@@ -200,7 +200,11 @@ $configuredDeployment = $deploymentTemplate `
   -replace '\$\{FABRIC_LAKEHOUSE_NAME\}', 'mcpontologies' `
   -replace '\$\{FABRIC_ONTOLOGY_PATH\}', 'Files/ontology' `
   -replace '\$\{FABRIC_API_ENDPOINT\}', '' `
-  -replace '\$\{ONTOLOGY_CONTAINER_NAME\}', 'ontologies'
+  -replace '\$\{ONTOLOGY_CONTAINER_NAME\}', 'ontologies' `
+  -replace '\$\{FABRIC_AGENT_MAX_RETRIES:-3\}', '3' `
+  -replace '\$\{FABRIC_PIPELINE_POLL_INTERVAL:-30\}', '30' `
+  -replace '\$\{FABRIC_PIPELINE_TIMEOUT:-3600\}', '3600' `
+  -replace '\$\{ONELAKE_MAX_DOWNLOAD_BYTES:-52428800\}', '52428800'
 $configuredDeployment | Out-File -FilePath "./k8s/mcp-agents-deployment-configured.yaml" -Encoding utf8
 Write-Host "  ✅ Configured mcp-agents-deployment-configured.yaml" -ForegroundColor Green
 
