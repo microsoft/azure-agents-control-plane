@@ -167,6 +167,20 @@ spec:
         - name: FABRIC_API_ENDPOINT
           value: "${FABRIC_API_ENDPOINT}"
         # =========================================
+        # Fabric Agent Orchestrator Configuration
+        # =========================================
+        - name: FABRIC_AGENT_MAX_RETRIES
+          value: "${FABRIC_AGENT_MAX_RETRIES:-3}"
+        - name: FABRIC_PIPELINE_POLL_INTERVAL
+          value: "${FABRIC_PIPELINE_POLL_INTERVAL:-30}"
+        - name: FABRIC_PIPELINE_TIMEOUT
+          value: "${FABRIC_PIPELINE_TIMEOUT:-3600}"
+        # =========================================
+        # OneLake File Operations Configuration
+        # =========================================
+        - name: ONELAKE_MAX_DOWNLOAD_BYTES
+          value: "${ONELAKE_MAX_DOWNLOAD_BYTES:-52428800}"
+        # =========================================
         # Ontology Storage (Azure Blob - Fabric fallback)
         # =========================================
         - name: ONTOLOGY_CONTAINER_NAME
