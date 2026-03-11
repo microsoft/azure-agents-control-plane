@@ -1,0 +1,53 @@
+# =============================================================================
+# Dev environment overlay
+# - 1 replica (cost savings)
+# - Reduced resource limits
+# - FABRIC_ENVIRONMENT=dev
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../base
+
+patches:
+  - target:
+      kind: Deployment
+      name: mcp-agents
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mcp-agents
+        namespace: mcp-agents
+        labels:
+          environment: dev
+      spec:
+        replicas: 1
+        template:
+          metadata:
+            labels:
+              environment: dev
+          spec:
+            containers:
+            - name: mcp-agents
+              env:
+              - name: FABRIC_ENVIRONMENT
+                value: "dev"
+              resources:
+                requests:
+                  memory: "128Mi"
+                  cpu: "125m"
+                limits:
+                  memory: "256Mi"
+                  cpu: "250m"
+  - target:
+      kind: Namespace
+      name: mcp-agents
+    patch: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: mcp-agents
+        labels:
+          environment: dev

@@ -1,0 +1,14 @@
+# Pod Disruption Budget for production — ensure at least 2 pods running during rollouts
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mcp-agents-pdb
+  namespace: mcp-agents
+  labels:
+    app: mcp-agents
+    environment: prod
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mcp-agents

@@ -166,6 +166,8 @@ spec:
           value: "${FABRIC_DATA_AGENTS_ENABLED}"
         - name: FABRIC_API_ENDPOINT
           value: "${FABRIC_API_ENDPOINT}"
+        - name: FABRIC_ENVIRONMENT
+          value: "${FABRIC_ENVIRONMENT:-dev}"
         # =========================================
         # Fabric Agent Orchestrator Configuration
         # =========================================

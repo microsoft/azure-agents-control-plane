@@ -1,0 +1,92 @@
+# =============================================================================
+# Deploy to Test — Triggered manually after Dev succeeds
+# =============================================================================
+name: Deploy Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'deploy-test' to confirm"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AZURE_ENV_NAME: agents-test
+  FABRIC_ENVIRONMENT: test
+  AZD_INITIAL_ENVIRONMENT_CONFIG: infra/main.parameters.test.json
+
+jobs:
+  validate-input:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate confirmation
+        if: github.event.inputs.confirm != 'deploy-test'
+        run: |
+          echo "::error::Confirmation mismatch. Type 'deploy-test' to proceed."
+          exit 1
+
+  deploy-test:
+    runs-on: ubuntu-latest
+    needs: validate-input
+    environment: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Azure Developer CLI
+        uses: Azure/setup-azd@v2
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision infrastructure (Test)
+        run: |
+          azd env new ${{ env.AZURE_ENV_NAME }} --no-prompt
+          azd env set AZURE_LOCATION ${{ vars.AZURE_LOCATION || 'westus3' }}
+          azd env set FABRIC_ENABLED true
+          azd env set FABRIC_DATA_AGENTS_ENABLED true
+          azd env set FABRIC_ENVIRONMENT test
+          azd env set FABRIC_SKU F4
+          azd env set DEFENDER_ENABLED true
+          azd env set VNET_ENABLED true
+          azd provision --no-prompt
+
+      - name: Deploy Fabric workspace (Test)
+        run: |
+          pwsh ./scripts/deploy-fabric-workspace.ps1 -WorkspaceName "agents-test-ws"
+
+      - name: Validate OneLake connectivity
+        run: |
+          python -c "
+          import os, sys
+          sys.path.insert(0, 'src')
+          os.environ['FABRIC_ENVIRONMENT'] = 'test'
+          from fabric_onelake import onelake_validate_connection_tool
+          import json
+          result = json.loads(onelake_validate_connection_tool())
+          print(json.dumps(result, indent=2))
+          if not result['success']:
+              print('::error::OneLake connectivity validation failed in test')
+              sys.exit(1)
+          "
+
+      - name: Build and deploy to AKS (Test)
+        run: azd deploy --no-prompt
+
+      - name: Run integration smoke tests
+        run: |
+          cd tests
+          python -m pytest test_fabric_data_agents.py -v --tb=short -k "TestOneLake"

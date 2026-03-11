@@ -252,3 +252,71 @@ Write-Host "  2. (Optional) Create a Data Pipeline in the Fabric portal"
 Write-Host "  3. (Optional) Create a Semantic Model / Power BI dataset"
 Write-Host "  4. Upload sample data to the Lakehouse Files section"
 Write-Host ""
+
+# ================================================================
+# Step 5: Validate OneLake connectivity
+# ================================================================
+Write-Host "`n--- Step 5: OneLake Connectivity Validation ---" -ForegroundColor Yellow
+
+$onelakeDfsEndpoint = if ($env:FABRIC_ONELAKE_DFS_ENDPOINT) { $env:FABRIC_ONELAKE_DFS_ENDPOINT } else { "https://onelake.dfs.fabric.microsoft.com" }
+$storageToken = az account get-access-token --resource "https://storage.azure.com" --query accessToken -o tsv 2>$null
+
+if ($storageToken) {
+    $olHeaders = @{
+        "Authorization" = "Bearer $storageToken"
+        "x-ms-version"  = "2021-08-06"
+    }
+
+    # Check 1: DFS endpoint reachability
+    try {
+        $olResp = Invoke-WebRequest -Uri $onelakeDfsEndpoint -Headers $olHeaders -Method GET -ErrorAction SilentlyContinue -TimeoutSec 10
+        Write-Host "[OK] OneLake DFS endpoint reachable (HTTP $($olResp.StatusCode))" -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "OneLake DFS endpoint not reachable: $($_.Exception.Message)"
+    }
+
+    # Check 2: Workspace root listing
+    try {
+        $wsUrl = "$onelakeDfsEndpoint/$workspaceId`?resource=account&maxResults=1"
+        $wsResp = Invoke-WebRequest -Uri $wsUrl -Headers $olHeaders -Method GET -ErrorAction SilentlyContinue -TimeoutSec 15
+        if ($wsResp.StatusCode -lt 400) {
+            Write-Host "[OK] Workspace accessible via OneLake DFS" -ForegroundColor Green
+        } else {
+            Write-Warning "Workspace access returned HTTP $($wsResp.StatusCode)"
+        }
+    }
+    catch {
+        Write-Warning "Workspace DFS access failed: $($_.Exception.Message)"
+    }
+
+    # Check 3: Lakehouse discovery
+    try {
+        $lhUrl = "$onelakeDfsEndpoint/$workspaceId/$lakehouseId/Files`?resource=filesystem&recursive=false"
+        $lhResp = Invoke-WebRequest -Uri $lhUrl -Headers $olHeaders -Method GET -ErrorAction SilentlyContinue -TimeoutSec 15
+        if ($lhResp.StatusCode -lt 400) {
+            Write-Host "[OK] Lakehouse Files section discoverable via OneLake DFS" -ForegroundColor Green
+        } else {
+            Write-Warning "Lakehouse access returned HTTP $($lhResp.StatusCode)"
+        }
+    }
+    catch {
+        Write-Warning "Lakehouse DFS access failed: $($_.Exception.Message)"
+    }
+}
+else {
+    Write-Warning "Could not acquire OneLake storage token. Skipping connectivity validation."
+}
+
+# ================================================================
+# Step 6: Save environment identifier
+# ================================================================
+$fabricEnv = if ($env:FABRIC_ENVIRONMENT) { $env:FABRIC_ENVIRONMENT } else { "dev" }
+if ($envName) {
+    azd env set FABRIC_ENVIRONMENT $fabricEnv -e $envName 2>$null
+    Write-Host "`n[OK] FABRIC_ENVIRONMENT set to '$fabricEnv'" -ForegroundColor Green
+}
+
+Write-Host "`n============================================" -ForegroundColor Cyan
+Write-Host "  All done! Environment: $fabricEnv" -ForegroundColor Cyan
+Write-Host "============================================`n" -ForegroundColor Cyan

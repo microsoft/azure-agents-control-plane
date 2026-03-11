@@ -34,6 +34,9 @@ ONELAKE_DFS_ENDPOINT = os.getenv(
 FABRIC_WORKSPACE_ID = os.getenv("FABRIC_WORKSPACE_ID", "")
 ONELAKE_SCOPE = "https://storage.azure.com/.default"
 
+# Environment: dev, test, or prod (defaults to dev)
+FABRIC_ENVIRONMENT = os.getenv("FABRIC_ENVIRONMENT", "dev").lower()
+
 # Max download size to prevent out-of-memory (50 MB)
 MAX_DOWNLOAD_BYTES = int(os.getenv("ONELAKE_MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
 
@@ -343,6 +346,162 @@ class OneLakeClient:
             "eTag": resp.headers.get("ETag", ""),
         }
 
+    # ------------------------------------------------------------------
+    # Connectivity Validation
+    # ------------------------------------------------------------------
+
+    def validate_connection(self) -> Dict[str, Any]:
+        """
+        Validate connectivity to OneLake by:
+        1. Checking token acquisition for the OneLake DFS scope
+        2. Verifying the DFS endpoint is reachable
+        3. Listing the workspace root to confirm access rights
+
+        Returns:
+            Dict with success, checks performed, and any errors
+        """
+        checks: List[Dict[str, Any]] = []
+        overall_success = True
+
+        # Check 1: Token acquisition
+        try:
+            token = self._get_token()
+            checks.append({
+                "check": "token_acquisition",
+                "success": True,
+                "message": "Successfully acquired OneLake DFS token",
+            })
+        except Exception as e:
+            overall_success = False
+            checks.append({
+                "check": "token_acquisition",
+                "success": False,
+                "message": f"Failed to acquire token: {e}",
+            })
+            return {
+                "success": False,
+                "checks": checks,
+                "environment": FABRIC_ENVIRONMENT,
+                "workspace_id": self.workspace_id,
+                "dfs_endpoint": self.dfs_endpoint,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        # Check 2: DFS endpoint reachability
+        try:
+            resp = requests.get(
+                self.dfs_endpoint,
+                headers=self._headers(),
+                timeout=10,
+                allow_redirects=True,
+            )
+            # Any non-5xx response means the endpoint is reachable
+            reachable = resp.status_code < 500
+            checks.append({
+                "check": "endpoint_reachable",
+                "success": reachable,
+                "message": f"DFS endpoint returned HTTP {resp.status_code}",
+                "endpoint": self.dfs_endpoint,
+            })
+            if not reachable:
+                overall_success = False
+        except requests.exceptions.RequestException as e:
+            overall_success = False
+            checks.append({
+                "check": "endpoint_reachable",
+                "success": False,
+                "message": f"DFS endpoint unreachable: {e}",
+                "endpoint": self.dfs_endpoint,
+            })
+
+        # Check 3: Workspace access — list the workspace root via DFS
+        if self.workspace_id:
+            try:
+                url = f"{self.dfs_endpoint}/{self.workspace_id}"
+                params = {"resource": "account", "maxResults": "1"}
+                resp = requests.get(
+                    url, headers=self._headers(), params=params, timeout=15
+                )
+                if resp.status_code < 400:
+                    checks.append({
+                        "check": "workspace_access",
+                        "success": True,
+                        "message": "Workspace is accessible via OneLake DFS",
+                        "workspace_id": self.workspace_id,
+                    })
+                else:
+                    overall_success = False
+                    checks.append({
+                        "check": "workspace_access",
+                        "success": False,
+                        "message": f"Workspace access returned HTTP {resp.status_code}",
+                        "workspace_id": self.workspace_id,
+                    })
+            except requests.exceptions.RequestException as e:
+                overall_success = False
+                checks.append({
+                    "check": "workspace_access",
+                    "success": False,
+                    "message": f"Workspace access failed: {e}",
+                    "workspace_id": self.workspace_id,
+                })
+        else:
+            checks.append({
+                "check": "workspace_access",
+                "success": False,
+                "message": "FABRIC_WORKSPACE_ID not configured",
+            })
+            overall_success = False
+
+        return {
+            "success": overall_success,
+            "checks": checks,
+            "environment": FABRIC_ENVIRONMENT,
+            "workspace_id": self.workspace_id,
+            "dfs_endpoint": self.dfs_endpoint,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def discover_items(self, lakehouse_id: str) -> Dict[str, Any]:
+        """
+        Discover OneLake items (Files and Tables) in a Lakehouse.
+
+        Validates that at least one item (file or table) is discoverable
+        without permission errors.
+
+        Args:
+            lakehouse_id: Lakehouse item ID
+
+        Returns:
+            Dict with discovered Files and Tables entries
+        """
+        discovered: Dict[str, Any] = {"files": [], "tables": [], "errors": []}
+
+        for section in ("Files", "Tables"):
+            try:
+                entries = self.list_files(lakehouse_id, "", section, recursive=False)
+                discovered[section.lower()] = entries
+            except requests.exceptions.HTTPError as e:
+                discovered["errors"].append({
+                    "section": section,
+                    "error": str(e),
+                    "status_code": getattr(e.response, "status_code", None),
+                })
+            except Exception as e:
+                discovered["errors"].append({
+                    "section": section,
+                    "error": str(e),
+                })
+
+        total = len(discovered["files"]) + len(discovered["tables"])
+        discovered["success"] = total > 0 or len(discovered["errors"]) == 0
+        discovered["total_items"] = total
+        discovered["lakehouse_id"] = lakehouse_id
+        discovered["environment"] = FABRIC_ENVIRONMENT
+        discovered["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        return discovered
+
 
 # ---------------------------------------------------------------------------
 # Global singleton
@@ -356,7 +515,7 @@ def get_onelake_client() -> OneLakeClient:
     global _onelake_client
     if _onelake_client is None:
         _onelake_client = OneLakeClient()
-        logger.info("OneLake client initialized")
+        logger.info("OneLake client initialized (env=%s)", FABRIC_ENVIRONMENT)
     return _onelake_client
 
 
@@ -503,3 +662,40 @@ def onelake_get_file_properties_tool(
     except Exception as e:
         logger.error(f"Error getting OneLake file properties: {e}")
         return json.dumps({"success": False, "error": str(e)})
+
+
+def onelake_validate_connection_tool() -> str:
+    """
+    Validate OneLake connectivity: token acquisition, DFS endpoint
+    reachability, and workspace access.
+
+    Returns:
+        JSON string with validation results per check
+    """
+    try:
+        client = get_onelake_client()
+        result = client.validate_connection()
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error validating OneLake connection: {e}")
+        return json.dumps({"success": False, "error": str(e)})
+
+
+def onelake_discover_items_tool(lakehouse_id: str) -> str:
+    """
+    Discover OneLake items (Files and Tables) in a Lakehouse.
+
+    Args:
+        lakehouse_id: ID of the lakehouse
+
+    Returns:
+        JSON string with discovered Files and Tables
+    """
+    try:
+        client = get_onelake_client()
+        result = client.discover_items(lakehouse_id)
+        return json.dumps(result)
+    except Exception as e:
+        logger.error(f"Error discovering OneLake items: {e}")
+        return json.dumps({"success": False, "error": str(e)})
+

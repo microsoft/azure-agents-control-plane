@@ -585,6 +585,213 @@ class TestOneLakeClient(unittest.TestCase):
 
 
 # ===========================================================================
+# OneLake Connectivity Validation Tests
+# ===========================================================================
+
+class TestOneLakeValidation(unittest.TestCase):
+    """Tests for OneLake connectivity validation and item discovery."""
+
+    def setUp(self):
+        from fabric_onelake import OneLakeClient
+        self.client = OneLakeClient(
+            workspace_id="test-workspace-id-0001",
+            dfs_endpoint="https://onelake.dfs.fabric.microsoft.com",
+        )
+
+    @patch("fabric_onelake.requests.get")
+    def test_validate_connection_all_pass(self, mock_get):
+        """All three checks pass: token, endpoint, workspace."""
+        self.client._get_token = MagicMock(return_value="fake-token")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_get.return_value = mock_resp
+
+        result = self.client.validate_connection()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(result["checks"]), 3)
+        for check in result["checks"]:
+            self.assertTrue(check["success"])
+        self.assertIn("environment", result)
+        self.assertIn("workspace_id", result)
+
+    @patch("fabric_onelake.requests.get")
+    def test_validate_connection_token_failure(self, mock_get):
+        """Token acquisition fails — should return immediately."""
+        self.client._get_token = MagicMock(side_effect=Exception("No credential"))
+
+        result = self.client.validate_connection()
+
+        self.assertFalse(result["success"])
+        self.assertEqual(len(result["checks"]), 1)
+        self.assertEqual(result["checks"][0]["check"], "token_acquisition")
+        self.assertFalse(result["checks"][0]["success"])
+
+    @patch("fabric_onelake.requests.get")
+    def test_validate_connection_endpoint_unreachable(self, mock_get):
+        """Token OK, but endpoint is unreachable."""
+        self.client._get_token = MagicMock(return_value="fake-token")
+
+        import requests as req
+        mock_get.side_effect = req.exceptions.ConnectionError("DNS failure")
+
+        result = self.client.validate_connection()
+
+        self.assertFalse(result["success"])
+        checks_by_name = {c["check"]: c for c in result["checks"]}
+        self.assertTrue(checks_by_name["token_acquisition"]["success"])
+        self.assertFalse(checks_by_name["endpoint_reachable"]["success"])
+
+    @patch("fabric_onelake.requests.get")
+    def test_validate_connection_workspace_forbidden(self, mock_get):
+        """Token and endpoint OK, but workspace returns 403."""
+        self.client._get_token = MagicMock(return_value="fake-token")
+
+        # First call: endpoint reachable (200)
+        # Second call: workspace access (403)
+        resp_ok = MagicMock()
+        resp_ok.status_code = 200
+        resp_403 = MagicMock()
+        resp_403.status_code = 403
+
+        mock_get.side_effect = [resp_ok, resp_403]
+
+        result = self.client.validate_connection()
+
+        self.assertFalse(result["success"])
+        checks_by_name = {c["check"]: c for c in result["checks"]}
+        self.assertTrue(checks_by_name["token_acquisition"]["success"])
+        self.assertTrue(checks_by_name["endpoint_reachable"]["success"])
+        self.assertFalse(checks_by_name["workspace_access"]["success"])
+
+    @patch("fabric_onelake.requests.get")
+    def test_validate_connection_no_workspace_id(self, mock_get):
+        """Workspace ID not configured."""
+        self.client.workspace_id = ""
+        self.client._get_token = MagicMock(return_value="fake-token")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_get.return_value = mock_resp
+
+        result = self.client.validate_connection()
+
+        self.assertFalse(result["success"])
+        checks_by_name = {c["check"]: c for c in result["checks"]}
+        self.assertFalse(checks_by_name["workspace_access"]["success"])
+        self.assertIn("not configured", checks_by_name["workspace_access"]["message"])
+
+    @patch("fabric_onelake.requests.get")
+    def test_discover_items_files_and_tables(self, mock_get):
+        """Discover Files and Tables sections."""
+        self.client._get_token = MagicMock(return_value="fake-token")
+
+        files_resp = MagicMock()
+        files_resp.raise_for_status = MagicMock()
+        files_resp.json.return_value = {
+            "paths": [
+                {"name": "Files/data.csv", "isDirectory": "false", "contentLength": "100", "lastModified": "2026-03-01"},
+            ]
+        }
+
+        tables_resp = MagicMock()
+        tables_resp.raise_for_status = MagicMock()
+        tables_resp.json.return_value = {
+            "paths": [
+                {"name": "Tables/customers", "isDirectory": "true", "contentLength": "0", "lastModified": "2026-03-01"},
+            ]
+        }
+
+        mock_get.side_effect = [files_resp, tables_resp]
+
+        result = self.client.discover_items("lh-001")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["total_items"], 2)
+        self.assertEqual(result["lakehouse_id"], "lh-001")
+
+    @patch("fabric_onelake.requests.get")
+    def test_discover_items_empty(self, mock_get):
+        """No items found — still succeeds if no errors."""
+        self.client._get_token = MagicMock(return_value="fake-token")
+
+        empty_resp = MagicMock()
+        empty_resp.raise_for_status = MagicMock()
+        empty_resp.json.return_value = {"paths": []}
+
+        mock_get.return_value = empty_resp
+
+        result = self.client.discover_items("lh-001")
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["total_items"], 0)
+
+
+# ===========================================================================
+# OneLake Validation Tool Wrapper Tests
+# ===========================================================================
+
+class TestOneLakeValidationTools(unittest.TestCase):
+    """Tests for OneLake validation MCP tool wrappers."""
+
+    @patch("fabric_onelake.get_onelake_client")
+    def test_validate_connection_tool(self, mock_get_client):
+        from fabric_onelake import onelake_validate_connection_tool
+
+        mock_client = MagicMock()
+        mock_client.validate_connection.return_value = {
+            "success": True,
+            "checks": [
+                {"check": "token_acquisition", "success": True, "message": "OK"},
+                {"check": "endpoint_reachable", "success": True, "message": "OK"},
+                {"check": "workspace_access", "success": True, "message": "OK"},
+            ],
+            "environment": "dev",
+            "workspace_id": "ws-001",
+            "dfs_endpoint": "https://onelake.dfs.fabric.microsoft.com",
+        }
+        mock_get_client.return_value = mock_client
+
+        result = json.loads(onelake_validate_connection_tool())
+
+        self.assertTrue(result["success"])
+        self.assertEqual(len(result["checks"]), 3)
+
+    @patch("fabric_onelake.get_onelake_client")
+    def test_discover_items_tool(self, mock_get_client):
+        from fabric_onelake import onelake_discover_items_tool
+
+        mock_client = MagicMock()
+        mock_client.discover_items.return_value = {
+            "success": True,
+            "files": [{"name": "data.csv"}],
+            "tables": [],
+            "errors": [],
+            "total_items": 1,
+            "lakehouse_id": "lh-001",
+        }
+        mock_get_client.return_value = mock_client
+
+        result = json.loads(onelake_discover_items_tool("lh-001"))
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["total_items"], 1)
+
+    @patch("fabric_onelake.get_onelake_client")
+    def test_validate_connection_tool_error(self, mock_get_client):
+        from fabric_onelake import onelake_validate_connection_tool
+
+        mock_get_client.side_effect = Exception("Init failed")
+
+        result = json.loads(onelake_validate_connection_tool())
+
+        self.assertFalse(result["success"])
+        self.assertIn("Init failed", result["error"])
+
+
+# ===========================================================================
 # OneLake Tool Wrappers Tests
 # ===========================================================================
 

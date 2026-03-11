@@ -1,0 +1,8 @@
+# =============================================================================
+# K8s Kustomize base configuration
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../mcp-agents-deployment.yaml

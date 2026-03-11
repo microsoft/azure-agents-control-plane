@@ -1,0 +1,60 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "${AZURE_ENV_NAME}"
+    },
+    "location": {
+      "value": "${AZURE_LOCATION}"
+    },
+    "vnetEnabled": {
+      "value": "${VNET_ENABLED=true}"
+    },
+    "mcpEntraApplicationDisplayName": {
+      "value": "MCP-OAuth-App-Test"
+    },
+    "mcpEntraApplicationUniqueName": {
+      "value": "mcp-oauth-app-test-${AZURE_ENV_NAME}"
+    },
+    "existingEntraAppId": {
+      "value": "${EXISTING_ENTRA_APP_ID=}"
+    },
+    "fabricEnabled": {
+      "value": "${FABRIC_ENABLED=true}"
+    },
+    "fabricSkuName": {
+      "value": "${FABRIC_SKU=F4}"
+    },
+    "fabricAdminEmail": {
+      "value": "${FABRIC_ADMIN_EMAIL}"
+    },
+    "agentIdentityEnabled": {
+      "value": "${AGENT_IDENTITY_ENABLED=false}"
+    },
+    "developerPrincipalId": {
+      "value": "${DEVELOPER_PRINCIPAL_ID=}"
+    },
+    "developerIpAddress": {
+      "value": "${DEVELOPER_IP_ADDRESS=}"
+    },
+    "fabricDataAgentsEnabled": {
+      "value": "${FABRIC_DATA_AGENTS_ENABLED=true}"
+    },
+    "fabricWorkspaceId": {
+      "value": "${FABRIC_WORKSPACE_ID=}"
+    },
+    "defenderEnabled": {
+      "value": "${DEFENDER_ENABLED=true}"
+    },
+    "defenderSecurityContactEmail": {
+      "value": "${DEFENDER_SECURITY_CONTACT_EMAIL=}"
+    },
+    "defenderSecurityContactPhone": {
+      "value": "${DEFENDER_SECURITY_CONTACT_PHONE=}"
+    },
+    "purviewEnabled": {
+      "value": "${PURVIEW_ENABLED=false}"
+    }
+  }
+}

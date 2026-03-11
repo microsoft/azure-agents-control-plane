@@ -1,6 +1,6 @@
 # Fabric Data Agents — Complete Setup Guide
 
-A step-by-step guide to connect and create Fabric Data Agents that interact with a Microsoft Fabric Lakehouse workspace.
+A step-by-step guide to setting up Fabric Data Agents that interact with Microsoft Fabric's data platform (Lakehouses, Warehouses, Pipelines, and Semantic Models).
 
 ---
 
@@ -48,7 +48,7 @@ azd version
 
 ## 2. Authenticate to Azure
 
-### 2.1 Login to the correct tenant
+### 2.1 Log in to the correct tenant
 
 ```powershell
 # Replace with your tenant ID
@@ -163,7 +163,7 @@ az resource invoke-action `
 
 ### Option A: Use the automated deploy script (recommended)
 
-The repository includes `scripts/deploy-fabric-workspace.ps1` which creates:
+The repository includes `scripts/deploy-fabric-workspace.ps1`, which creates:
 - A Fabric **Workspace**
 - A **Lakehouse** (AgentsLakehouse)
 - A **Warehouse** (AgentsWarehouse)
@@ -420,7 +420,7 @@ python -m pytest tests/test_fabric_agents.py -v --use-az-token
 
 ### 9.3 Test via MCP tool calls
 
-Once deployed, interact with the agents via MCP SSE endpoint:
+Once deployed, interact with the agents via the MCP SSE endpoint:
 
 **Query Lakehouse:**
 ```json
@@ -659,7 +659,7 @@ ast.parse(open('src/file.py', encoding='utf-8').read())
 
 **Cause**: Workload identity not configured.
 
-**Fix**: Ensure federated identity credential exists:
+**Fix**: Ensure the federated identity credential exists:
 
 ```powershell
 az identity federated-credential create `

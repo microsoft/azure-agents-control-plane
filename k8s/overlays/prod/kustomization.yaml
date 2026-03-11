@@ -1,0 +1,60 @@
+# =============================================================================
+# Prod environment overlay
+# - 3 replicas (high availability)
+# - Higher resource limits
+# - FABRIC_ENVIRONMENT=prod
+# - Pod disruption budget for zero-downtime deployments
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../base
+  - pdb.yaml
+
+patches:
+  - target:
+      kind: Deployment
+      name: mcp-agents
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mcp-agents
+        namespace: mcp-agents
+        labels:
+          environment: prod
+      spec:
+        replicas: 3
+        strategy:
+          type: RollingUpdate
+          rollingUpdate:
+            maxUnavailable: 1
+            maxSurge: 1
+        template:
+          metadata:
+            labels:
+              environment: prod
+          spec:
+            containers:
+            - name: mcp-agents
+              env:
+              - name: FABRIC_ENVIRONMENT
+                value: "prod"
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "500m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "1000m"
+  - target:
+      kind: Namespace
+      name: mcp-agents
+    patch: |
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: mcp-agents
+        labels:
+          environment: prod
