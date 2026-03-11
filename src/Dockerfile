@@ -18,6 +18,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY next_best_action_agent.py .
 
+# Copy Fabric agents and tools
+COPY fabric_tools.py .
+COPY fabric_agents.py .
+COPY fabric_onelake.py .
+
+# Copy Agent 365 approval workflow
+COPY agent365_approval.py .
+
 # Copy memory module
 COPY memory/ ./memory/
 

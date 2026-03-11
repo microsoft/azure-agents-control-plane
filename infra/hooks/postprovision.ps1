@@ -25,6 +25,8 @@ $fabricEnabled = $envValues.FABRIC_ENABLED.Trim('"')
 $fabricCapacityName = $envValues.FABRIC_CAPACITY_NAME.Trim('"')
 $fabricOneLakeDfsEndpoint = $envValues.FABRIC_ONELAKE_DFS_ENDPOINT.Trim('"')
 $fabricOneLakeBlobEndpoint = $envValues.FABRIC_ONELAKE_BLOB_ENDPOINT.Trim('"')
+$fabricDataAgentsEnabled = $envValues.FABRIC_DATA_AGENTS_ENABLED.Trim('"')
+$fabricWorkspaceId = $envValues.FABRIC_WORKSPACE_ID.Trim('"')
 
 Write-Host "  AKS Cluster: $aksName" -ForegroundColor White
 Write-Host "  Resource Group: $rgName" -ForegroundColor White
@@ -95,7 +97,11 @@ $configuredDeployment = $deploymentTemplate `
   -replace '\$\{FABRIC_ONELAKE_BLOB_ENDPOINT\}', $fabricOneLakeBlobEndpoint `
   -replace '\$\{FABRIC_LAKEHOUSE_NAME\}', 'mcpontologies' `
   -replace '\$\{FABRIC_ONTOLOGY_PATH\}', 'Files/ontology' `
-  -replace '\$\{ONTOLOGY_CONTAINER_NAME\}', 'ontologies'
+  -replace '\$\{ONTOLOGY_CONTAINER_NAME\}', 'ontologies' `
+  -replace '\$\{FABRIC_AGENT_MAX_RETRIES\}', '3' `
+  -replace '\$\{FABRIC_PIPELINE_POLL_INTERVAL\}', '30' `
+  -replace '\$\{FABRIC_PIPELINE_TIMEOUT\}', '3600' `
+  -replace '\$\{ONELAKE_MAX_DOWNLOAD_BYTES\}', '52428800'
 $configuredDeployment | Out-File -FilePath "./k8s/mcp-agents-deployment-configured.yaml" -Encoding utf8
 Write-Host "  ✅ Configured mcp-agents-deployment-configured.yaml" -ForegroundColor Green
 
@@ -206,15 +212,30 @@ Write-Host "══════════════════════�
 Write-Host "🎉 Post-provision setup complete!" -ForegroundColor Green
 Write-Host "═══════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 
-# Fabric IQ Setup Instructions
+# Fabric Data Agents provisioning
 if ($fabricEnabled -eq "true") {
-  Write-Host "`n🧠 Microsoft Fabric IQ Setup:" -ForegroundColor Magenta
-  Write-Host "  1. Create a Fabric Workspace in the Fabric portal" -ForegroundColor White
-  Write-Host "  2. Create a Lakehouse named 'mcpontologies'" -ForegroundColor White
-  Write-Host "  3. Upload ontologies to OneLake:" -ForegroundColor White
-  Write-Host "     ./scripts/upload-ontologies-to-onelake.ps1 -WorkspaceId <GUID> -LakehouseName mcpontologies" -ForegroundColor Yellow
-  Write-Host "  4. Configure Fabric IQ with the uploaded ontologies" -ForegroundColor White
-  Write-Host "  5. Update FABRIC_WORKSPACE_ID environment variable" -ForegroundColor White
+  Write-Host "`n🧠 Provisioning Fabric Data Agents workspace..." -ForegroundColor Magenta
+  $fabricDataAgentsEnabled = $envValues.FABRIC_DATA_AGENTS_ENABLED.Trim('"')
+  if ($fabricDataAgentsEnabled -eq "true") {
+    try {
+      & "./scripts/deploy-fabric-workspace.ps1"
+      Write-Host "  ✅ Fabric workspace provisioned" -ForegroundColor Green
+
+      # Upload ontologies to the Lakehouse
+      $fabricWorkspaceId = (azd env get-values -e $envName | ConvertFrom-StringData -Delimiter '=').FABRIC_WORKSPACE_ID.Trim('"')
+      if ($fabricWorkspaceId) {
+        Write-Host "  Uploading ontologies to OneLake..." -ForegroundColor White
+        & "./scripts/upload-ontologies-to-onelake.ps1" -WorkspaceId $fabricWorkspaceId -LakehouseName mcpontologies
+        Write-Host "  ✅ Ontologies uploaded" -ForegroundColor Green
+      }
+    }
+    catch {
+      Write-Host "  ⚠️ Fabric provisioning failed: $($_.Exception.Message)" -ForegroundColor Yellow
+      Write-Host "  👉 Run manually: ./scripts/deploy-fabric-workspace.ps1" -ForegroundColor Yellow
+    }
+  } else {
+    Write-Host "  Fabric Data Agents disabled (FABRIC_DATA_AGENTS_ENABLED != true)" -ForegroundColor Gray
+  }
 }
 
 Write-Host "`n📝 Run integration tests:" -ForegroundColor Cyan

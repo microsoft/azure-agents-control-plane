@@ -57,6 +57,36 @@ except ImportError:
     FABRIC_DATA_AGENTS_AVAILABLE = False
     print("WARNING: fabric_tools not available - Fabric Data Agents will be disabled")
 
+# Fabric Agent Orchestrator imports (intelligent agent layer)
+try:
+    from fabric_agents import (
+        FabricAgentOrchestrator,
+        LakehouseAgent,
+        WarehouseAgent,
+        PipelineAgent,
+        SemanticModelAgent,
+        AgentResponse as FabricAgentResponse,
+        get_fabric_orchestrator,
+    )
+    FABRIC_AGENTS_AVAILABLE = True
+except ImportError:
+    FABRIC_AGENTS_AVAILABLE = False
+    print("WARNING: fabric_agents not available - Fabric Agent Orchestrator will be disabled")
+
+# OneLake file operations imports
+try:
+    from fabric_onelake import (
+        onelake_list_files_tool,
+        onelake_read_file_tool,
+        onelake_write_file_tool,
+        onelake_delete_file_tool,
+        onelake_get_file_properties_tool,
+    )
+    ONELAKE_AVAILABLE = True
+except ImportError:
+    ONELAKE_AVAILABLE = False
+    print("WARNING: fabric_onelake not available - OneLake operations will be disabled")
+
 # Agent Lightning imports (for fine-tuning and behavior optimization)
 try:
     from lightning import (
@@ -3654,6 +3684,132 @@ TOOLS = [
             "required": []
         }
     ),
+    # =========================================
+    # Fabric Agent Orchestrator Tools
+    # =========================================
+    MCPTool(
+        name="fabric_agent_query",
+        description="Intelligent Fabric agent that automatically routes your request to the right specialist (Lakehouse, Warehouse, Pipeline, or Semantic Model). Supports natural-language queries, schema exploration, pipeline management, and cross-domain analytics.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural-language request (e.g., 'show all high-risk customers from the lakehouse')"
+                },
+                "agent_type": {
+                    "type": "string",
+                    "description": "Force a specific agent: lakehouse, warehouse, pipeline, semantic_model (optional - auto-detected if omitted)",
+                    "enum": ["lakehouse", "warehouse", "pipeline", "semantic_model"]
+                },
+                "lakehouse_id": {"type": "string", "description": "Target lakehouse ID (optional)"},
+                "warehouse_id": {"type": "string", "description": "Target warehouse ID (optional)"},
+                "pipeline_id": {"type": "string", "description": "Target pipeline ID (optional)"},
+                "dataset_id": {"type": "string", "description": "Target semantic model/dataset ID (optional)"},
+                "sql_query": {"type": "string", "description": "Explicit SQL/DAX query to execute (optional)"}
+            },
+            "required": ["query"]
+        }
+    ),
+    MCPTool(
+        name="fabric_agent_cross_domain",
+        description="Execute a cross-domain query spanning multiple Fabric resource types (e.g., query lakehouse data then trigger a pipeline refresh).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Cross-domain natural-language request"
+                },
+                "lakehouse_id": {"type": "string", "description": "Lakehouse ID (optional)"},
+                "warehouse_id": {"type": "string", "description": "Warehouse ID (optional)"},
+                "pipeline_id": {"type": "string", "description": "Pipeline ID (optional)"},
+                "dataset_id": {"type": "string", "description": "Dataset ID (optional)"}
+            },
+            "required": ["query"]
+        }
+    ),
+    MCPTool(
+        name="fabric_agent_list_all",
+        description="List all available Fabric resources (lakehouses, warehouses, pipelines, semantic models) in the workspace.",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    ),
+    # =========================================
+    # OneLake File Operations Tools
+    # =========================================
+    MCPTool(
+        name="onelake_list_files",
+        description="List files and directories in a OneLake Lakehouse path.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "lakehouse_id": {"type": "string", "description": "Lakehouse item ID"},
+                "path": {"type": "string", "description": "Directory path (default: root)"},
+                "section": {"type": "string", "description": "'Files' or 'Tables'", "enum": ["Files", "Tables"]},
+                "recursive": {"type": "boolean", "description": "List recursively (default: false)"}
+            },
+            "required": ["lakehouse_id"]
+        }
+    ),
+    MCPTool(
+        name="onelake_read_file",
+        description="Read a file from a OneLake Lakehouse (text and binary supported).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "lakehouse_id": {"type": "string", "description": "Lakehouse item ID"},
+                "path": {"type": "string", "description": "File path within the lakehouse"},
+                "section": {"type": "string", "description": "'Files' or 'Tables'", "enum": ["Files", "Tables"]}
+            },
+            "required": ["lakehouse_id", "path"]
+        }
+    ),
+    MCPTool(
+        name="onelake_write_file",
+        description="Write / upload a file to a OneLake Lakehouse.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "lakehouse_id": {"type": "string", "description": "Lakehouse item ID"},
+                "path": {"type": "string", "description": "Destination file path"},
+                "content": {"type": "string", "description": "File content"},
+                "section": {"type": "string", "description": "'Files' or 'Tables'", "enum": ["Files", "Tables"]},
+                "overwrite": {"type": "boolean", "description": "Overwrite if exists (default: true)"}
+            },
+            "required": ["lakehouse_id", "path", "content"]
+        }
+    ),
+    MCPTool(
+        name="onelake_delete_file",
+        description="Delete a file or directory from a OneLake Lakehouse.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "lakehouse_id": {"type": "string", "description": "Lakehouse item ID"},
+                "path": {"type": "string", "description": "Path to delete"},
+                "section": {"type": "string", "description": "'Files' or 'Tables'", "enum": ["Files", "Tables"]},
+                "recursive": {"type": "boolean", "description": "Delete directory recursively"}
+            },
+            "required": ["lakehouse_id", "path"]
+        }
+    ),
+    MCPTool(
+        name="onelake_get_file_properties",
+        description="Get metadata (size, last modified, content type) for a file in OneLake.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "lakehouse_id": {"type": "string", "description": "Lakehouse item ID"},
+                "path": {"type": "string", "description": "File path"},
+                "section": {"type": "string", "description": "'Files' or 'Tables'", "enum": ["Files", "Tables"]}
+            },
+            "required": ["lakehouse_id", "path"]
+        }
+    ),
 ]
 
 
@@ -6044,6 +6200,120 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     isError=True
                 )
         
+        # =========================================
+        # Fabric Agent Orchestrator tools
+        # =========================================
+        elif tool_name == "fabric_agent_query":
+            if not FABRIC_AGENTS_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "Fabric Agent Orchestrator not available"}],
+                    isError=True,
+                )
+            query = arguments.get("query", "")
+            agent_kwargs = {}
+            for key in ("agent_type", "lakehouse_id", "warehouse_id", "pipeline_id", "dataset_id"):
+                if arguments.get(key):
+                    agent_kwargs[key] = arguments[key]
+            if arguments.get("sql_query"):
+                agent_kwargs["query"] = arguments["sql_query"]
+            orchestrator = get_fabric_orchestrator()
+            resp = await orchestrator.handle(query, **agent_kwargs)
+            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}])
+
+        elif tool_name == "fabric_agent_cross_domain":
+            if not FABRIC_AGENTS_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "Fabric Agent Orchestrator not available"}],
+                    isError=True,
+                )
+            query = arguments.get("query", "")
+            kwargs = {k: arguments[k] for k in ("lakehouse_id", "warehouse_id", "pipeline_id", "dataset_id") if arguments.get(k)}
+            orchestrator = get_fabric_orchestrator()
+            resp = await orchestrator.cross_domain_query(query, **kwargs)
+            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}])
+
+        elif tool_name == "fabric_agent_list_all":
+            if not FABRIC_AGENTS_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "Fabric Agent Orchestrator not available"}],
+                    isError=True,
+                )
+            orchestrator = get_fabric_orchestrator()
+            resp = await orchestrator.list_all_resources()
+            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}])
+
+        # =========================================
+        # OneLake file operations tools
+        # =========================================
+        elif tool_name == "onelake_list_files":
+            if not ONELAKE_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "OneLake operations not available"}],
+                    isError=True,
+                )
+            result = onelake_list_files_tool(
+                lakehouse_id=arguments.get("lakehouse_id", ""),
+                path=arguments.get("path", ""),
+                section=arguments.get("section", "Files"),
+                recursive=arguments.get("recursive", False),
+            )
+            return MCPToolResult(content=[{"type": "text", "text": result}])
+
+        elif tool_name == "onelake_read_file":
+            if not ONELAKE_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "OneLake operations not available"}],
+                    isError=True,
+                )
+            result = onelake_read_file_tool(
+                lakehouse_id=arguments.get("lakehouse_id", ""),
+                path=arguments.get("path", ""),
+                section=arguments.get("section", "Files"),
+            )
+            return MCPToolResult(content=[{"type": "text", "text": result}])
+
+        elif tool_name == "onelake_write_file":
+            if not ONELAKE_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "OneLake operations not available"}],
+                    isError=True,
+                )
+            result = onelake_write_file_tool(
+                lakehouse_id=arguments.get("lakehouse_id", ""),
+                path=arguments.get("path", ""),
+                content=arguments.get("content", ""),
+                section=arguments.get("section", "Files"),
+                overwrite=arguments.get("overwrite", True),
+            )
+            return MCPToolResult(content=[{"type": "text", "text": result}])
+
+        elif tool_name == "onelake_delete_file":
+            if not ONELAKE_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "OneLake operations not available"}],
+                    isError=True,
+                )
+            result = onelake_delete_file_tool(
+                lakehouse_id=arguments.get("lakehouse_id", ""),
+                path=arguments.get("path", ""),
+                section=arguments.get("section", "Files"),
+                recursive=arguments.get("recursive", False),
+            )
+            return MCPToolResult(content=[{"type": "text", "text": result}])
+
+        elif tool_name == "onelake_get_file_properties":
+            if not ONELAKE_AVAILABLE:
+                return MCPToolResult(
+                    content=[{"type": "text", "text": "OneLake operations not available"}],
+                    isError=True,
+                )
+            result = onelake_get_file_properties_tool(
+                lakehouse_id=arguments.get("lakehouse_id", ""),
+                path=arguments.get("path", ""),
+                section=arguments.get("section", "Files"),
+            )
+            return MCPToolResult(content=[{"type": "text", "text": result}])
+
         else:
             return MCPToolResult(
                 content=[{"type": "text", "text": f"Unknown tool: {tool_name}"}],
