@@ -30,16 +30,16 @@ param disableLocalAuth bool = true
 
 // Foundry AI configuration
 param foundryName string = ''
-param foundryModelDeploymentName string = 'gpt-4o-mini'
-param foundryModelName string = 'gpt-4o-mini'
-param foundryModelVersion string = '2024-07-18'
+param foundryModelDeploymentName string = 'gpt-5.4-mini'
+param foundryModelName string = 'gpt-5.4-mini'
+param foundryModelVersion string = '2026-03-17'
 param foundryModelCapacity int = 10
 
-// Fine-tuning model configuration
-param fineTuneModelDeploymentName string = 'gpt-4o-mini'
-param fineTuneModelName string = 'gpt-4o-mini'
-param fineTuneModelVersion string = '2024-07-18'
-param fineTuneModelCapacity int = 10
+// Evaluation/judge model configuration (Azure AI Evaluation judges for the Learning SDK)
+param evalModelDeploymentName string = 'gpt-5.4-mini-eval'
+param evalModelName string = 'gpt-5.4-mini'
+param evalModelVersion string = '2026-03-17'
+param evalModelCapacity int = 10
 
 // Embeddings model configuration
 param embeddingModelDeploymentName string = 'text-embedding-3-large'
@@ -54,6 +54,7 @@ param cosmosDatabaseName string = 'mcpdb'
 // Azure AI Search configuration
 param searchServiceName string = ''
 param searchIndexName string = 'task-instructions'
+param searchEnabled bool = false
 
 // Ontology storage container (used when Fabric is disabled)
 var ontologyContainerName = 'ontologies'
@@ -193,8 +194,13 @@ module apimService './core/apim/apim.bicep' = {
   params:{
     apiManagementName: apiManagementName
     logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsWorkspaceId
+    // Standard v2 outbound VNet integration so APIM can reach the private (internal LB) MCP backend.
+    apimSubnetId: vnetEnabled ? '${rg.id}/providers/Microsoft.Network/virtualNetworks/${serviceVirtualNetworkName}/subnets/apim' : ''
   }
-  dependsOn: [
+  dependsOn: vnetEnabled ? [
+    monitoring
+    serviceVirtualNetworkEarly
+  ] : [
     monitoring
   ]
 }
@@ -215,13 +221,14 @@ module oauthAPIModule './app/apim-oauth/oauth.bicep' = {
   }
 }
 
-// MCP server API endpoints pointing to AKS service via public LoadBalancer
+// MCP server API endpoints pointing to the AKS service via the internal (private) LoadBalancer.
+// APIM reaches this private IP through Standard v2 outbound VNet integration.
 module mcpApiModule './app/apim-mcp/mcp-api.bicep' = {
   name: 'mcpApiModule'
   scope: rg
   params: {
     apimServiceName: apimService.name
-    mcpServerBackendUrl: 'http://${mcpPublicIp.outputs.publicIpAddress}/runtime/webhooks/mcp'
+    mcpServerBackendUrl: 'http://10.0.4.4/runtime/webhooks/mcp'
   }
   dependsOn: [
     aksCluster
@@ -341,8 +348,8 @@ module aksCluster './core/aks/aks-cluster.bicep' = {
     aksClusterName: '${abbrs.containerServiceManagedClusters}${resourceToken}'
     location: location
     tags: tags
-    kubernetesVersion: '1.32.0'
-    systemNodePoolVmSize: 'Standard_DS2_v2'
+    kubernetesVersion: '1.34'
+    systemNodePoolVmSize: 'Standard_D4s_v3'
     systemNodePoolCount: 2
     userAssignedIdentityId: aksUserAssignedIdentity.outputs.identityId
     logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsWorkspaceId
@@ -356,19 +363,6 @@ module aksCluster './core/aks/aks-cluster.bicep' = {
   ] : [
     monitoring
   ]
-}
-
-// Static Public IP for MCP Server LoadBalancer
-// This IP is used by the Kubernetes LoadBalancer service and APIM backend
-module mcpPublicIp './core/network/public-ip.bicep' = {
-  name: 'mcpPublicIp'
-  scope: rg
-  params: {
-    publicIpName: 'pip-mcp-${resourceToken}'
-    location: location
-    tags: tags
-    dnsLabel: 'mcp-${resourceToken}'
-  }
 }
 
 // Grant AKS pull access to ACR
@@ -502,15 +496,16 @@ module foundry './core/ai/foundry.bicep' = {
   params: {
     foundryName: foundryResourceName
     bingName: bingResourceName
+    bingEnabled: false
     location: location
     modelDeploymentName: foundryModelDeploymentName
     modelName: foundryModelName
     modelVersion: foundryModelVersion
     modelCapacity: foundryModelCapacity
-    fineTuneModelDeploymentName: fineTuneModelDeploymentName
-    fineTuneModelName: fineTuneModelName
-    fineTuneModelVersion: fineTuneModelVersion
-    fineTuneModelCapacity: fineTuneModelCapacity
+    evalModelDeploymentName: evalModelDeploymentName
+    evalModelName: evalModelName
+    evalModelVersion: evalModelVersion
+    evalModelCapacity: evalModelCapacity
     embeddingModelDeploymentName: embeddingModelDeploymentName
     embeddingModelName: embeddingModelName
     embeddingModelVersion: embeddingModelVersion
@@ -703,16 +698,16 @@ module cosmosShortTermMemoryContainer './core/cosmos-db/nosql/container.bicep' =
 }
 
 // =========================================
-// Agent Lightning Cosmos DB Resources
-// Database and containers for RL fine-tuning loop
-// See docs/AGENT-LIGHTNING.md for details
+// Azure Agents Learning SDK Cosmos DB Resources
+// Database and containers for the in-process reinforcement-learning loop
+// See docs/AGENTS_AGENT_LEARNING_DESIGN.md for details
 // =========================================
-module lightningCosmos './app/lightning-cosmos.bicep' = {
-  name: 'lightningCosmos'
+module learningCosmos './app/learning-cosmos.bicep' = {
+  name: 'learningCosmos'
   scope: rg
   params: {
     parentAccountName: cosmosAccount.outputs.name
-    databaseName: 'agent_rl'
+    databaseName: 'agent_learning'
     tags: tags
   }
 }
@@ -765,7 +760,7 @@ module cosmosRoleAssignmentDeveloper './app/cosmos-RoleAssignment.bicep' = if (!
 var searchResourceName = !empty(searchServiceName) ? searchServiceName : '${abbrs.searchSearchServices}${resourceToken}'
 
 // Azure AI Search Service with semantic search and private networking
-module searchService './core/search/search-service.bicep' = {
+module searchService './core/search/search-service.bicep' = if (searchEnabled) {
   name: 'searchService'
   scope: rg
   params: {
@@ -790,7 +785,7 @@ module searchService './core/search/search-service.bicep' = {
 // RBAC: Search Index Data Contributor role for MCP server identity
 // This allows the MCP server to read/write data in search indexes
 var SearchIndexDataContributor = '8ebe5a00-799e-43f5-93ac-243d3dce84a7'
-module searchRoleAssignmentMcp './core/search/search-role-assignment.bicep' = {
+module searchRoleAssignmentMcp './core/search/search-role-assignment.bicep' = if (searchEnabled) {
   name: 'searchRoleAssignmentMcp'
   scope: rg
   params: {
@@ -803,7 +798,7 @@ module searchRoleAssignmentMcp './core/search/search-role-assignment.bicep' = {
 // RBAC: Search Service Contributor role for MCP server identity
 // This allows the MCP server to manage indexes and knowledge bases
 var SearchServiceContributor = '7ca78c08-252a-4471-8644-bb5ff32d4ba0'
-module searchServiceRoleAssignmentMcp './core/search/search-role-assignment.bicep' = {
+module searchServiceRoleAssignmentMcp './core/search/search-role-assignment.bicep' = if (searchEnabled) {
   name: 'searchServiceRoleAssignmentMcp'
   scope: rg
   params: {
@@ -842,7 +837,6 @@ module fabricPrivateEndpoint 'app/fabric-PrivateEndpoint.bicep' = if (fabricEnab
     tags: tags
     virtualNetworkName: serviceVirtualNetworkName
     subnetName: vnetEnabled ? serviceVirtualNetworkPrivateEndpointSubnetName : ''
-    fabricCapacityId: fabricCapacity!.outputs.id
     fabricPrivateLinkServiceId: fabricPrivateLinkServiceId
     fabricCapacityName: fabricResourceName
   }
@@ -993,7 +987,7 @@ module agentRoleAssignments './app/agent-RoleAssignments.bicep' = if (agentIdent
   params: {
     agentPrincipalId: nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId
     cosmosAccountName: cosmosAccount.outputs.name
-    searchServiceName: searchService.outputs.name
+    searchServiceName: searchEnabled ? searchService.outputs.name : ''
     storageAccountName: storage.outputs.name
     foundryAccountName: foundry.outputs.foundryAccountName
   }
@@ -1129,8 +1123,10 @@ output MCP_OAUTH_TOKEN_URL string = '${apimService.outputs.gatewayUrl}/mcp/oauth
 output MCP_CLIENT_ID string = existingEntraAppId
 output AZURE_RESOURCE_GROUP_NAME string = rg.name
 output AZURE_SUBSCRIPTION_ID string = subscription().subscriptionId
-output MCP_PUBLIC_IP_ADDRESS string = mcpPublicIp.outputs.publicIpAddress
-output MCP_PUBLIC_IP_NAME string = 'pip-mcp-${resourceToken}'
+// MCP server is exposed via an INTERNAL (private) LoadBalancer reachable by APIM through
+// Standard v2 outbound VNet integration. No public IP is provisioned for the MCP server.
+output MCP_INTERNAL_LB_IP string = '10.0.4.4'
+output MCP_LB_SUBNET_NAME string = 'svc-lb'
 
 // Foundry outputs
 output FOUNDRY_PROJECT_ENDPOINT string = foundry.outputs.projectEndpoint
@@ -1143,14 +1139,14 @@ output COSMOSDB_ENDPOINT string = cosmosAccount.outputs.endpoint
 output COSMOSDB_DATABASE_NAME string = cosmosDatabaseName
 output COSMOSDB_ACCOUNT_NAME string = cosmosAccount.outputs.name
 
-// Agent Lightning Cosmos DB outputs (for RL fine-tuning)
+// Azure Agents Learning SDK Cosmos DB outputs (in-process reinforcement learning)
 output COSMOS_ACCOUNT_URI string = cosmosAccount.outputs.endpoint
-output COSMOS_DATABASE_NAME string = lightningCosmos.outputs.databaseName
+output COSMOS_DATABASE_NAME string = learningCosmos.outputs.databaseName
 
 // Azure AI Search outputs
-output AZURE_SEARCH_ENDPOINT string = searchService.outputs.endpoint
+output AZURE_SEARCH_ENDPOINT string = searchEnabled ? searchService.outputs.endpoint : ''
 output AZURE_SEARCH_INDEX_NAME string = searchIndexName
-output AZURE_SEARCH_SERVICE_NAME string = searchService.outputs.name
+output AZURE_SEARCH_SERVICE_NAME string = searchEnabled ? searchService.outputs.name : ''
 
 // Ontology storage outputs (Azure Blob Storage - used when Fabric is disabled)
 output ONTOLOGY_CONTAINER_NAME string = ontologyContainerName

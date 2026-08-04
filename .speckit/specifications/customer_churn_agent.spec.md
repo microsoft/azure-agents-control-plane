@@ -192,7 +192,9 @@ sequenceDiagram
 | Recommendation Relevance | GPT-4 judge | > 0.80 |
 | Groundedness | Fact verification | > 0.90 |
 
-## Fine-Tuning Specification
+## Learning Specification
+
+The agent's behavior is optimized in-process by the Azure Agents Learning SDK: captured episodes are scored (Azure AI Evaluation judges or outcome signals) and used to learn a policy over discrete action choices — there is no model-weight fine-tuning.
 
 ### Episode Capture
 

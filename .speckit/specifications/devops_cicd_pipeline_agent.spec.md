@@ -80,7 +80,7 @@ Agent 365 bridges the gap between autonomous AI capabilities and enterprise gove
 | Approval Queue | Cosmos DB + Power Automate | Event-driven workflow |
 | Activity Log | Azure Monitor + Cosmos DB | Comprehensive audit |
 | Escalation Router | Event Grid + Logic Apps | Rule-based routing |
-| Feedback Capture | Cosmos DB | Fine-tuning signals |
+| Feedback Capture | Cosmos DB | Reinforcement-learning signals |
 | Notifications | Teams + Email | Multi-channel |
 
 ## MCP Tool Catalog
@@ -365,7 +365,9 @@ sequenceDiagram
 | Fix Suggestion Relevance | GPT-4 judge | > 0.75 |
 | Groundedness | Fact verification | > 0.90 |
 
-## Fine-Tuning Specification
+## Learning Specification
+
+The agent's behavior is optimized in-process by the Azure Agents Learning SDK: captured episodes are scored (Azure AI Evaluation judges or outcome signals) and used to learn a policy over discrete action choices — there is no model-weight fine-tuning.
 
 ### Episode Capture
 

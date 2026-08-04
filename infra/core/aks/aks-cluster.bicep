@@ -8,7 +8,7 @@ param location string = resourceGroup().location
 param tags object = {}
 
 @description('Kubernetes version')
-param kubernetesVersion string = '1.32.0'
+param kubernetesVersion string = '1.34'
 
 @description('System node pool VM size')
 param systemNodePoolVmSize string = 'Standard_DS2_v2'

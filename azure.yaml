@@ -1,8 +1,8 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
 
-name: apim-mcp-aks
+name: azure-agents-control-plane
 metadata:
-  template: apim-mcp-aks@1.0.0
+  template: azure-agents-control-plane@1.0.0
   
 services:
   mcp-agents:
@@ -10,6 +10,8 @@ services:
     language: python
     host: aks
     resourceName: ${AKS_CLUSTER_NAME}
+    docker:
+      remoteBuild: true
     
 hooks:
   postprovision:

@@ -299,14 +299,15 @@
       <text x="70" y="56" class="sublabel">Human-in-the-Loop</text>
     </g>
     
-    <!-- Agent Lightning Section - Centered vertically in bottom third -->
+    <!-- Azure Agents Learning SDK Section - Centered vertically in bottom third -->
     <g transform="translate(290, 205)">
       <rect x="0" y="0" width="220" height="70" fill="#1a1a1a" stroke="#f7931e" stroke-width="2" class="box"/>
       <g class="logo-glow" transform="translate(16, 14)">
-        <path d="M 18 0 L 7 20 L 15 20 L 11 42 L 32 18 L 23 18 L 28 0 Z" fill="#f7931e"/>
+        <polyline points="2,40 14,24 22,30 40,6" fill="none" stroke="#f7931e" stroke-width="4"/>
+        <path d="M 40 6 L 31 7 M 40 6 L 39 15" fill="none" stroke="#f7931e" stroke-width="4"/>
       </g>
-      <text x="65" y="36" class="title">Agent Lightning</text>
-      <text x="65" y="56" class="sublabel">Fine-Tuning &amp; RL</text>
+      <text x="65" y="36" class="title">Agent Learning</text>
+      <text x="65" y="56" class="sublabel">In-Process RL</text>
     </g>
   </g>
   

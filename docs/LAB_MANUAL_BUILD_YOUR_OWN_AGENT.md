@@ -16,7 +16,7 @@ This lab guides you through creating a new AI agent using Azure as the secured, 
 | [Exercise 1: Lab Intro](exercises/exercise_01_lab_intro.md) | 30 min | Review objectives, architecture, validate environment |
 | [Exercise 2: Build Agents](exercises/exercise_02_build_agents.md) | 2 hr | Use GitHub Copilot and SpecKit to specify, create, test, and deploy agents |
 | [Exercise 3: Review Agents Control Plane](exercises/exercise_03_review_agents_control_plane.md) | 30 min | Inspect security, governance, memory, and observability. |
-| [Exercise 4: Fine-Tune and Evaluate Agent](exercises/exercise_04_fine_tune_agent_evaluations.md) | 1 hr | Evaluate baseline, fine-tune with Agent Lightning, re-evaluate to validate improvement |
+| [Exercise 4: Optimize and Evaluate Agent](exercises/exercise_04_optimize_and_evaluate_agent.md) | 1 hr | Evaluate baseline, optimize with the Azure Agents Learning SDK, re-evaluate to validate improvement |
 
 ---
 
@@ -37,7 +37,7 @@ Traditional AI agent frameworks and architectures focus on getting something wor
 - **Identity-First Security** - Every agent has a Microsoft Entra ID Agent identity with Role-Based Access Control (RBAC)
 - **API-First Architecture** - All agent operations flow through Azure API Management (APIM) using Model Context Protocol (MCP)
 - **Multi-Cloud Capable** - Agents can execute anywhere while being governed by Azure
-- **Continuous Improvement** - Built-in evaluations, learning, and fine-tuning pipelines
+- **Continuous Improvement** - Built-in evaluations and in-process reinforcement learning
 - **Human Oversight** - Agent 365 integration for human-in-the-loop workflows
 
 ---
@@ -49,7 +49,7 @@ Traditional AI agent frameworks and architectures focus on getting something wor
 3. [Exercise 1: Lab Intro](exercises/exercise_01_lab_intro.md)
 4. [Exercise 2: Build Agents](exercises/exercise_02_build_agents.md)
 5. [Exercise 3: Review Agents Control Plane](exercises/exercise_03_review_agents_control_plane.md)
-6. [Exercise 4: Fine-Tune and Evaluate Agent](exercises/exercise_04_fine_tune_agent_evaluations.md)
+6. [Exercise 4: Optimize and Evaluate Agent](exercises/exercise_04_optimize_and_evaluate_agent.md)
 7. [Optional Exercises](#optional-exercises)
 
 ---
@@ -81,13 +81,13 @@ By the end of this lab, you will be able to:
 - ✅ Monitor agent behavior using Azure Monitor and Application Insights
 - ✅ Query telemetry with Kusto Query Language (KQL)
 
-### Fine-Tuning & Evaluation
-- ✅ Establish baseline evaluation scores before fine-tuning
+### Learning & Evaluation
+- ✅ Establish baseline evaluation scores before learning
 - ✅ Capture agent episodes for training data collection
-- ✅ Label episodes with rewards (human or automated)
-- ✅ Fine-tune models using Agent Lightning
-- ✅ Re-evaluate after fine-tuning to measure improvement
-- ✅ Apply decision gates (keep, rollback, or retrain) based on eval results
+- ✅ Produce rewards from Azure AI Evaluation judges or manual labels
+- ✅ Optimize agent behavior with the Azure Agents Learning SDK (in-process reinforcement learning)
+- ✅ Re-evaluate after learning to measure improvement
+- ✅ Apply decision gates (keep, re-learn, or collect more data) based on eval results
 - ✅ Run structured evaluations measuring intent resolution, tool accuracy, and task adherence
 
 ---
@@ -146,20 +146,20 @@ Inspect security, governance, memory, and observability.
 
 ---
 
-### Exercise 4: Fine-Tune and Evaluate Agent (1 hour)
+### Exercise 4: Optimize and Evaluate Agent (1 hour)
 
-Establish baseline evaluations, fine-tune with Agent Lightning, re-evaluate to validate improvement.
+Establish baseline evaluations, optimize with the Azure Agents Learning SDK, re-evaluate to validate improvement.
 
 **Key Activities:**
 - Prepare evaluation dataset and run baseline evaluation
 - Enable episode capture and generate training data
-- Label episodes with rewards (manual or automated)
-- Build fine-tuning dataset and submit training job
-- Deploy fine-tuned model
+- Produce rewards from the Azure AI Evaluation judges or manual labels
+- Initialize a softmax policy over discrete action choices
+- Run an in-process REINFORCE learning batch and inspect the policy
 - Re-run evaluations and compare before/after scores
-- Apply decision gate: keep, rollback, or retrain
+- Apply decision gate: keep, re-learn, or collect more data
 - Store evaluation results for historical tracking
 
-**[Full Exercise →](exercises/exercise_04_fine_tune_agent_evaluations.md)**
+**[Full Exercise →](exercises/exercise_04_optimize_and_evaluate_agent.md)**
 
 ---

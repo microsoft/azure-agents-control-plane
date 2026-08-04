@@ -21,9 +21,6 @@ COPY next_best_action_agent.py .
 # Copy memory module
 COPY memory/ ./memory/
 
-# Copy lightning module (Agent Lightning RLHF)
-COPY lightning/ ./lightning/
-
 # Create non-root user
 RUN useradd -m -u 1000 mcpuser && \
     chown -R mcpuser:mcpuser /app

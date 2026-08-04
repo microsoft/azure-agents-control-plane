@@ -34,10 +34,10 @@ By completing this lab, you will learn how to:
 - ✅ Monitor agent behavior using Azure Monitor and Application Insights
 - ✅ Query telemetry with Kusto Query Language (KQL)
 
-### Fine-Tuning & Evaluation
+### Learning & Evaluation
 - ✅ Capture agent episodes for training data collection
-- ✅ Label episodes with rewards (human or automated)
-- ✅ Fine-tune models using Agent Lightning
+- ✅ Produce rewards from Azure AI Evaluation judges or manual labels
+- ✅ Optimize agent behavior with the Azure Agents Learning SDK (in-process reinforcement learning)
 - ✅ Run structured evaluations measuring intent resolution, tool accuracy, and task adherence
 
 ---

@@ -1,4 +1,4 @@
-# Build and push MCP server Docker image to Azure Container Registry
+﻿# Build and push MCP server Docker image to Azure Container Registry
 # PowerShell version
 
 $ErrorActionPreference = "Stop"
@@ -14,22 +14,20 @@ $IMAGE_NAME = if ($env:IMAGE_NAME) { $env:IMAGE_NAME } else { "mcp-agents" }
 $IMAGE_TAG = if ($env:IMAGE_TAG) { $env:IMAGE_TAG } else { "latest" }
 $FULL_IMAGE_NAME = "$($env:CONTAINER_REGISTRY)/$($IMAGE_NAME):$($IMAGE_TAG)"
 
-Write-Host "🏗️  Building Docker image: $FULL_IMAGE_NAME" -ForegroundColor Cyan
+Write-Host "Building image via ACR Tasks (linux/amd64): $FULL_IMAGE_NAME" -ForegroundColor Cyan
 
-# Build the Docker image
+$registryName = $env:CONTAINER_REGISTRY -replace '\..*', ''
+
+# Build and push using ACR Tasks: cloud build, always linux/amd64,
+# with no dependency on the local Docker daemon or host CPU architecture.
 Push-Location src
-docker build -t $FULL_IMAGE_NAME .
+az acr build --registry $registryName --image "$($IMAGE_NAME):$($IMAGE_TAG)" --platform linux/amd64 .
+$acrBuildExit = $LASTEXITCODE
 Pop-Location
 
-Write-Host "✅ Docker image built successfully" -ForegroundColor Green
+if ($acrBuildExit -ne 0) {
+    Write-Host "ACR build failed (exit $acrBuildExit)" -ForegroundColor Red
+    exit $acrBuildExit
+}
 
-# Login to Azure Container Registry
-Write-Host "🔐 Logging in to Azure Container Registry..." -ForegroundColor Yellow
-$registryName = $env:CONTAINER_REGISTRY -replace '\..*', ''
-az acr login --name $registryName
-
-# Push the image
-Write-Host "📤 Pushing Docker image to registry..." -ForegroundColor Yellow
-docker push $FULL_IMAGE_NAME
-
-Write-Host "✅ Docker image pushed successfully: $FULL_IMAGE_NAME" -ForegroundColor Green
+Write-Host "Image built and pushed successfully: $FULL_IMAGE_NAME" -ForegroundColor Green

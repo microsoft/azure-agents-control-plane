@@ -140,7 +140,7 @@ ContainerLog
 | take 100
 ```
 
-The logs reflect the runtime behavior of `next_best_action_agent.py` — a FastAPI MCP server that initializes CosmosDB clients for task and plan storage, sets up memory providers (short-term via CosmosDB, long-term via AI Search, and facts via Fabric IQ), generates embeddings for semantic similarity search, analyzes user intent, produces action plans, and optionally leverages Agent Lightning for fine-tuning — along with standard HTTP request handling from the Uvicorn server.
+The logs reflect the runtime behavior of `next_best_action_agent.py` — a FastAPI MCP server that initializes CosmosDB clients for task and plan storage, sets up memory providers (short-term via CosmosDB, long-term via AI Search, and facts via Fabric IQ), generates embeddings for semantic similarity search, analyzes user intent, produces action plans, and optionally leverages the Azure Agents Learning SDK for in-process reinforcement learning — along with standard HTTP request handling from the Uvicorn server.
 
 ---
 
@@ -227,4 +227,4 @@ Before proceeding to Exercise 4, please confirm the following:
 
 ---
 
-**Next:** [Exercise 4: Fine-Tune and Evaluate Agent](exercise_04_fine_tune_agent_evaluations.md)
+**Next:** [Exercise 4: Optimize and Evaluate Agent](exercise_04_optimize_and_evaluate_agent.md)

@@ -477,14 +477,15 @@
       <text x="38" y="22" font-family="Segoe UI" font-size="10" fill="#aaa">AI Search</text>
     </g>
     
-    <!-- Agent Lightning -->
+    <!-- Azure Agents Learning SDK -->
     <g transform="translate(360, 172)">
       <rect x="0" y="0" width="108" height="36" fill="#1a1a1a" stroke="#f7931e" stroke-width="1" class="box"/>
       <g transform="translate(6, 5)">
-        <path d="M 11 0 L 4 12 L 9 12 L 6 26 L 20 10 L 14 10 L 17 0 Z" fill="#f7931e"/>
+        <polyline points="2,24 9,15 14,19 24,4" fill="none" stroke="#f7931e" stroke-width="2.5"/>
+        <path d="M 24 4 L 18 5 M 24 4 L 23 10" fill="none" stroke="#f7931e" stroke-width="2.5"/>
       </g>
       <text x="34" y="15" font-family="Segoe UI" font-size="9" fill="#aaa">Agent</text>
-      <text x="34" y="26" font-family="Segoe UI" font-size="9" fill="#aaa">Lightning</text>
+      <text x="34" y="26" font-family="Segoe UI" font-size="9" fill="#aaa">Learning</text>
     </g>
     
     <!-- Row 5 -->

@@ -58,6 +58,9 @@
     },
     "purviewEnabled": {
       "value": "${PURVIEW_ENABLED=false}"
+    },
+    "searchEnabled": {
+      "value": "${SEARCH_ENABLED=false}"
     }
   }
 }

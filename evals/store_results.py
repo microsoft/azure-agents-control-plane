@@ -8,7 +8,7 @@ Usage:
     python -m evals.store_results \
         --input evals/eval_results/eval_summary_*.json \
         --agent-id mcp-agents \
-        --version v1.0-finetuned
+        --version policy-v1
 """
 
 import argparse

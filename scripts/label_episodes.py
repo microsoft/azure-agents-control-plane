@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Label captured episodes with rewards via MCP API (lightning_assign_reward).
+Label captured episodes with rewards via the Azure Agents Learning SDK
+(learning_assign_reward MCP tool).
 
 Automated labeling based on quality criteria:
   0.9-1.0  Excellent  — correct tool, complete response, accurate data
@@ -30,12 +31,11 @@ GOOD_TOOLS = {
     "next_best_action", "ask_foundry", "search_facts",
     "get_customer_churn_facts", "cross_domain_analysis",
     "store_memory", "recall_memory",
-    # Lightning operational tools are expected for system episodes
-    "lightning_list_episodes", "lightning_get_episode",
-    "lightning_assign_reward", "lightning_list_rewards",
-    "lightning_build_dataset", "lightning_list_datasets",
-    "lightning_list_training_runs", "lightning_get_active_deployment",
-    "lightning_list_deployments", "lightning_get_stats",
+    # Learning operational tools are expected for system episodes
+    "learning_list_episodes", "learning_get_episode",
+    "learning_assign_reward", "learning_list_rewards",
+    "learning_score_episode", "learning_get_metrics",
+    "learning_list_training_runs", "learning_get_stats",
 }
 
 
@@ -145,7 +145,7 @@ async def main(port: int, agent_id: str, limit: int):
             # Step 1: List episodes
             print(f"Listing episodes for agent '{agent_id}'...")
             episodes_data = await call_mcp_tool(
-                session, session_url, "lightning_list_episodes",
+                session, session_url, "learning_list_episodes",
                 {"agent_id": agent_id, "limit": limit}, "list-1"
             )
 
@@ -193,11 +193,11 @@ async def main(port: int, agent_id: str, limit: int):
 
                 # Assign reward via MCP
                 result = await call_mcp_tool(
-                    session, session_url, "lightning_assign_reward",
+                    session, session_url, "learning_assign_reward",
                     {
                         "episode_id": ep_id,
                         "reward_value": score,
-                        "reward_source": "eval_score",
+                        "reward_source": "test_result",
                         "agent_id": agent_id,
                         "rubric": "task_adherence",
                         "evaluator": "copilot_auto_labeler",

@@ -117,20 +117,18 @@ spec:
         - name: COSMOSDB_DATABASE_NAME
           value: "${COSMOSDB_DATABASE_NAME}"
         # =========================================
-        # Agent Lightning Configuration (RL Fine-Tuning)
+        # Azure Agents Learning SDK Configuration (in-process RL)
         # =========================================
-        - name: COSMOS_ACCOUNT_URI
+        - name: AGENT_LEARNING_STORE_BACKEND
+          value: "${AGENT_LEARNING_STORE_BACKEND:-cosmos}"
+        - name: AGENT_LEARNING_COSMOS_ENDPOINT
           value: "${COSMOSDB_ENDPOINT}"
-        - name: COSMOS_DATABASE_NAME
-          value: "agent_rl"
-        - name: LIGHTNING_AGENT_ID
+        - name: AGENT_LEARNING_COSMOS_DATABASE
+          value: "agent_learning"
+        - name: AGENT_LEARNING_AGENT_ID
           value: "mcp-agents"
-        - name: ENABLE_LIGHTNING_CAPTURE
-          value: "${ENABLE_LIGHTNING_CAPTURE:-false}"
-        - name: USE_TUNED_MODEL
-          value: "${USE_TUNED_MODEL:-false}"
-        - name: TUNED_MODEL_DEPLOYMENT_NAME
-          value: "${TUNED_MODEL_DEPLOYMENT_NAME:-}"
+        - name: AGENT_LEARNING_ENABLE_CAPTURE
+          value: "${AGENT_LEARNING_ENABLE_CAPTURE:-false}"
         # =========================================
         # Azure AI Search Configuration (Foundry IQ)
         # =========================================

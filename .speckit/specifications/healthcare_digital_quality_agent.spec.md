@@ -200,8 +200,8 @@ sequenceDiagram
 |--------|--------|-------------|
 | API Latency P95 | < 500ms | App Insights |
 | Availability | 99.9% | Azure Monitor |
-| Episode Capture Rate | 100% | Lightning metrics |
-| Fine-tuning Lift | > 5% | A/B evaluation |
+| Episode Capture Rate | 100% | Learning SDK metrics |
+| Policy improvement lift | > 5% | A/B evaluation |
 
 ## Testing Requirements
 
@@ -246,9 +246,11 @@ The agent is evaluated against the **Meridian Health Partners Quality Protocol (
 - Gap Closure Priority Algorithm with override rules
 - Member Engagement Score (MES) formula and tier-based outreach strategies
 
-The GroundednessEvaluator checks whether agent responses correctly reference this protocol. The base model lacks this knowledge; fine-tuning embeds it.
+The GroundednessEvaluator checks whether agent responses correctly reference this protocol. The base model lacks this knowledge; retrieved grounding facts and the learned prompt-selection policy supply it.
 
-## Fine-Tuning Specification
+## Learning Specification
+
+The agent's behavior is optimized in-process by the Azure Agents Learning SDK: captured episodes are scored (Azure AI Evaluation judges or outcome signals) and used to learn a policy over discrete action choices — there is no model-weight fine-tuning.
 
 ### Episode Capture
 
@@ -271,14 +273,13 @@ The GroundednessEvaluator checks whether agent responses correctly reference thi
 | Provider Accepted | Feedback | 0.3 |
 | Human Override | Agent 365 | -0.5 |
 
-### Training Pipeline
+### Learning Pipeline
 
 1. Capture episodes during production operation
-2. Label episodes with outcome-based rewards
-3. Build training dataset with positive/negative examples
-4. Fine-tune base model via Azure AI Foundry
-5. Evaluate tuned model against baseline
-6. Promote to production if evaluation passes
+2. Score episodes with outcome-based rewards (Azure AI Evaluation judges or tracked outcomes)
+3. Run an offline REINFORCE-with-baseline batch to update the policy
+4. Evaluate the updated policy against the previous version
+5. Roll the improved policy forward if evaluation passes
 
 ## Governance & Compliance
 

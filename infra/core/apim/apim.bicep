@@ -38,7 +38,7 @@ param apimLoggerDescription string  = 'APIM Logger for OpenAI API'
   'Standardv2'
   'Premium'
 ])
-param apimSku string = 'Basicv2'
+param apimSku string = 'Standardv2'
 
 @description('The instrumentation key for Application Insights')
 param appInsightsInstrumentationKey string = ''
@@ -51,6 +51,9 @@ param entraAppUserAssignedIdentityName string = 'entra-app-user-assigned-identit
 
 @description('The resource ID of the Log Analytics workspace for diagnostic settings')
 param logAnalyticsWorkspaceId string = ''
+
+@description('Resource ID of the delegated subnet used for APIM Standard v2 outbound VNet integration. Empty string disables VNet integration.')
+param apimSubnetId string = ''
 
 // ------------------
 //    VARIABLES
@@ -78,6 +81,12 @@ resource apimService 'Microsoft.ApiManagement/service@2024-06-01-preview' = {
   properties: {
     publisherEmail: publisherEmail
     publisherName: publisherName
+    publicNetworkAccess: 'Enabled'
+    // Standard v2 outbound VNet integration: public gateway, private backend access.
+    virtualNetworkType: !empty(apimSubnetId) ? 'External' : 'None'
+    virtualNetworkConfiguration: !empty(apimSubnetId) ? {
+      subnetResourceId: apimSubnetId
+    } : null
   }
   identity: {
     type: 'SystemAssigned, UserAssigned'

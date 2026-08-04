@@ -1,20 +1,20 @@
 # Azure Agents Control Plane
 
-The Azure Agents Control Plane governs the complete lifecycle of enterprise AI agents: analysis, design, development, testing, fine-tuning, and evaluation. It enables enterprise-grade AI agent development where Azure provides centralized governance, observability, identity, and compliance—regardless of agent execution location.
+The Azure Agents Control Plane governs the complete lifecycle of enterprise AI agents: analysis, design, development, testing, learning, and evaluation. It enables enterprise-grade AI agent development where Azure provides centralized governance, observability, identity, and compliance—regardless of agent execution location.
 
 **Core Principles:**
 
 - **Azure as Enterprise Control Plane** - Centralized governance with single or multi-cloud execution capability
-- **Specification-Driven Development** - SpecKit methodology ensures structured analysis, design, testing, fine tuning and evaluations
+- **Specification-Driven Development** - SpecKit methodology ensures structured analysis, design, testing, reinforcement learning and evaluations
 - **API-First Agent Architecture** - All agent operations flow through Azure API Management with Model Context Protocol (MCP) defining capabilities
 - **Identity-First Security** - Every agent receives a Microsoft Entra ID Agent identity with least-privilege role based authorization control (RBAC)
-- **Continuous Evaluation & Improvement** - Agent Lightning enables fine-tuning through reinforcement learning
+- **Continuous Evaluation & Improvement** - The Azure Agents Learning SDK enables in-process reinforcement learning
 
 The following two animations show the system architecture at runtime and buildtime.
 
 ### Runtime Architecture
 
-Runtime Architecture - Describes the request flow through API Management to AKS, workload identity, connections to AI Foundry, Cosmos DB, AI Search, Storage, Agent Lightning, and Fabric with observability through Monitor and App Insights.
+Runtime Architecture - Describes the request flow through API Management to AKS, workload identity, connections to AI Foundry, Cosmos DB, AI Search, Storage, the Azure Agents Learning SDK, and Fabric with observability through Monitor and App Insights.
 
 ![Runtime](runtime.svg)
 
@@ -33,7 +33,7 @@ For detailed architecture diagrams and component specifications, see [docs/AGENT
 This project follows the [SpecKit Methodology](https://speckit.dev) for agent governance. Specifications are stored in `.speckit/` and define:
 
 - **Constitution** - Core principles, standards, and governance framework
-- **Agent Specifications** - Use case analysis, design, implementation, testing, fine-tuning, and evaluation for each agent
+- **Agent Specifications** - Use case analysis, design, implementation, testing, learning, and evaluation for each agent
 
 ### Governance Model
 
@@ -134,8 +134,8 @@ python tests/test_apim_mcp_connection.py --use-az-token
 | [AGENTS_APPROVALS.md](docs/AGENTS_APPROVALS.md)                                       | Agent 365 approvals and human-in-the-loop (HITL) |
 | [AGENTS_DEPLOYMENT_NOTES.md](docs/AGENTS_DEPLOYMENT_NOTES.md)                         | Detailed deployment notes                        |
 | [AGENTS_IDENTITY_DESIGN.md](docs/AGENTS_IDENTITY_DESIGN.md)                           | Identity architecture design                     |
-| [AGENTS_AGENT_LIGHTNING_DESIGN.md](docs/AGENTS_AGENT_LIGHTNING_DESIGN.md)             | Fine-tuning and RL documentation                 |
-| [AGENTS_AGENT_LIGHTNING_TEST_RESULTS.md](docs/AGENTS_AGENT_LIGHTNING_TEST_RESULTS.md) | Lightning test results                           |
+| [AGENTS_AGENT_LEARNING_DESIGN.md](docs/AGENTS_AGENT_LEARNING_DESIGN.md)               | Reinforcement learning (Azure Agents Learning SDK) documentation |
+| [AGENTS_AGENT_LEARNING_TEST_RESULTS.md](docs/AGENTS_AGENT_LEARNING_TEST_RESULTS.md)   | Learning SDK test results                        |
 | [AGENTS_EVALUATIONS.md](docs/AGENTS_EVALUATIONS.md)                                   | Agent evaluation framework                       |
 | [AGENTS_TEST_RESULTS.md](docs/AGENTS_TEST_RESULTS.md)                                 | Integration test results                         |
 | [DEFENDER_FOR_CLOUD_TESTING.md](docs/DEFENDER_FOR_CLOUD_TESTING.md)                   | Defender for Cloud deployment and testing guide  |
@@ -177,7 +177,7 @@ python tests/test_apim_mcp_connection.py --use-az-token
 
 ### Agent Frameworks & Tools
 
-- [Agent Lightning](docs/AGENTS_AGENT_LIGHTNING_DESIGN.md) - Fine-tuning and reinforcement learning
+- [Azure Agents Learning SDK](docs/AGENTS_AGENT_LEARNING_DESIGN.md) - In-process reinforcement learning
 - [Agents 365](https://learn.microsoft.com/microsoft-365-copilot/extensibility/) - Human-in-the-Loop integration
 - [MCP Inspector](https://github.com/modelcontextprotocol/inspector)
 - [Microsoft Agent Framework](https://learn.microsoft.com/azure/ai-services/agents/)

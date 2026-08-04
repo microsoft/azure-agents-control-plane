@@ -15,7 +15,7 @@ Tests cover:
 - find_similar_tasks
 - analyze_intent
 - generate_plan / generate_plan_with_instructions
-- lightning_* tools (unavailable path)
+- learning_* tools (unavailable path)
 - fabric_* wrappers (unavailable path)
 - FastAPI endpoints: health, root, mcp_message_endpoint, agent_chat
 - MCPTool / MCPToolResult dataclasses
@@ -104,8 +104,8 @@ _fabric_tools = MagicMock()
 _fabric_tools.FABRIC_DATA_AGENTS_ENABLED = False
 sys.modules.setdefault("fabric_tools", _fabric_tools)
 
-# ---- lightning stub --------------------------------------------------------
-sys.modules.setdefault("lightning", MagicMock())
+# ---- agent_learning SDK stub -----------------------------------------------
+sys.modules.setdefault("agent_learning", MagicMock())
 
 # ---- agent365_approval stub -----------------------------------------------
 _agent365 = MagicMock()
@@ -144,8 +144,7 @@ os.environ.setdefault("FOUNDRY_MODEL_DEPLOYMENT_NAME", "gpt-test")
 os.environ.setdefault("EMBEDDING_MODEL_DEPLOYMENT_NAME", "embed-test")
 os.environ.setdefault("AZURE_SEARCH_ENDPOINT", "")
 os.environ.setdefault("FABRIC_ENABLED", "false")
-os.environ.setdefault("ENABLE_LIGHTNING_CAPTURE", "false")
-os.environ.setdefault("USE_TUNED_MODEL", "false")
+os.environ.setdefault("AGENT_LEARNING_ENABLE_CAPTURE", "false")
 
 # Now import the module under test
 # We add `src/` to sys.path so the import resolves
@@ -216,44 +215,16 @@ class TestCosineSimilarity(unittest.TestCase):
 
 
 class TestGetModelDeployment(unittest.TestCase):
-    """Tests for get_model_deployment()."""
+    """Tests for get_model_deployment().
 
-    @patch.object(agent, "USE_TUNED_MODEL", False)
-    def test_returns_base_model_when_tuned_disabled(self):
+    The Azure Agents Learning SDK optimizes agent behavior in-process by
+    learning a policy over discrete action choices rather than fine-tuning
+    model weights, so the model deployment is always the base Foundry model.
+    """
+
+    def test_returns_base_model(self):
         result = agent.get_model_deployment()
         self.assertEqual(result, agent.FOUNDRY_MODEL_DEPLOYMENT_NAME)
-
-    @patch.object(agent, "USE_TUNED_MODEL", True)
-    @patch.object(agent, "deployment_registry", None)
-    @patch.object(agent, "TUNED_MODEL_DEPLOYMENT_NAME", "")
-    def test_falls_back_to_base_model(self):
-        result = agent.get_model_deployment()
-        self.assertEqual(result, agent.FOUNDRY_MODEL_DEPLOYMENT_NAME)
-
-    @patch.object(agent, "USE_TUNED_MODEL", True)
-    @patch.object(agent, "deployment_registry", None)
-    @patch.object(agent, "TUNED_MODEL_DEPLOYMENT_NAME", "tuned-v1")
-    def test_env_var_fallback(self):
-        result = agent.get_model_deployment()
-        self.assertEqual(result, "tuned-v1")
-
-    @patch.object(agent, "USE_TUNED_MODEL", True)
-    @patch.object(agent, "TUNED_MODEL_DEPLOYMENT_NAME", "tuned-v1")
-    def test_registry_takes_precedence(self):
-        mock_reg = MagicMock()
-        mock_reg.get_active_model.return_value = "tuned-from-cosmos"
-        with patch.object(agent, "deployment_registry", mock_reg):
-            result = agent.get_model_deployment()
-        self.assertEqual(result, "tuned-from-cosmos")
-
-    @patch.object(agent, "USE_TUNED_MODEL", True)
-    @patch.object(agent, "TUNED_MODEL_DEPLOYMENT_NAME", "tuned-v1")
-    def test_registry_exception_falls_back(self):
-        mock_reg = MagicMock()
-        mock_reg.get_active_model.side_effect = RuntimeError("boom")
-        with patch.object(agent, "deployment_registry", mock_reg):
-            result = agent.get_model_deployment()
-        self.assertEqual(result, "tuned-v1")
 
 
 # ===========================================================================
@@ -415,39 +386,45 @@ class TestFactsToolsUnavailable(unittest.TestCase):
 
 
 # ===========================================================================
-#  Tests – Lightning tools (unavailable path)
+#  Tests – Learning tools (unavailable path)
 # ===========================================================================
 
 
-class TestLightningToolsUnavailable(unittest.TestCase):
-    @patch.object(agent, "LIGHTNING_AVAILABLE", False)
-    @patch.object(agent, "rl_ledger", None)
+class TestLearningToolsUnavailable(unittest.TestCase):
+    @patch.object(agent, "LEARNING_AVAILABLE", False)
+    @patch.object(agent, "learning_store", None)
     def test_list_episodes_unavailable(self):
-        result = json.loads(agent.lightning_list_episodes_tool())
+        result = json.loads(agent.learning_list_episodes_tool())
         self.assertIn("error", result)
 
-    @patch.object(agent, "LIGHTNING_AVAILABLE", False)
-    @patch.object(agent, "rl_ledger", None)
+    @patch.object(agent, "LEARNING_AVAILABLE", False)
+    @patch.object(agent, "learning_store", None)
     def test_get_episode_unavailable(self):
-        result = json.loads(agent.lightning_get_episode_tool("ep-1"))
+        result = json.loads(agent.learning_get_episode_tool("ep-1"))
         self.assertIn("error", result)
 
-    @patch.object(agent, "LIGHTNING_AVAILABLE", False)
-    @patch.object(agent, "reward_writer", None)
+    @patch.object(agent, "LEARNING_AVAILABLE", False)
+    @patch.object(agent, "learning_store", None)
     def test_assign_reward_unavailable(self):
-        result = json.loads(agent.lightning_assign_reward_tool("ep-1", 0.9))
+        result = json.loads(agent.learning_assign_reward_tool("ep-1", 0.9))
         self.assertIn("error", result)
 
-    @patch.object(agent, "LIGHTNING_AVAILABLE", False)
-    @patch.object(agent, "rl_ledger", None)
+    @patch.object(agent, "LEARNING_AVAILABLE", False)
+    @patch.object(agent, "learning_store", None)
     def test_list_rewards_unavailable(self):
-        result = json.loads(agent.lightning_list_rewards_tool())
+        result = json.loads(agent.learning_list_rewards_tool())
         self.assertIn("error", result)
 
-    @patch.object(agent, "LIGHTNING_AVAILABLE", False)
-    @patch.object(agent, "dataset_builder", None)
-    def test_build_dataset_unavailable(self):
-        result = json.loads(agent.lightning_build_dataset_tool("ds-1"))
+    @patch.object(agent, "LEARNING_AVAILABLE", False)
+    @patch.object(agent, "learning_store", None)
+    def test_score_episode_unavailable(self):
+        result = json.loads(agent.learning_score_episode_tool("ep-1"))
+        self.assertIn("error", result)
+
+    @patch.object(agent, "LEARNING_AVAILABLE", False)
+    @patch.object(agent, "learning_store", None)
+    def test_get_policy_unavailable(self):
+        result = json.loads(agent.learning_get_policy_tool())
         self.assertIn("error", result)
 
 

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-The Azure Agents Control Plane governs the complete lifecycle of enterprise AI agents, SDLC: analysis, design, development, testing, fine-tuning, and evaluation. This constitution establishes the principles, standards, and governance framework for building agents using Azure API Management (APIM), Model Context Protocol (MCP), and Azure Kubernetes Service (AKS) as the foundational control plane infrastructure.
+The Azure Agents Control Plane governs the complete lifecycle of enterprise AI agents, SDLC: analysis, design, development, testing, learning, and evaluation. This constitution establishes the principles, standards, and governance framework for building agents using Azure API Management (APIM), Model Context Protocol (MCP), and Azure Kubernetes Service (AKS) as the foundational control plane infrastructure.
 
 **Mission**: Enable enterprise-grade AI agent development where Azure provides centralized governance, observability, identity, and compliance—regardless of agent execution location.
 
@@ -39,7 +39,7 @@ The Azure Agents Control Plane governs the complete lifecycle of enterprise AI a
 ### 5. Continuous Evaluation & Improvement
 
 - **Agent Evaluations**: Built-in evaluation framework measures task adherence, safety, and quality
-- **Fine-Tuning Pipeline**: Agent Lightning captures episodes for reinforcement learning
+- **Reinforcement Learning**: The Azure Agents Learning SDK captures episodes and learns an action-selection policy in-process
 - **Behavioral Optimization**: Continuous feedback loops improve agent performance
 - **Human-in-the-Loop**: Agent 365 enables oversight for critical decisions
 
@@ -90,13 +90,13 @@ The Azure Agents Control Plane governs the complete lifecycle of enterprise AI a
 - **Functional Tests**: Use case validation via Copilot-driven testing
 - **Security Tests**: Authentication, authorization, input validation
 
-### Fine-Tuning Phase
+### Learning Phase
 
-- **Episode Capture**: Enable Lightning capture for training data collection
-- **Reward Labeling**: Human or automated scoring of agent behaviors
-- **Dataset Building**: Create training datasets from labeled episodes
-- **Model Training**: Execute fine-tuning jobs via Azure AI Foundry
-- **Promotion**: Deploy tuned models to production after validation
+- **Episode Capture**: Enable Azure Agents Learning SDK capture for training data collection
+- **Reward Signal**: Score episodes with Azure AI Evaluation judges (intent resolution, task adherence, task completion) or human labels
+- **Policy Initialization**: Define the discrete action space (prompt variants, retrieval strategies) the policy selects from
+- **Policy Learning**: Run offline REINFORCE-with-baseline batches to update the policy in-process
+- **Evaluation**: Compare policy versions and roll improvements forward after validation
 
 ### Evaluation Phase
 
@@ -123,10 +123,10 @@ src/
 ├── tools/               # MCP tool implementations
 │   ├── registry.py      # Tool catalog
 │   └── adapters/        # External service adapters
-├── lightning/           # Fine-tuning framework
-│   ├── capture.py       # Episode recording
-│   ├── rewards.py       # Reward labeling
-│   └── training.py      # Training orchestration
+├── learning/            # Azure Agents Learning SDK integration (in-process RL)
+│   ├── capture.py       # Episode capture hook
+│   ├── policy.py        # Softmax policy over discrete actions
+│   └── runner.py        # REINFORCE learning runner
 └── evaluation/          # Evaluation framework
     ├── metrics.py       # Metric definitions
     ├── runners.py       # Evaluation execution
@@ -157,7 +157,7 @@ infra/
 3. **Tool Execution**: Agent → Tool → External Service (via managed identity)
 4. **Memory Operations**: Agent → Memory Provider → CosmosDB/AI Search/Fabric
 5. **Telemetry**: All operations → OpenTelemetry → App Insights
-6. **Fine-Tuning**: Episodes → Lightning → AI Foundry → Tuned Models
+6. **Learning**: Episodes → Judges → REINFORCE → Policy Update
 
 ## Success Criteria
 
@@ -178,7 +178,7 @@ infra/
 - ✅ Infrastructure provisioned via azd in < 30 minutes
 - ✅ Zero-downtime deployments via AKS rolling updates
 - ✅ Observability dashboards available within 5 minutes of deployment
-- ✅ Fine-tuning pipeline executable end-to-end
+- ✅ Reinforcement-learning loop executable end-to-end
 
 ## Constraints & Assumptions
 
@@ -217,7 +217,7 @@ infra/
 ### Lifecycle Management
 - Agents versioned with semantic versioning
 - Deprecated agents have 90-day sunset period
-- Fine-tuned models tracked with lineage to base models
+- Policy versions tracked with lineage across learning runs
 - Evaluation baselines maintained for regression detection
 
 ## Solution Architecture Summary
@@ -242,7 +242,7 @@ This constitution supports the Azure Agents Control Plane Lab with the following
 1. **Lab Intro.** (30 min): Environment validation and architecture walkthrough
 2. **Build Agents** (1 hr): Specification-driven agent development with Copilot
 3. **End-to-End Review** (30 min): Governance verification across all pillars
-4. **Fine-Tuning** (1 hr): Agent Lightning workflow for behavior optimization
+4. **Learning** (1 hr): Azure Agents Learning SDK workflow for behavior optimization
 5. **Evaluations** (1 hr): Evaluation framework for task adherence and quality
 
 **Success Criteria**: "Copilot helped me move faster, but Microsoft Azure, Foundry and Fabric made this enterprise ready."

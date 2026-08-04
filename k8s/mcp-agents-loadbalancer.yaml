@@ -4,13 +4,14 @@ metadata:
   name: mcp-agents-loadbalancer
   namespace: mcp-agents
   annotations:
-    service.beta.kubernetes.io/azure-load-balancer-internal: "false"  # Public load balancer
-    # The resource group where the public IP resides (set by post-provision script)
-    service.beta.kubernetes.io/azure-load-balancer-resource-group: "${AZURE_RESOURCE_GROUP_NAME}"
+    # Internal (private) load balancer within the VNet - reached by APIM via Standard v2 VNet integration.
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+    # Place the internal LB frontend in the dedicated svc-lb subnet (set by post-provision script)
+    service.beta.kubernetes.io/azure-load-balancer-internal-subnet: "${MCP_LB_SUBNET_NAME}"
 spec:
   type: LoadBalancer
-  # Static IP allocated by Bicep (set by post-provision script)
-  loadBalancerIP: "${MCP_PUBLIC_IP_ADDRESS}"
+  # Static private IP from the svc-lb subnet - APIM's backend targets this address (set by post-provision script)
+  loadBalancerIP: "${MCP_INTERNAL_LB_IP}"
   selector:
     app: mcp-agents
   ports:

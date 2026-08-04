@@ -4,6 +4,9 @@ param foundryName string
 @description('Name of the Bing Grounding resource')
 param bingName string
 
+@description('Enable Bing Grounding (disable when Bing is unavailable/suspended for the subscription)')
+param bingEnabled bool = true
+
 @description('Location for all resources')
 param location string
 
@@ -19,17 +22,17 @@ param modelVersion string
 @description('Model capacity')
 param modelCapacity int
 
-@description('Fine-tuning model deployment name')
-param fineTuneModelDeploymentName string = 'gpt-4o-mini'
+@description('Evaluation/judge model deployment name (Azure AI Evaluation judges for the Learning SDK)')
+param evalModelDeploymentName string = 'gpt-4o-mini'
 
-@description('Fine-tuning model name')
-param fineTuneModelName string = 'gpt-4o-mini'
+@description('Evaluation/judge model name')
+param evalModelName string = 'gpt-4o-mini'
 
-@description('Fine-tuning model version')
-param fineTuneModelVersion string = '2024-07-18'
+@description('Evaluation/judge model version')
+param evalModelVersion string = '2024-07-18'
 
-@description('Fine-tuning model capacity')
-param fineTuneModelCapacity int = 10
+@description('Evaluation/judge model capacity')
+param evalModelCapacity int = 10
 
 @description('Embedding model deployment name')
 param embeddingModelDeploymentName string = 'text-embedding-3-large'
@@ -53,7 +56,7 @@ param enablePrivateEndpoint bool = false
 param publicNetworkAccess string = 'Enabled'
 
 // Create Bing Grounding resource
-resource bingGrounding 'Microsoft.Bing/accounts@2020-06-10' = {
+resource bingGrounding 'Microsoft.Bing/accounts@2020-06-10' = if (bingEnabled) {
   name: bingName
   location: 'global'
   sku: {
@@ -124,22 +127,22 @@ resource modelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-
   }
 }
 
-// Deploy gpt-4o-mini model for fine-tuning
-resource fineTuneModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = {
+// Deploy gpt-5.4-mini model for Azure AI Evaluation judges (Learning SDK reward signal)
+resource evalModelDeployment 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = {
   parent: foundryAccount
-  name: fineTuneModelDeploymentName
+  name: evalModelDeploymentName
   sku: {
-    name: 'Standard'
-    capacity: fineTuneModelCapacity
+    name: 'GlobalStandard'
+    capacity: evalModelCapacity
   }
   properties: {
     model: {
       format: 'OpenAI'
-      name: fineTuneModelName
-      version: fineTuneModelVersion
+      name: evalModelName
+      version: evalModelVersion
     }
     versionUpgradeOption: 'OnceNewDefaultVersionAvailable'
-    currentCapacity: fineTuneModelCapacity
+    currentCapacity: evalModelCapacity
     raiPolicyName: 'Microsoft.DefaultV2'
   }
   dependsOn: [
@@ -166,7 +169,7 @@ resource embeddingModelDeployment 'Microsoft.CognitiveServices/accounts/deployme
     raiPolicyName: 'Microsoft.DefaultV2'
   }
   dependsOn: [
-    fineTuneModelDeployment
+    evalModelDeployment
   ]
 }
 
@@ -186,7 +189,7 @@ resource defaultProject 'Microsoft.CognitiveServices/accounts/projects@2025-06-0
 }
 
 // Create Bing connection at project level
-resource bingConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2025-06-01' = {
+resource bingConnection 'Microsoft.CognitiveServices/accounts/projects/connections@2025-06-01' = if (bingEnabled) {
   parent: defaultProject
   name: bingName
   properties: {
@@ -214,9 +217,9 @@ output foundryAccountName string = foundryAccount.name
 output foundryEndpoint string = foundryAccount.properties.endpoint
 output projectId string = defaultProject.id
 output projectEndpoint string = 'https://${foundryName}.services.ai.azure.com/api/projects/proj-default'
-output bingConnectionId string = bingConnection.id
-output bingConnectionName string = bingConnection.name
-output bingResourceId string = bingGrounding.id
+output bingConnectionId string = bingEnabled ? bingConnection.id : ''
+output bingConnectionName string = bingEnabled ? bingConnection.name : ''
+output bingResourceId string = bingEnabled ? bingGrounding.id : ''
 output modelDeploymentName string = modelDeployment.name
-output fineTuneModelDeploymentName string = fineTuneModelDeployment.name
+output evalModelDeploymentName string = evalModelDeployment.name
 output embeddingModelDeploymentName string = embeddingModelDeployment.name

@@ -37,13 +37,13 @@ async def main(port: int, agent_id: str, limit: int):
 
             print(f"Session established\n")
 
-            # Call lightning_list_episodes tool
+            # Call learning_list_episodes tool
             request = {
                 "jsonrpc": "2.0",
                 "id": "list-episodes-1",
                 "method": "tools/call",
                 "params": {
-                    "name": "lightning_list_episodes",
+                    "name": "learning_list_episodes",
                     "arguments": {
                         "agent_id": agent_id,
                         "limit": limit,

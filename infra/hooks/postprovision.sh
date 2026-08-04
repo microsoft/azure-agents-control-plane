@@ -15,7 +15,8 @@ RG_NAME=$(echo $AZURE_RESOURCE_GROUP_NAME | tr -d '"')
 CONTAINER_REG=$(echo $CONTAINER_REGISTRY | tr -d '"')
 STORAGE_URL=$(echo $AZURE_STORAGE_ACCOUNT_URL | tr -d '"')
 MCP_IDENTITY_CLIENT_ID=$(echo $MCP_SERVER_IDENTITY_CLIENT_ID | tr -d '"')
-MCP_PUBLIC_IP=$(echo $MCP_PUBLIC_IP_ADDRESS | tr -d '"')
+MCP_INTERNAL_LB_IP=$(echo ${MCP_INTERNAL_LB_IP:-10.0.4.4} | tr -d '"')
+MCP_LB_SUBNET_NAME=$(echo ${MCP_LB_SUBNET_NAME:-svc-lb} | tr -d '"')
 FOUNDRY_ENDPOINT=$(echo $FOUNDRY_PROJECT_ENDPOINT | tr -d '"')
 FOUNDRY_MODEL=$(echo $FOUNDRY_MODEL_DEPLOYMENT_NAME | tr -d '"')
 EMBEDDING_MODEL=$(echo $EMBEDDING_MODEL_DEPLOYMENT_NAME | tr -d '"')
@@ -27,7 +28,7 @@ SEARCH_INDEX=$(echo $AZURE_SEARCH_INDEX_NAME | tr -d '"')
 echo "  AKS Cluster: $AKS_NAME"
 echo "  Resource Group: $RG_NAME"
 echo "  Container Registry: $CONTAINER_REG"
-echo "  MCP Public IP: $MCP_PUBLIC_IP"
+echo "  MCP Internal LB IP: $MCP_INTERNAL_LB_IP"
 echo "  Foundry Endpoint: $FOUNDRY_ENDPOINT"
 echo "  Foundry Model: $FOUNDRY_MODEL"
 echo "  Embedding Model: $EMBEDDING_MODEL"
@@ -81,9 +82,10 @@ sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
     ./k8s/mcp-agents-deployment.yaml > ./k8s/mcp-agents-deployment-configured.yaml
 echo "  ✅ Configured mcp-agents-deployment-configured.yaml"
 
-# Read and configure loadbalancer template
+# Read and configure loadbalancer template (internal / private LoadBalancer)
 sed -e "s|\${AZURE_RESOURCE_GROUP_NAME}|$RG_NAME|g" \
-    -e "s|\${MCP_PUBLIC_IP_ADDRESS}|$MCP_PUBLIC_IP|g" \
+    -e "s|\${MCP_INTERNAL_LB_IP}|$MCP_INTERNAL_LB_IP|g" \
+    -e "s|\${MCP_LB_SUBNET_NAME}|$MCP_LB_SUBNET_NAME|g" \
     ./k8s/mcp-agents-loadbalancer.yaml > ./k8s/mcp-agents-loadbalancer-configured.yaml
 echo "  ✅ Configured mcp-agents-loadbalancer-configured.yaml"
 
@@ -124,7 +126,7 @@ echo ""
 echo "⏳ Waiting for deployment to be ready..."
 kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
 
-# Wait for LoadBalancer to get external IP
+# Wait for LoadBalancer to get its private IP
 echo ""
 echo "⏳ Waiting for LoadBalancer IP assignment..."
 MAX_RETRIES=30
@@ -132,9 +134,9 @@ RETRY=0
 LB_READY=false
 while [ $RETRY -lt $MAX_RETRIES ] && [ "$LB_READY" = "false" ]; do
   LB_STATUS=$(kubectl get svc mcp-agents-loadbalancer -n mcp-agents -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
-  if [ "$LB_STATUS" = "$MCP_PUBLIC_IP" ]; then
+  if [ "$LB_STATUS" = "$MCP_INTERNAL_LB_IP" ]; then
     LB_READY=true
-    echo "✅ LoadBalancer ready with IP: $LB_STATUS"
+    echo "✅ Internal LoadBalancer ready with private IP: $LB_STATUS"
   else
     echo "  Waiting for LoadBalancer... ($RETRY/$MAX_RETRIES)"
     sleep 10

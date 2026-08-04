@@ -5,7 +5,7 @@ Implements Model Context Protocol (MCP) with SSE support
 Enhanced with Microsoft Agent Framework for AI agent capabilities
 Integrated with CosmosDB for task and plan storage with semantic reasoning
 Features Memory Provider abstraction for short-term (CosmosDB), long-term (AI Search), and facts (Fabric IQ) memory
-Includes Agent Lightning for fine-tuning and behavior optimization
+Includes the Azure Agents Learning SDK for in-process reinforcement learning and behavior optimization
 """
 
 import json
@@ -57,20 +57,21 @@ except ImportError:
     FABRIC_DATA_AGENTS_AVAILABLE = False
     print("WARNING: fabric_tools not available - Fabric Data Agents will be disabled")
 
-# Agent Lightning imports (for fine-tuning and behavior optimization)
+# Azure Agents Learning SDK imports (in-process RL and behavior optimization)
 try:
-    from lightning import (
-        EpisodeCaptureHook, get_capture_hook,
-        DeploymentRegistry, get_deployment_registry,
-        RewardWriter, get_reward_writer,
-        DatasetBuilder, get_dataset_builder,
-        TrainingRunner, get_training_runner,
-        RLLedgerCosmos, get_rl_ledger,
-        Episode, Reward, RewardSource, Dataset, TrainingRun, TrainingStatus, Deployment,
+    from agent_learning import (
+        Action,
+        EpisodeCapture, get_capture,
+        LearningRunner,
+        RewardWriter,
+        SoftmaxPolicy,
+        get_default_store,
+        Episode, Reward, RewardSource, MetricResult, PolicySnapshot,
+        TrainingRun, TrainingStatus,
     )
-    LIGHTNING_AVAILABLE = True
+    LEARNING_AVAILABLE = True
 except ImportError:
-    LIGHTNING_AVAILABLE = False
+    LEARNING_AVAILABLE = False
 
 # Azure AI Evaluation SDK imports (for agent evaluators)
 try:
@@ -203,63 +204,39 @@ FOUNDRY_MODEL_DEPLOYMENT_NAME = os.getenv("FOUNDRY_MODEL_DEPLOYMENT_NAME", "gpt-
 EVALUATOR_MODEL_DEPLOYMENT_NAME = os.getenv("EVALUATOR_MODEL_DEPLOYMENT_NAME", "gpt-5.2-chat")
 EMBEDDING_MODEL_DEPLOYMENT_NAME = os.getenv("EMBEDDING_MODEL_DEPLOYMENT_NAME", "text-embedding-3-large")
 
-# Agent Lightning configuration for fine-tuning and behavior optimization
-LIGHTNING_AGENT_ID = os.getenv("LIGHTNING_AGENT_ID", "mcp-agents")
-ENABLE_LIGHTNING_CAPTURE = os.getenv("ENABLE_LIGHTNING_CAPTURE", "false").lower() == "true"
-USE_TUNED_MODEL = os.getenv("USE_TUNED_MODEL", "false").lower() == "true"
-TUNED_MODEL_DEPLOYMENT_NAME = os.getenv("TUNED_MODEL_DEPLOYMENT_NAME", "")  # Fallback tuned model
+# Azure Agents Learning SDK configuration (in-process RL and behavior optimization)
+LEARNING_AGENT_ID = os.getenv("AGENT_LEARNING_AGENT_ID", "mcp-agents")
+ENABLE_LEARNING_CAPTURE = os.getenv("AGENT_LEARNING_ENABLE_CAPTURE", "false").lower() == "true"
 
-# Initialize Agent Lightning components (if available)
-episode_capture_hook: Optional[EpisodeCaptureHook] = None
-deployment_registry: Optional[DeploymentRegistry] = None
-reward_writer: Optional[RewardWriter] = None
-dataset_builder: Optional[DatasetBuilder] = None
-training_runner: Optional[TrainingRunner] = None
-rl_ledger: Optional[RLLedgerCosmos] = None
+# Initialize Azure Agents Learning SDK components (if available)
+episode_capture: Optional["EpisodeCapture"] = None
+learning_store = None
+learning_runner: Optional["LearningRunner"] = None
+reward_writer: Optional["RewardWriter"] = None
 
-if LIGHTNING_AVAILABLE:
+if LEARNING_AVAILABLE:
     try:
-        episode_capture_hook = get_capture_hook()
-        deployment_registry = get_deployment_registry()
-        reward_writer = get_reward_writer()
-        dataset_builder = get_dataset_builder()
-        training_runner = get_training_runner()
-        rl_ledger = get_rl_ledger()
-        logger.info(f"Agent Lightning initialized (capture={ENABLE_LIGHTNING_CAPTURE}, use_tuned={USE_TUNED_MODEL})")
+        learning_store = get_default_store()
+        episode_capture = get_capture()
+        reward_writer = RewardWriter(learning_store)
+        learning_runner = LearningRunner(store=learning_store)
+        logger.info(f"Azure Agents Learning SDK initialized (capture={ENABLE_LEARNING_CAPTURE}, agent_id={LEARNING_AGENT_ID})")
     except Exception as e:
-        logger.warning(f"Failed to initialize Agent Lightning: {e}")
+        logger.warning(f"Failed to initialize Azure Agents Learning SDK: {e}")
 else:
-    logger.info("Agent Lightning not available - fine-tuning features disabled")
+    logger.info("Azure Agents Learning SDK not available - learning features disabled")
 
 
 def get_model_deployment() -> str:
     """
-    Get the model deployment name to use.
-    
-    Selection order (when USE_TUNED_MODEL=true):
-    1. Active tuned deployment from Cosmos DB
-    2. TUNED_MODEL_DEPLOYMENT_NAME env var
-    3. Base model (FOUNDRY_MODEL_DEPLOYMENT_NAME)
+    Get the model deployment name to use for agent requests.
+
+    The Azure Agents Learning SDK optimizes agent behavior in-process by
+    learning a policy over discrete action choices (for example, prompt
+    variants) using Azure AI Evaluation judges as the reward signal, rather
+    than fine-tuning model weights. The underlying model deployment is
+    therefore always the configured Azure AI Foundry base model.
     """
-    if not USE_TUNED_MODEL:
-        return FOUNDRY_MODEL_DEPLOYMENT_NAME
-    
-    # Try to get active tuned model from Cosmos
-    if deployment_registry:
-        try:
-            tuned_model = deployment_registry.get_active_model(LIGHTNING_AGENT_ID)
-            if tuned_model:
-                logger.debug(f"Using tuned model from Cosmos: {tuned_model}")
-                return tuned_model
-        except Exception as e:
-            logger.warning(f"Failed to get tuned model from registry: {e}")
-    
-    # Fallback to env var
-    if TUNED_MODEL_DEPLOYMENT_NAME:
-        logger.debug(f"Using fallback tuned model: {TUNED_MODEL_DEPLOYMENT_NAME}")
-        return TUNED_MODEL_DEPLOYMENT_NAME
-    
-    # Use base model
     return FOUNDRY_MODEL_DEPLOYMENT_NAME
 
 
@@ -315,7 +292,7 @@ def get_embedding(text: str) -> List[float]:
     
     client = AzureOpenAI(
         azure_endpoint=base_endpoint,
-        api_key=token.token,
+        azure_ad_token=token.token,
         api_version="2024-02-15-preview"
     )
     
@@ -416,11 +393,11 @@ def analyze_intent(task: str) -> str:
         
         client = AzureOpenAI(
             azure_endpoint=base_endpoint,
-            api_key=token.token,
+            azure_ad_token=token.token,
             api_version="2024-02-15-preview"
         )
         
-        # Use tuned model if available (Agent Lightning)
+        # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         
         response = client.chat.completions.create(
@@ -467,7 +444,7 @@ def generate_plan(task: str, similar_tasks: List[Dict[str, Any]]) -> List[Dict[s
         
         client = AzureOpenAI(
             azure_endpoint=base_endpoint,
-            api_key=token.token,
+            azure_ad_token=token.token,
             api_version="2024-02-15-preview"
         )
         
@@ -478,7 +455,7 @@ def generate_plan(task: str, similar_tasks: List[Dict[str, Any]]) -> List[Dict[s
             for st in similar_tasks[:3]:
                 context += f"- {st['task']} (intent: {st['intent']}, similarity: {st['similarity']:.2f})\n"
         
-        # Use tuned model if available (Agent Lightning)
+        # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         
         response = client.chat.completions.create(
@@ -556,7 +533,7 @@ def generate_plan_with_instructions(
         
         client = AzureOpenAI(
             azure_endpoint=base_endpoint,
-            api_key=token.token,
+            azure_ad_token=token.token,
             api_version="2024-02-15-preview"
         )
         
@@ -603,7 +580,7 @@ def generate_plan_with_instructions(
                     for key, value in list(fact_context.items())[:5]:
                         context += f"    - {key}: {value}\n"
         
-        # Use tuned model if available (Agent Lightning)
+        # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         
         response = client.chat.completions.create(
@@ -659,6 +636,43 @@ Return ONLY valid JSON, no markdown or explanation."""
         logger.error(f"Error generating plan with instructions: {e}")
         # Fallback to basic plan generation
         return generate_plan(task, similar_tasks)
+
+
+def _normalize_plan_steps(plan_result: Any) -> List[Dict[str, Any]]:
+    """Normalize planner output into a list of step dicts.
+
+    The instructions-based planner (generate_plan_with_instructions) may return a
+    concrete-results object (status/results/actions_taken/recommendations) instead
+    of a list of steps. Represent it consistently as a list of step dicts so the
+    response contract always exposes plan.steps as a list.
+    """
+    if isinstance(plan_result, list):
+        return plan_result
+    if isinstance(plan_result, dict):
+        steps: List[Dict[str, Any]] = []
+        for action in plan_result.get("actions_taken", []) or []:
+            steps.append({
+                "step": len(steps) + 1,
+                "action": "executed",
+                "description": action if isinstance(action, str) else json.dumps(action),
+                "estimated_effort": "n/a",
+            })
+        for rec in plan_result.get("recommendations", []) or []:
+            steps.append({
+                "step": len(steps) + 1,
+                "action": "recommendation",
+                "description": rec if isinstance(rec, str) else json.dumps(rec),
+                "estimated_effort": "n/a",
+            })
+        if not steps:
+            steps.append({
+                "step": 1,
+                "action": str(plan_result.get("status", "completed")),
+                "description": json.dumps(plan_result.get("results", plan_result)),
+                "estimated_effort": "n/a",
+            })
+        return steps
+    return [{"step": 1, "action": "result", "description": str(plan_result), "estimated_effort": "n/a"}]
 
 
 # =========================================
@@ -1027,11 +1041,11 @@ def ask_foundry_tool(question: str) -> str:
         
         client = AzureOpenAI(
             azure_endpoint=base_endpoint,
-            api_key=token.token,
+            azure_ad_token=token.token,
             api_version="2024-02-15-preview"
         )
         
-        # Use tuned model if available (Agent Lightning)
+        # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         logger.info(f"ask_foundry using model: {model_deployment}")
         
@@ -1262,7 +1276,7 @@ def next_best_action_tool(task: str) -> str:
         
         # Step 6: Generate plan based on task, similar past tasks, task instructions, AND domain facts
         logger.info("Generating execution plan with all memory contexts...")
-        plan_steps = generate_plan_with_instructions(task, similar_tasks, task_instructions, domain_facts)
+        plan_steps = _normalize_plan_steps(generate_plan_with_instructions(task, similar_tasks, task_instructions, domain_facts))
         
         # Step 7: Store task in CosmosDB
         task_doc = {
@@ -1929,119 +1943,391 @@ def get_facts_memory_stats_tool() -> str:
 
 
 # =========================================
-# Agent Lightning Tools (RLHF Fine-Tuning)
+# Azure Agents Learning SDK Tools (in-process RL)
 # =========================================
+# The Azure Agents Learning SDK optimizes agent behavior in-process by
+# learning a softmax policy over discrete action choices, using Azure AI
+# Evaluation judges (intent resolution, task adherence, task completion)
+# as the reward signal. The helpers below back both the @ai_function tools
+# and the MCP dispatch handlers so the logic lives in one place.
+
+
+def _ll_unavailable() -> Optional[Dict[str, Any]]:
+    """Return a standard error payload when the learning SDK is unavailable."""
+    if not LEARNING_AVAILABLE or learning_store is None:
+        return {"error": "Azure Agents Learning SDK not available"}
+    return None
+
+
+def _ll_list_episodes(agent_id: str = None, limit: int = 20, start_date: str = None, end_date: str = None) -> Dict[str, Any]:
+    """List captured episodes for an agent."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    episodes = learning_store.query_episodes(agent, limit=limit, start_date=start_date, end_date=end_date)
+    episodes_data = [{
+        "id": ep.id,
+        "agent_id": ep.agent_id,
+        "user_input": ep.user_input[:200] + "..." if len(ep.user_input) > 200 else ep.user_input,
+        "assistant_output": ep.assistant_output[:200] + "..." if len(ep.assistant_output) > 200 else ep.assistant_output,
+        "tool_calls_count": len(ep.tool_calls),
+        "action_id": ep.action_id,
+        "policy_version": ep.policy_version,
+        "request_latency_ms": ep.request_latency_ms,
+        "created_at": ep.created_at,
+    } for ep in episodes]
+    return {"agent_id": agent, "episodes_found": len(episodes_data), "episodes": episodes_data}
+
+
+def _ll_get_episode(episode_id: str, agent_id: str = None) -> Dict[str, Any]:
+    """Return full details for a single episode."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    episode = learning_store.get_episode(episode_id, agent)
+    if not episode:
+        return {"error": f"Episode {episode_id} not found"}
+    tool_calls_data = [{
+        "name": tc.name,
+        "arguments": tc.arguments,
+        "result": tc.result[:500] + "..." if tc.result and len(tc.result) > 500 else tc.result,
+        "duration_ms": tc.duration_ms,
+        "error": tc.error,
+    } for tc in episode.tool_calls]
+    return {
+        "id": episode.id,
+        "agent_id": episode.agent_id,
+        "user_input": episode.user_input,
+        "assistant_output": episode.assistant_output,
+        "tool_calls": tool_calls_data,
+        "policy_id": episode.policy_id,
+        "policy_version": episode.policy_version,
+        "action_id": episode.action_id,
+        "model_deployment": episode.model_deployment,
+        "correlation_id": episode.correlation_id,
+        "session_id": episode.session_id,
+        "request_latency_ms": episode.request_latency_ms,
+        "token_usage": episode.token_usage,
+        "metadata": episode.metadata,
+        "created_at": episode.created_at,
+    }
+
+
+def _ll_assign_reward(episode_id: str, reward_value: float, reward_source: str = "human_approval",
+                      agent_id: str = None, rubric: str = None, evaluator: str = None, comments: str = None) -> Dict[str, Any]:
+    """Attach a manual (human) reward to an episode."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    source_map = {
+        "human_approval": RewardSource.HUMAN_APPROVAL,
+        "test_result": RewardSource.TEST_RESULT,
+        "metric": RewardSource.METRIC,
+        "latency_penalty": RewardSource.LATENCY_PENALTY,
+        "cost_penalty": RewardSource.COST_PENALTY,
+    }
+    source = source_map.get((reward_source or "").lower(), RewardSource.HUMAN_APPROVAL)
+    value = max(-1.0, min(1.0, float(reward_value)))
+    reward = Reward(
+        episode_id=episode_id,
+        agent_id=agent,
+        source=source,
+        value=value,
+        rubric=rubric,
+        evaluator=evaluator,
+        metadata={"comments": comments} if comments else {},
+    )
+    reward_id = learning_store.store_reward(reward)
+    return {
+        "success": True,
+        "reward_id": reward_id or reward.id,
+        "episode_id": episode_id,
+        "value": reward.value,
+        "source": source.value,
+        "rubric": rubric,
+        "evaluator": evaluator,
+        "created_at": reward.created_at,
+    }
+
+
+def _ll_list_rewards(episode_id: str = None, agent_id: str = None, limit: int = 50) -> Dict[str, Any]:
+    """List rewards attached to an agent's episodes."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    rewards = learning_store.query_rewards(agent, episode_id=episode_id, limit=limit)
+    rewards_data = [{
+        "id": r.id,
+        "episode_id": r.episode_id,
+        "source": r.source.value,
+        "value": r.value,
+        "raw_value": r.raw_value,
+        "metric": r.metric.value if r.metric else None,
+        "rubric": r.rubric,
+        "evaluator": r.evaluator,
+        "created_at": r.created_at,
+    } for r in rewards]
+    return {"agent_id": agent, "episode_filter": episode_id, "rewards_found": len(rewards_data), "rewards": rewards_data}
+
+
+def _ll_score_episode(episode_id: str, agent_id: str = None) -> Dict[str, Any]:
+    """Run the Azure AI Evaluation judges over an episode and persist rewards."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    if learning_runner is None:
+        return {"error": "Learning runner not available"}
+    agent = agent_id or LEARNING_AGENT_ID
+    episode = learning_store.get_episode(episode_id, agent)
+    if not episode:
+        return {"error": f"Episode {episode_id} not found"}
+    rewards = learning_runner.score_and_record(episode)
+    scored = [{
+        "reward_id": r.id,
+        "source": r.source.value,
+        "metric": r.metric.value if r.metric else None,
+        "value": round(r.value, 4),
+    } for r in rewards]
+    aggregate = next((r for r in rewards if r.source == RewardSource.AGGREGATE), None)
+    return {
+        "success": True,
+        "episode_id": episode_id,
+        "agent_id": agent,
+        "rewards_written": len(scored),
+        "aggregate_reward": round(aggregate.value, 4) if aggregate else None,
+        "rewards": scored,
+    }
+
+
+def _ll_get_metrics(episode_id: str, agent_id: str = None) -> Dict[str, Any]:
+    """Return the stored judge metric results for an episode."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    results = learning_store.get_metric_results(episode_id, agent)
+    metrics_data = [{
+        "metric": m.metric.value,
+        "score": m.score,
+        "normalized": m.normalized,
+        "status": m.status,
+        "reason": m.reason,
+        "evaluator": m.evaluator,
+    } for m in results]
+    return {"agent_id": agent, "episode_id": episode_id, "metrics_found": len(metrics_data), "metrics": metrics_data}
+
+
+def _ll_init_policy(actions: List[Any], agent_id: str = None) -> Dict[str, Any]:
+    """Create (or replace) the softmax policy for an agent from a list of actions."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    if not actions:
+        return {"error": "At least one action is required to initialize a policy"}
+    action_objs = []
+    for item in actions:
+        if isinstance(item, str):
+            action_objs.append(Action(id=item))
+        elif isinstance(item, dict) and item.get("id"):
+            action_objs.append(Action(id=item["id"], description=item.get("description"), parameters=item.get("parameters", {})))
+    if not action_objs:
+        return {"error": "No valid actions provided. Supply action ids as strings or {id, description} objects."}
+    policy = SoftmaxPolicy.from_actions(action_objs, agent_id=agent)
+    snapshot = policy.snapshot()
+    learning_store.store_policy(snapshot)
+    return {
+        "success": True,
+        "agent_id": agent,
+        "policy_id": snapshot.id,
+        "version": snapshot.version,
+        "actions": [a.id for a in snapshot.actions],
+        "created_at": snapshot.created_at,
+    }
+
+
+def _ll_get_policy(agent_id: str = None) -> Dict[str, Any]:
+    """Return the latest policy snapshot and its action probabilities."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    snapshot = learning_store.get_latest_policy(agent)
+    if snapshot is None:
+        return {"has_policy": False, "agent_id": agent, "message": "No policy found. Initialize one with learning_init_policy."}
+    import math
+    action_ids = [a.id for a in snapshot.actions]
+    logits = [snapshot.logits.get(aid, 0.0) for aid in action_ids]
+    mx = max(logits) if logits else 0.0
+    exps = [math.exp(logit - mx) for logit in logits]
+    total = sum(exps) or 1.0
+    probs = {aid: round(e / total, 4) for aid, e in zip(action_ids, exps)}
+    return {
+        "has_policy": True,
+        "agent_id": agent,
+        "policy_id": snapshot.id,
+        "version": snapshot.version,
+        "actions": action_ids,
+        "action_probabilities": probs,
+        "baseline": round(snapshot.baseline, 4),
+        "episodes_seen": snapshot.episodes_seen,
+        "updates_applied": snapshot.updates_applied,
+        "created_at": snapshot.created_at,
+    }
+
+
+def _ll_run_training(agent_id: str = None, limit: int = 200, score_missing: bool = True,
+                     start_date: str = None, end_date: str = None) -> Dict[str, Any]:
+    """Run one offline REINFORCE learning batch to update the agent's policy."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    snapshot = learning_store.get_latest_policy(agent)
+    if snapshot is None:
+        return {"error": f"No policy found for agent_id={agent}. Initialize one with learning_init_policy first."}
+    policy = SoftmaxPolicy.from_snapshot(snapshot)
+    runner = LearningRunner(store=learning_store, policy=policy)
+    run = runner.run_offline_batch(agent, episode_limit=limit, start_date=start_date, end_date=end_date, score_missing=score_missing)
+    return {
+        "success": True,
+        "training_run_id": run.id,
+        "agent_id": run.agent_id,
+        "policy_id": run.policy_id,
+        "algorithm": run.algorithm,
+        "status": run.status.value,
+        "episodes_used": len(run.episode_ids),
+        "metrics": run.metrics,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+    }
+
+
+def _ll_get_training_status(training_run_id: str, agent_id: str = None) -> Dict[str, Any]:
+    """Return the status and metrics of a single learning run."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    run = learning_store.get_run(training_run_id, agent)
+    if not run:
+        return {"error": f"Training run {training_run_id} not found"}
+    return {
+        "id": run.id,
+        "agent_id": run.agent_id,
+        "policy_id": run.policy_id,
+        "algorithm": run.algorithm,
+        "status": run.status.value,
+        "episodes_used": len(run.episode_ids),
+        "hyperparameters": run.hyperparameters,
+        "metrics": run.metrics,
+        "error_message": run.error_message,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "created_at": run.created_at,
+    }
+
+
+def _ll_list_training_runs(agent_id: str = None, limit: int = 20) -> Dict[str, Any]:
+    """List recent learning runs for an agent."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    runs = learning_store.list_training_runs(agent, limit=limit)
+    runs_data = [{
+        "id": run.id,
+        "policy_id": run.policy_id,
+        "algorithm": run.algorithm,
+        "status": run.status.value,
+        "episodes_used": len(run.episode_ids),
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "created_at": run.created_at,
+    } for run in runs]
+    return {"agent_id": agent, "runs_found": len(runs_data), "training_runs": runs_data}
+
+
+def _ll_get_stats(agent_id: str = None) -> Dict[str, Any]:
+    """Return aggregate learning statistics for an agent."""
+    err = _ll_unavailable()
+    if err:
+        return err
+    agent = agent_id or LEARNING_AGENT_ID
+    episodes = learning_store.query_episodes(agent, limit=1000)
+    rewards = learning_store.query_rewards(agent, limit=1000)
+    runs = learning_store.list_training_runs(agent, limit=100)
+    snapshot = learning_store.get_latest_policy(agent)
+    aggregate_values = [r.value for r in rewards if r.source == RewardSource.AGGREGATE]
+    avg_reward = sum(aggregate_values) / len(aggregate_values) if aggregate_values else 0
+    status_counts: Dict[str, int] = {}
+    for run in runs:
+        status_counts[run.status.value] = status_counts.get(run.status.value, 0) + 1
+    return {
+        "agent_id": agent,
+        "capture_enabled": ENABLE_LEARNING_CAPTURE,
+        "statistics": {
+            "total_episodes": len(episodes),
+            "total_rewards": len(rewards),
+            "average_aggregate_reward": round(avg_reward, 3),
+            "total_training_runs": len(runs),
+            "training_run_status": status_counts,
+        },
+        "active_policy": {
+            "has_policy": snapshot is not None,
+            "policy_id": snapshot.id if snapshot else None,
+            "version": snapshot.version if snapshot else None,
+            "actions": [a.id for a in snapshot.actions] if snapshot else [],
+            "updates_applied": snapshot.updates_applied if snapshot else 0,
+        },
+        "model_deployment": get_model_deployment(),
+    }
+
 
 @ai_function
-def lightning_list_episodes_tool(
+def learning_list_episodes_tool(
     agent_id: str = None,
     limit: int = 20,
     start_date: str = None,
     end_date: str = None,
 ) -> str:
     """
-    List captured episodes from Agent Lightning.
+    List captured episodes recorded by the Azure Agents Learning SDK.
     Episodes represent agent interactions (user input → tool calls → response).
-    
+
     Args:
         agent_id: Filter by agent ID (default: mcp-agents)
         limit: Maximum number of episodes to return (default: 20)
         start_date: Filter episodes after this date (ISO format)
         end_date: Filter episodes before this date (ISO format)
-    
+
     Returns:
         JSON response with list of episodes
     """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        episodes = rl_ledger.query_episodes(
-            agent_id=agent,
-            start_date=start_date,
-            end_date=end_date,
-            limit=limit,
-        )
-        
-        episodes_data = []
-        for ep in episodes:
-            episodes_data.append({
-                "id": ep.id,
-                "agent_id": ep.agent_id,
-                "user_input": ep.user_input[:200] + "..." if len(ep.user_input) > 200 else ep.user_input,
-                "assistant_output": ep.assistant_output[:200] + "..." if len(ep.assistant_output) > 200 else ep.assistant_output,
-                "tool_calls_count": len(ep.tool_calls),
-                "model_deployment": ep.model_deployment,
-                "request_latency_ms": ep.request_latency_ms,
-                "created_at": ep.created_at,
-            })
-        
-        return json.dumps({
-            "agent_id": agent,
-            "episodes_found": len(episodes_data),
-            "episodes": episodes_data,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error listing episodes: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_list_episodes(agent_id, limit, start_date, end_date), indent=2)
 
 
 @ai_function
-def lightning_get_episode_tool(episode_id: str, agent_id: str = None) -> str:
+def learning_get_episode_tool(episode_id: str, agent_id: str = None) -> str:
     """
     Get detailed information about a specific episode.
-    
+
     Args:
         episode_id: The ID of the episode to retrieve
         agent_id: Agent ID (default: mcp-agents)
-    
+
     Returns:
         JSON response with full episode details including tool calls
     """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        episode = rl_ledger.get_episode(episode_id, agent)
-        
-        if not episode:
-            return json.dumps({"error": f"Episode {episode_id} not found"})
-        
-        tool_calls_data = []
-        for tc in episode.tool_calls:
-            tool_calls_data.append({
-                "tool_name": tc.tool_name,
-                "arguments": tc.arguments,
-                "result": tc.result[:500] + "..." if tc.result and len(tc.result) > 500 else tc.result,
-                "duration_ms": tc.duration_ms,
-                "error": tc.error,
-            })
-        
-        return json.dumps({
-            "id": episode.id,
-            "agent_id": episode.agent_id,
-            "user_input": episode.user_input,
-            "assistant_output": episode.assistant_output,
-            "tool_calls": tool_calls_data,
-            "model_deployment": episode.model_deployment,
-            "correlation_id": episode.correlation_id,
-            "session_id": episode.session_id,
-            "request_latency_ms": episode.request_latency_ms,
-            "token_usage": episode.token_usage,
-            "metadata": episode.metadata,
-            "created_at": episode.created_at,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error getting episode: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_get_episode(episode_id, agent_id), indent=2)
 
 
 @ai_function
-def lightning_assign_reward_tool(
+def learning_assign_reward_tool(
     episode_id: str,
     reward_value: float,
     reward_source: str = "human_approval",
@@ -2051,650 +2337,179 @@ def lightning_assign_reward_tool(
     comments: str = None,
 ) -> str:
     """
-    Assign a reward/label to an episode for RLHF training.
-    
+    Assign a manual reward/label to an episode.
+
     Args:
         episode_id: The ID of the episode to reward
         reward_value: Reward value from -1.0 (bad) to 1.0 (good)
-        reward_source: Source of reward (human_approval, eval_score, test_result, safety_check)
+        reward_source: Source of reward (human_approval, test_result, metric)
         agent_id: Agent ID (default: mcp-agents)
         rubric: Evaluation rubric/criteria used
         evaluator: Who/what evaluated
         comments: Additional comments
-    
+
     Returns:
         JSON response with stored reward details
     """
-    if not LIGHTNING_AVAILABLE or not reward_writer:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        # Map string to RewardSource enum
-        source_map = {
-            "human_approval": RewardSource.HUMAN_APPROVAL,
-            "eval_score": RewardSource.EVAL_SCORE,
-            "test_result": RewardSource.TEST_RESULT,
-            "safety_check": RewardSource.SAFETY_CHECK,
-            "cost_penalty": RewardSource.COST_PENALTY,
-            "latency_penalty": RewardSource.LATENCY_PENALTY,
-            "golden_conversation": RewardSource.GOLDEN_CONVERSATION,
-        }
-        source = source_map.get(reward_source.lower(), RewardSource.EVAL_SCORE)
-        
-        reward = reward_writer.record_reward(
-            episode_id=episode_id,
-            agent_id=agent,
-            source=source,
-            value=reward_value,
-            rubric=rubric,
-            evaluator=evaluator,
-            metadata={"comments": comments} if comments else {},
-        )
-        
-        if reward:
-            return json.dumps({
-                "success": True,
-                "reward_id": reward.id,
-                "episode_id": episode_id,
-                "value": reward.value,
-                "source": source.value,
-                "rubric": rubric,
-                "evaluator": evaluator,
-                "created_at": reward.created_at,
-            }, indent=2)
-        else:
-            return json.dumps({"error": "Failed to store reward"})
-    
-    except Exception as e:
-        logger.error(f"Error assigning reward: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_assign_reward(episode_id, reward_value, reward_source, agent_id, rubric, evaluator, comments), indent=2)
 
 
 @ai_function
-def lightning_list_rewards_tool(
+def learning_list_rewards_tool(
     episode_id: str = None,
     agent_id: str = None,
     limit: int = 50,
 ) -> str:
     """
     List rewards assigned to episodes.
-    
+
     Args:
         episode_id: Filter by episode ID (optional)
         agent_id: Filter by agent ID (default: mcp-agents)
         limit: Maximum number of rewards to return
-    
+
     Returns:
         JSON response with list of rewards
     """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        rewards = rl_ledger.query_rewards(
-            agent_id=agent,
-            episode_id=episode_id,
-            limit=limit,
-        )
-        
-        rewards_data = []
-        for r in rewards:
-            rewards_data.append({
-                "id": r.id,
-                "episode_id": r.episode_id,
-                "source": r.source.value,
-                "value": r.value,
-                "raw_value": r.raw_value,
-                "rubric": r.rubric,
-                "evaluator": r.evaluator,
-                "created_at": r.created_at,
-            })
-        
-        return json.dumps({
-            "agent_id": agent,
-            "episode_filter": episode_id,
-            "rewards_found": len(rewards_data),
-            "rewards": rewards_data,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error listing rewards: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_list_rewards(episode_id, agent_id, limit), indent=2)
 
 
 @ai_function
-def lightning_build_dataset_tool(
-    name: str,
+def learning_score_episode_tool(episode_id: str, agent_id: str = None) -> str:
+    """
+    Score an episode with the Azure AI Evaluation judges (intent resolution,
+    task adherence, task completion) and persist the per-metric and aggregate
+    rewards the learner consumes.
+
+    Args:
+        episode_id: The ID of the episode to score
+        agent_id: Agent ID (default: mcp-agents)
+
+    Returns:
+        JSON response with the rewards written for the episode
+    """
+    return json.dumps(_ll_score_episode(episode_id, agent_id), indent=2)
+
+
+@ai_function
+def learning_get_metrics_tool(episode_id: str, agent_id: str = None) -> str:
+    """
+    List the stored judge metric results for an episode.
+
+    Args:
+        episode_id: The ID of the episode
+        agent_id: Agent ID (default: mcp-agents)
+
+    Returns:
+        JSON response with the metric results
+    """
+    return json.dumps(_ll_get_metrics(episode_id, agent_id), indent=2)
+
+
+@ai_function
+def learning_run_training_tool(
     agent_id: str = None,
-    description: str = None,
-    min_reward: float = 0.5,
+    limit: int = 200,
+    score_missing: bool = True,
+    start_date: str = None,
+    end_date: str = None,
 ) -> str:
     """
-    Build a fine-tuning dataset from rewarded episodes.
-    
-    Creates JSONL files for Azure OpenAI fine-tuning from episodes
-    that have positive rewards.
-    
+    Run one offline REINFORCE-with-baseline learning batch over recent episodes
+    to update the agent's softmax policy. Episodes without rewards are scored by
+    the judges first (unless score_missing is false).
+
     Args:
-        name: Name for the dataset
         agent_id: Agent ID (default: mcp-agents)
-        description: Optional description
-        min_reward: Minimum average reward for episode inclusion (default: 0.5)
-    
+        limit: Maximum number of recent episodes to learn from (default: 200)
+        score_missing: Score episodes that have no rewards yet (default: true)
+        start_date: Only include episodes after this date (ISO format)
+        end_date: Only include episodes before this date (ISO format)
+
     Returns:
-        JSON response with dataset manifest
+        JSON response with the training run record
     """
-    if not LIGHTNING_AVAILABLE or not dataset_builder:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        dataset = dataset_builder.build_dataset(
-            agent_id=agent,
-            name=name,
-            description=description,
-            min_reward=min_reward,
-        )
-        
-        if dataset:
-            return json.dumps({
-                "success": True,
-                "dataset_id": dataset.id,
-                "name": dataset.name,
-                "description": dataset.description,
-                "agent_id": dataset.agent_id,
-                "training_count": dataset.training_count,
-                "validation_count": dataset.validation_count,
-                "episode_count": len(dataset.episode_ids),
-                "reward_threshold": dataset.reward_threshold,
-                "local_path": dataset.local_path,
-                "validation_path": dataset.metadata.get("validation_path"),
-                "created_at": dataset.created_at,
-            }, indent=2)
-        else:
-            return json.dumps({"error": "No qualifying episodes found for dataset"})
-    
-    except Exception as e:
-        logger.error(f"Error building dataset: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_run_training(agent_id, limit, score_missing, start_date, end_date), indent=2)
 
 
 @ai_function
-def lightning_list_datasets_tool(agent_id: str = None, limit: int = 20) -> str:
+def learning_get_training_status_tool(training_run_id: str, agent_id: str = None) -> str:
     """
-    List available fine-tuning datasets.
-    
-    Args:
-        agent_id: Filter by agent ID (default: mcp-agents)
-        limit: Maximum number of datasets to return
-    
-    Returns:
-        JSON response with list of datasets
-    """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        datasets = rl_ledger.list_datasets(agent_id=agent, limit=limit)
-        
-        datasets_data = []
-        for ds in datasets:
-            datasets_data.append({
-                "id": ds.id,
-                "name": ds.name,
-                "description": ds.description,
-                "training_count": ds.training_count,
-                "validation_count": ds.validation_count,
-                "episode_count": len(ds.episode_ids),
-                "reward_threshold": ds.reward_threshold,
-                "created_at": ds.created_at,
-            })
-        
-        return json.dumps({
-            "agent_id": agent,
-            "datasets_found": len(datasets_data),
-            "datasets": datasets_data,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error listing datasets: {e}")
-        return json.dumps({"error": str(e)})
+    Get the status and metrics of a learning run.
 
-
-@ai_function
-def lightning_start_training_tool(
-    dataset_id: str,
-    agent_id: str = None,
-    base_model: str = None,
-    n_epochs: int = None,
-) -> str:
-    """
-    Start a fine-tuning training run using Azure OpenAI.
-    
-    Args:
-        dataset_id: ID of the dataset to use for training
-        agent_id: Agent ID (default: mcp-agents)
-        base_model: Base model to fine-tune (default: gpt-4o-mini-2024-07-18)
-        n_epochs: Number of training epochs (default: 3)
-    
-    Returns:
-        JSON response with training run details
-    """
-    if not LIGHTNING_AVAILABLE or not training_runner:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        hyperparams = {}
-        if n_epochs:
-            hyperparams["n_epochs"] = n_epochs
-        
-        run = training_runner.start_training(
-            dataset_id=dataset_id,
-            agent_id=agent,
-            base_model=base_model,
-            hyperparameters=hyperparams if hyperparams else None,
-        )
-        
-        if run:
-            return json.dumps({
-                "success": True,
-                "training_run_id": run.id,
-                "dataset_id": run.dataset_id,
-                "base_model": run.base_model,
-                "status": run.status.value,
-                "hyperparameters": run.hyperparameters,
-                "aoai_job_id": run.aoai_job_id,
-                "created_at": run.created_at,
-            }, indent=2)
-        else:
-            return json.dumps({"error": "Failed to start training"})
-    
-    except Exception as e:
-        logger.error(f"Error starting training: {e}")
-        return json.dumps({"error": str(e)})
-
-
-@ai_function
-def lightning_get_training_status_tool(training_run_id: str, agent_id: str = None) -> str:
-    """
-    Get the status of a training run.
-    Polls the Azure OpenAI API to sync status, then returns from Cosmos.
-    
     Args:
         training_run_id: ID of the training run
         agent_id: Agent ID (default: mcp-agents)
-    
+
     Returns:
         JSON response with training run status and metrics
     """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        # Use training_runner.check_status() to poll AOAI API and sync Cosmos
-        if training_runner:
-            run = training_runner.check_status(training_run_id, agent)
-        else:
-            run = rl_ledger.get_training_run(training_run_id, agent)
-        
-        if not run:
-            return json.dumps({"error": f"Training run {training_run_id} not found"})
-        
-        return json.dumps({
-            "id": run.id,
-            "agent_id": run.agent_id,
-            "dataset_id": run.dataset_id,
-            "base_model": run.base_model,
-            "tuned_model_name": run.tuned_model_name,
-            "status": run.status.value,
-            "hyperparameters": run.hyperparameters,
-            "metrics": run.metrics,
-            "aoai_job_id": run.aoai_job_id,
-            "error_message": run.error_message,
-            "started_at": run.started_at,
-            "completed_at": run.completed_at,
-            "created_at": run.created_at,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error getting training status: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_get_training_status(training_run_id, agent_id), indent=2)
 
 
 @ai_function
-def lightning_list_training_runs_tool(agent_id: str = None, limit: int = 20) -> str:
+def learning_list_training_runs_tool(agent_id: str = None, limit: int = 20) -> str:
     """
-    List training runs.
-    
+    List learning runs.
+
     Args:
         agent_id: Filter by agent ID (default: mcp-agents)
         limit: Maximum number of runs to return
-    
+
     Returns:
         JSON response with list of training runs
     """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        runs = rl_ledger.list_training_runs(agent_id=agent, limit=limit)
-        
-        runs_data = []
-        for run in runs:
-            runs_data.append({
-                "id": run.id,
-                "dataset_id": run.dataset_id,
-                "base_model": run.base_model,
-                "tuned_model_name": run.tuned_model_name,
-                "status": run.status.value,
-                "started_at": run.started_at,
-                "completed_at": run.completed_at,
-                "created_at": run.created_at,
-            })
-        
-        return json.dumps({
-            "agent_id": agent,
-            "runs_found": len(runs_data),
-            "training_runs": runs_data,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error listing training runs: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_list_training_runs(agent_id, limit), indent=2)
 
 
 @ai_function
-def lightning_promote_deployment_tool(
-    training_run_id: str,
+def learning_init_policy_tool(
+    actions: List[Any] = None,
     agent_id: str = None,
-    promoted_by: str = None,
 ) -> str:
     """
-    Promote a tuned model to active deployment.
-    
-    Makes the fine-tuned model from a training run the active model
-    for the agent, so all subsequent requests use the tuned model.
-    
+    Create (or replace) the softmax policy for an agent from a list of discrete
+    actions. Each action is a configuration choice the agent can take (for
+    example, a prompt variant or retrieval strategy). Actions may be supplied as
+    a list of ids (strings) or as {id, description, parameters} objects.
+
     Args:
-        training_run_id: ID of the completed training run
+        actions: List of action ids or action objects
         agent_id: Agent ID (default: mcp-agents)
-        promoted_by: Who is promoting (for audit trail)
-    
+
     Returns:
-        JSON response with deployment details
+        JSON response with the created policy snapshot
     """
-    if not LIGHTNING_AVAILABLE or not deployment_registry:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        deployment = deployment_registry.promote(
-            agent_id=agent,
-            training_run_id=training_run_id,
-            promoted_by=promoted_by,
-        )
-        
-        if deployment:
-            return json.dumps({
-                "success": True,
-                "deployment_id": deployment.id,
-                "training_run_id": deployment.training_run_id,
-                "tuned_model_name": deployment.tuned_model_name,
-                "is_active": deployment.is_active,
-                "promoted_at": deployment.promoted_at,
-                "promoted_by": deployment.promoted_by,
-            }, indent=2)
-        else:
-            return json.dumps({"error": "Failed to promote deployment"})
-    
-    except Exception as e:
-        logger.error(f"Error promoting deployment: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_init_policy(actions or [], agent_id), indent=2)
 
 
 @ai_function
-def lightning_get_active_deployment_tool(agent_id: str = None) -> str:
+def learning_get_policy_tool(agent_id: str = None) -> str:
     """
-    Get the currently active tuned model deployment.
-    
+    Get the agent's latest policy snapshot, including the current action
+    probabilities the learner has converged toward.
+
     Args:
         agent_id: Agent ID (default: mcp-agents)
-    
+
     Returns:
-        JSON response with active deployment details
+        JSON response with the active policy details
     """
-    if not LIGHTNING_AVAILABLE or not deployment_registry:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        deployment = deployment_registry.get_active_deployment(agent)
-        
-        if deployment:
-            return json.dumps({
-                "has_active_deployment": True,
-                "deployment_id": deployment.id,
-                "training_run_id": deployment.training_run_id,
-                "tuned_model_name": deployment.tuned_model_name,
-                "promoted_at": deployment.promoted_at,
-                "promoted_by": deployment.promoted_by,
-            }, indent=2)
-        else:
-            return json.dumps({
-                "has_active_deployment": False,
-                "message": "No active tuned model deployment. Using base model.",
-                "base_model": FOUNDRY_MODEL_DEPLOYMENT_NAME,
-            }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error getting active deployment: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_get_policy(agent_id), indent=2)
 
 
 @ai_function
-def lightning_list_deployments_tool(agent_id: str = None, limit: int = 20) -> str:
+def learning_get_stats_tool(agent_id: str = None) -> str:
     """
-    List all deployments (active and historical).
-    
-    Args:
-        agent_id: Filter by agent ID (default: mcp-agents)
-        limit: Maximum number of deployments to return
-    
-    Returns:
-        JSON response with list of deployments
-    """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        deployments = rl_ledger.list_deployments(agent_id=agent, limit=limit)
-        
-        deployments_data = []
-        for dep in deployments:
-            deployments_data.append({
-                "id": dep.id,
-                "training_run_id": dep.training_run_id,
-                "tuned_model_name": dep.tuned_model_name,
-                "is_active": dep.is_active,
-                "promoted_at": dep.promoted_at,
-                "promoted_by": dep.promoted_by,
-                "rollback_from": dep.rollback_from,
-                "rollback_reason": dep.rollback_reason,
-            })
-        
-        return json.dumps({
-            "agent_id": agent,
-            "deployments_found": len(deployments_data),
-            "deployments": deployments_data,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error listing deployments: {e}")
-        return json.dumps({"error": str(e)})
+    Get comprehensive statistics about the Azure Agents Learning SDK for an agent.
 
-
-@ai_function
-def lightning_rollback_deployment_tool(
-    agent_id: str = None,
-    target_deployment_id: str = None,
-    reason: str = None,
-    rolled_back_by: str = None,
-) -> str:
-    """
-    Rollback to a previous deployment.
-    
-    If no target is specified, rolls back to the most recent previous deployment.
-    
     Args:
         agent_id: Agent ID (default: mcp-agents)
-        target_deployment_id: Specific deployment to roll back to (optional)
-        reason: Reason for rollback
-        rolled_back_by: Who is rolling back (for audit trail)
-    
+
     Returns:
-        JSON response with new active deployment details
+        JSON response with episode, reward, training-run, and policy statistics
     """
-    if not LIGHTNING_AVAILABLE or not deployment_registry:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        deployment = deployment_registry.rollback(
-            agent_id=agent,
-            target_deployment_id=target_deployment_id,
-            reason=reason,
-            rolled_back_by=rolled_back_by,
-        )
-        
-        if deployment:
-            return json.dumps({
-                "success": True,
-                "deployment_id": deployment.id,
-                "tuned_model_name": deployment.tuned_model_name,
-                "is_active": deployment.is_active,
-                "rollback_reason": reason,
-                "rolled_back_by": rolled_back_by,
-            }, indent=2)
-        else:
-            return json.dumps({"error": "No previous deployment to roll back to"})
-    
-    except Exception as e:
-        logger.error(f"Error rolling back deployment: {e}")
-        return json.dumps({"error": str(e)})
-
-
-@ai_function
-def lightning_deactivate_deployment_tool(agent_id: str = None, reason: str = None) -> str:
-    """
-    Deactivate the current tuned model deployment.
-    
-    This causes the agent to revert to using the base model.
-    
-    Args:
-        agent_id: Agent ID (default: mcp-agents)
-        reason: Reason for deactivation
-    
-    Returns:
-        JSON response confirming deactivation
-    """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        success = rl_ledger.deactivate_deployment(agent_id=agent)
-        
-        if success:
-            return json.dumps({
-                "success": True,
-                "message": f"Tuned model deactivated for agent {agent}. Now using base model.",
-                "base_model": FOUNDRY_MODEL_DEPLOYMENT_NAME,
-                "reason": reason,
-            }, indent=2)
-        else:
-            return json.dumps({"error": "Failed to deactivate deployment"})
-    
-    except Exception as e:
-        logger.error(f"Error deactivating deployment: {e}")
-        return json.dumps({"error": str(e)})
-
-
-@ai_function
-def lightning_get_stats_tool(agent_id: str = None) -> str:
-    """
-    Get comprehensive statistics about Agent Lightning for an agent.
-    
-    Args:
-        agent_id: Agent ID (default: mcp-agents)
-    
-    Returns:
-        JSON response with episode, reward, dataset, and deployment statistics
-    """
-    if not LIGHTNING_AVAILABLE or not rl_ledger:
-        return json.dumps({"error": "Agent Lightning not available"})
-    
-    try:
-        agent = agent_id or LIGHTNING_AGENT_ID
-        
-        # Get counts from ledger
-        episodes = rl_ledger.query_episodes(agent_id=agent, limit=1000)
-        rewards = rl_ledger.query_rewards(agent_id=agent, limit=1000)
-        datasets = rl_ledger.list_datasets(agent_id=agent, limit=100)
-        runs = rl_ledger.list_training_runs(agent_id=agent, limit=100)
-        deployments = rl_ledger.list_deployments(agent_id=agent, limit=100)
-        
-        # Get active deployment
-        active_deployment = deployment_registry.get_active_deployment(agent) if deployment_registry else None
-        
-        # Calculate reward statistics
-        reward_values = [r.value for r in rewards]
-        avg_reward = sum(reward_values) / len(reward_values) if reward_values else 0
-        
-        # Count by status
-        status_counts = {}
-        for run in runs:
-            status = run.status.value
-            status_counts[status] = status_counts.get(status, 0) + 1
-        
-        return json.dumps({
-            "agent_id": agent,
-            "lightning_enabled": ENABLE_LIGHTNING_CAPTURE,
-            "use_tuned_model": USE_TUNED_MODEL,
-            "statistics": {
-                "total_episodes": len(episodes),
-                "total_rewards": len(rewards),
-                "average_reward": round(avg_reward, 3),
-                "total_datasets": len(datasets),
-                "total_training_runs": len(runs),
-                "training_run_status": status_counts,
-                "total_deployments": len(deployments),
-            },
-            "active_deployment": {
-                "has_active": active_deployment is not None,
-                "model_name": active_deployment.tuned_model_name if active_deployment else None,
-                "promoted_at": active_deployment.promoted_at if active_deployment else None,
-            } if active_deployment else {"has_active": False},
-            "current_model": get_model_deployment(),
-            "base_model": FOUNDRY_MODEL_DEPLOYMENT_NAME,
-        }, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error getting Lightning stats: {e}")
-        return json.dumps({"error": str(e)})
+    return json.dumps(_ll_get_stats(agent_id), indent=2)
 
 
 # =========================================
@@ -3128,11 +2943,11 @@ TOOLS = [
         }
     ),
     # =========================================
-    # Agent Lightning Tools (RLHF Fine-Tuning)
+    # Azure Agents Learning SDK Tools (in-process RL)
     # =========================================
     MCPTool(
-        name="lightning_list_episodes",
-        description="List captured episodes from Agent Lightning. Episodes represent agent interactions (user input → tool calls → response) that can be used for RLHF fine-tuning.",
+        name="learning_list_episodes",
+        description="List captured episodes from the Azure Agents Learning SDK. Episodes represent agent interactions (user input → tool calls → response) used to learn the agent's policy.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3157,7 +2972,7 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_get_episode",
+        name="learning_get_episode",
         description="Get detailed information about a specific episode including all tool calls.",
         inputSchema={
             "type": "object",
@@ -3175,8 +2990,8 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_assign_reward",
-        description="Assign a reward/label to an episode for RLHF training. Rewards indicate the quality of the agent's response.",
+        name="learning_assign_reward",
+        description="Assign a manual reward/label to an episode. Rewards indicate the quality of the agent's response and feed the policy learner.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3191,7 +3006,7 @@ TOOLS = [
                 "reward_source": {
                     "type": "string",
                     "description": "Source of reward",
-                    "enum": ["human_approval", "eval_score", "test_result", "safety_check"]
+                    "enum": ["human_approval", "test_result", "metric"]
                 },
                 "agent_id": {
                     "type": "string",
@@ -3214,7 +3029,7 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_list_rewards",
+        name="learning_list_rewards",
         description="List rewards assigned to episodes.",
         inputSchema={
             "type": "object",
@@ -3236,78 +3051,74 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_build_dataset",
-        description="Build a fine-tuning dataset from rewarded episodes. Creates JSONL files for Azure OpenAI fine-tuning.",
+        name="learning_score_episode",
+        description="Score an episode with the Azure AI Evaluation judges (intent resolution, task adherence, task completion) and persist the per-metric and aggregate rewards.",
         inputSchema={
             "type": "object",
             "properties": {
-                "name": {
+                "episode_id": {
                     "type": "string",
-                    "description": "Name for the dataset"
+                    "description": "The ID of the episode to score"
                 },
                 "agent_id": {
                     "type": "string",
                     "description": "Agent ID (default: mcp-agents)"
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional description"
-                },
-                "min_reward": {
-                    "type": "number",
-                    "description": "Minimum average reward for episode inclusion (default: 0.5)"
                 }
             },
-            "required": ["name"]
+            "required": ["episode_id"]
         }
     ),
     MCPTool(
-        name="lightning_list_datasets",
-        description="List available fine-tuning datasets.",
+        name="learning_get_metrics",
+        description="List the stored judge metric results for an episode.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "episode_id": {
+                    "type": "string",
+                    "description": "The ID of the episode"
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Agent ID (default: mcp-agents)"
+                }
+            },
+            "required": ["episode_id"]
+        }
+    ),
+    MCPTool(
+        name="learning_run_training",
+        description="Run one offline REINFORCE-with-baseline learning batch over recent episodes to update the agent's softmax policy.",
         inputSchema={
             "type": "object",
             "properties": {
                 "agent_id": {
                     "type": "string",
-                    "description": "Filter by agent ID (default: mcp-agents)"
+                    "description": "Agent ID (default: mcp-agents)"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of datasets to return"
+                    "description": "Maximum number of recent episodes to learn from (default: 200)"
+                },
+                "score_missing": {
+                    "type": "boolean",
+                    "description": "Score episodes that have no rewards yet (default: true)"
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Only include episodes after this date (ISO format)"
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Only include episodes before this date (ISO format)"
                 }
             },
             "required": []
         }
     ),
     MCPTool(
-        name="lightning_start_training",
-        description="Start a fine-tuning training run using Azure OpenAI.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "dataset_id": {
-                    "type": "string",
-                    "description": "ID of the dataset to use for training"
-                },
-                "agent_id": {
-                    "type": "string",
-                    "description": "Agent ID (default: mcp-agents)"
-                },
-                "base_model": {
-                    "type": "string",
-                    "description": "Base model to fine-tune (default: gpt-4o-mini-2024-07-18)"
-                },
-                "n_epochs": {
-                    "type": "integer",
-                    "description": "Number of training epochs (default: 3)"
-                }
-            },
-            "required": ["dataset_id"]
-        }
-    ),
-    MCPTool(
-        name="lightning_get_training_status",
-        description="Get the status of a training run.",
+        name="learning_get_training_status",
+        description="Get the status and metrics of a learning run.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3324,8 +3135,8 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_list_training_runs",
-        description="List training runs.",
+        name="learning_list_training_runs",
+        description="List learning runs.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3342,30 +3153,27 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_promote_deployment",
-        description="Promote a tuned model to active deployment. Makes the fine-tuned model the active model for the agent.",
+        name="learning_init_policy",
+        description="Create (or replace) the softmax policy for an agent from a list of discrete action choices (prompt variants, retrieval strategies, etc.).",
         inputSchema={
             "type": "object",
             "properties": {
-                "training_run_id": {
-                    "type": "string",
-                    "description": "ID of the completed training run"
+                "actions": {
+                    "type": "array",
+                    "description": "List of action ids (strings) or {id, description, parameters} objects",
+                    "items": {"type": ["string", "object"]}
                 },
                 "agent_id": {
                     "type": "string",
                     "description": "Agent ID (default: mcp-agents)"
-                },
-                "promoted_by": {
-                    "type": "string",
-                    "description": "Who is promoting (for audit trail)"
                 }
             },
-            "required": ["training_run_id"]
+            "required": ["actions"]
         }
     ),
     MCPTool(
-        name="lightning_get_active_deployment",
-        description="Get the currently active tuned model deployment.",
+        name="learning_get_policy",
+        description="Get the agent's latest policy snapshot, including current action probabilities the learner has converged toward.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3378,70 +3186,8 @@ TOOLS = [
         }
     ),
     MCPTool(
-        name="lightning_list_deployments",
-        description="List all deployments (active and historical).",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "agent_id": {
-                    "type": "string",
-                    "description": "Filter by agent ID (default: mcp-agents)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of deployments to return"
-                }
-            },
-            "required": []
-        }
-    ),
-    MCPTool(
-        name="lightning_rollback_deployment",
-        description="Rollback to a previous deployment. If no target is specified, rolls back to the most recent previous deployment.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "agent_id": {
-                    "type": "string",
-                    "description": "Agent ID (default: mcp-agents)"
-                },
-                "target_deployment_id": {
-                    "type": "string",
-                    "description": "Specific deployment to roll back to (optional)"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Reason for rollback"
-                },
-                "rolled_back_by": {
-                    "type": "string",
-                    "description": "Who is rolling back (for audit trail)"
-                }
-            },
-            "required": []
-        }
-    ),
-    MCPTool(
-        name="lightning_deactivate_deployment",
-        description="Deactivate the current tuned model deployment. Causes the agent to revert to using the base model.",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "agent_id": {
-                    "type": "string",
-                    "description": "Agent ID (default: mcp-agents)"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Reason for deactivation"
-                }
-            },
-            "required": []
-        }
-    ),
-    MCPTool(
-        name="lightning_get_stats",
-        description="Get comprehensive statistics about Agent Lightning including episodes, rewards, datasets, and deployments.",
+        name="learning_get_stats",
+        description="Get comprehensive statistics about the Azure Agents Learning SDK including episodes, rewards, training runs, and the active policy.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3658,7 +3404,7 @@ TOOLS = [
 
 
 async def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> MCPToolResult:
-    """Execute an MCP tool with optional Agent Lightning episode capture."""
+    """Execute an MCP tool with optional Azure Agents Learning SDK episode capture."""
     start_time = time.time()
     result = None
     error_message = None
@@ -3673,8 +3419,8 @@ async def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> MCPToolResu
             isError=True
         )
     
-    # Capture episode for Agent Lightning if enabled
-    if episode_capture_hook and episode_capture_hook.is_enabled():
+    # Capture episode with the Azure Agents Learning SDK if enabled
+    if episode_capture and episode_capture.is_enabled():
         try:
             duration_ms = int((time.time() - start_time) * 1000)
             
@@ -3688,15 +3434,21 @@ async def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> MCPToolResu
             # Build user input from tool invocation
             user_input = f"Call tool '{tool_name}' with arguments: {json.dumps(arguments, default=str)}"
             
-            # Capture as episode
-            episode_capture_hook.capture_from_tool_result(
-                tool_name=tool_name,
-                arguments=arguments,
-                result=result_text,
+            # Capture as a single-turn episode
+            ctx = episode_capture.start(
                 user_input=user_input,
                 model_deployment=get_model_deployment(),
-                duration_ms=duration_ms,
+                metadata={"tool_name": tool_name},
             )
+            episode_capture.record_tool_call(
+                ctx,
+                name=tool_name,
+                arguments=arguments,
+                result=result_text,
+                duration_ms=duration_ms,
+                error=error_message,
+            )
+            episode_capture.end(ctx, assistant_output=result_text)
         except Exception as capture_error:
             # Never fail the tool call due to capture issues
             logger.warning(f"Failed to capture episode: {capture_error}")
@@ -3817,13 +3569,13 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 # Use the services.ai.azure.com endpoint directly
                 base_endpoint = FOUNDRY_PROJECT_ENDPOINT.split('/api/projects')[0] if '/api/projects' in FOUNDRY_PROJECT_ENDPOINT else FOUNDRY_PROJECT_ENDPOINT
                 
-                # Get the model deployment (may be tuned model if enabled)
+                # Get the model deployment (always the base Azure AI Foundry model)
                 model_deployment = get_model_deployment()
                 logger.info(f"Using Foundry endpoint: {base_endpoint}, model: {model_deployment}")
                 
                 client = AzureOpenAI(
                     azure_endpoint=base_endpoint,
-                    api_key=token.token,
+                    azure_ad_token=token.token,
                     api_version="2024-02-15-preview"
                 )
                 
@@ -3945,7 +3697,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 
                 # Step 6: Generate plan based on task, similar past tasks, and domain knowledge
                 logger.info("Generating execution plan...")
-                plan_steps = generate_plan_with_instructions(task, similar_tasks, task_instructions, domain_facts)
+                plan_steps = _normalize_plan_steps(generate_plan_with_instructions(task, similar_tasks, task_instructions, domain_facts))
                 
                 # Step 7: Store task in CosmosDB
                 task_doc = {
@@ -4573,747 +4325,149 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 )
         
         # =========================================
-        # Agent Lightning Tool Handlers
+        # Azure Agents Learning SDK Tool Handlers
         # =========================================
         
-        elif tool_name == "lightning_list_episodes":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            limit = arguments.get("limit", 20)
-            start_date = arguments.get("start_date")
-            end_date = arguments.get("end_date")
-            
-            try:
-                episodes = rl_ledger.query_episodes(
-                    agent_id=agent_id,
-                    start_date=start_date,
-                    end_date=end_date,
-                    limit=limit,
-                )
-                
-                episodes_data = []
-                for ep in episodes:
-                    episodes_data.append({
-                        "id": ep.id,
-                        "agent_id": ep.agent_id,
-                        "user_input": ep.user_input[:200] + "..." if len(ep.user_input) > 200 else ep.user_input,
-                        "assistant_output": ep.assistant_output[:200] + "..." if len(ep.assistant_output) > 200 else ep.assistant_output,
-                        "tool_calls_count": len(ep.tool_calls),
-                        "model_deployment": ep.model_deployment,
-                        "request_latency_ms": ep.request_latency_ms,
-                        "created_at": ep.created_at,
-                    })
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "agent_id": agent_id,
-                            "episodes_found": len(episodes_data),
-                            "episodes": episodes_data,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error listing episodes: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error listing episodes: {str(e)}"}],
-                    isError=True
-                )
+        elif tool_name == "learning_list_episodes":
+            payload = _ll_list_episodes(
+                arguments.get("agent_id"),
+                arguments.get("limit", 20),
+                arguments.get("start_date"),
+                arguments.get("end_date"),
+            )
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_get_episode":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
+        elif tool_name == "learning_get_episode":
             episode_id = arguments.get("episode_id")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            
             if not episode_id:
                 return MCPToolResult(
                     content=[{"type": "text", "text": "No episode_id provided"}],
                     isError=True
                 )
-            
-            try:
-                episode = rl_ledger.get_episode(episode_id, agent_id)
-                
-                if not episode:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": f"Episode {episode_id} not found"}],
-                        isError=True
-                    )
-                
-                tool_calls_data = []
-                for tc in episode.tool_calls:
-                    tool_calls_data.append({
-                        "tool_name": tc.tool_name,
-                        "arguments": tc.arguments,
-                        "result": tc.result[:500] + "..." if tc.result and len(tc.result) > 500 else tc.result,
-                        "duration_ms": tc.duration_ms,
-                        "error": tc.error,
-                    })
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "id": episode.id,
-                            "agent_id": episode.agent_id,
-                            "user_input": episode.user_input,
-                            "assistant_output": episode.assistant_output,
-                            "tool_calls": tool_calls_data,
-                            "model_deployment": episode.model_deployment,
-                            "request_latency_ms": episode.request_latency_ms,
-                            "created_at": episode.created_at,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error getting episode: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error getting episode: {str(e)}"}],
-                    isError=True
-                )
+            payload = _ll_get_episode(episode_id, arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_assign_reward":
-            if not LIGHTNING_AVAILABLE or not reward_writer:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
+        elif tool_name == "learning_assign_reward":
             episode_id = arguments.get("episode_id")
             reward_value = arguments.get("reward_value")
-            reward_source = arguments.get("reward_source", "human_approval")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            rubric = arguments.get("rubric")
-            evaluator = arguments.get("evaluator")
-            comments = arguments.get("comments")
-            
             if not episode_id or reward_value is None:
                 return MCPToolResult(
                     content=[{"type": "text", "text": "episode_id and reward_value are required"}],
                     isError=True
                 )
-            
-            try:
-                source_map = {
-                    "human_approval": RewardSource.HUMAN_APPROVAL,
-                    "eval_score": RewardSource.EVAL_SCORE,
-                    "test_result": RewardSource.TEST_RESULT,
-                    "safety_check": RewardSource.SAFETY_CHECK,
-                }
-                source = source_map.get(reward_source.lower(), RewardSource.EVAL_SCORE)
-                
-                reward = reward_writer.record_reward(
-                    episode_id=episode_id,
-                    agent_id=agent_id,
-                    source=source,
-                    value=reward_value,
-                    rubric=rubric,
-                    evaluator=evaluator,
-                    metadata={"comments": comments} if comments else {},
-                )
-                
-                if reward:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "reward_id": reward.id,
-                                "episode_id": episode_id,
-                                "value": reward.value,
-                                "source": source.value,
-                                "created_at": reward.created_at,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": "Failed to store reward"}],
-                        isError=True
-                    )
-            except Exception as e:
-                logger.error(f"Error assigning reward: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error assigning reward: {str(e)}"}],
-                    isError=True
-                )
+            payload = _ll_assign_reward(
+                episode_id,
+                reward_value,
+                arguments.get("reward_source", "human_approval"),
+                arguments.get("agent_id"),
+                arguments.get("rubric"),
+                arguments.get("evaluator"),
+                arguments.get("comments"),
+            )
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_list_rewards":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
+        elif tool_name == "learning_list_rewards":
+            payload = _ll_list_rewards(
+                arguments.get("episode_id"),
+                arguments.get("agent_id"),
+                arguments.get("limit", 50),
+            )
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
+        
+        elif tool_name == "learning_score_episode":
             episode_id = arguments.get("episode_id")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            limit = arguments.get("limit", 50)
-            
-            try:
-                rewards = rl_ledger.query_rewards(
-                    agent_id=agent_id,
-                    episode_id=episode_id,
-                    limit=limit,
-                )
-                
-                rewards_data = []
-                for r in rewards:
-                    rewards_data.append({
-                        "id": r.id,
-                        "episode_id": r.episode_id,
-                        "source": r.source.value,
-                        "value": r.value,
-                        "rubric": r.rubric,
-                        "evaluator": r.evaluator,
-                        "created_at": r.created_at,
-                    })
-                
+            if not episode_id:
                 return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "agent_id": agent_id,
-                            "rewards_found": len(rewards_data),
-                            "rewards": rewards_data,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error listing rewards: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error listing rewards: {str(e)}"}],
+                    content=[{"type": "text", "text": "episode_id is required"}],
                     isError=True
                 )
+            payload = _ll_score_episode(episode_id, arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_build_dataset":
-            if not LIGHTNING_AVAILABLE or not dataset_builder:
+        elif tool_name == "learning_get_metrics":
+            episode_id = arguments.get("episode_id")
+            if not episode_id:
                 return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
+                    content=[{"type": "text", "text": "episode_id is required"}],
                     isError=True
                 )
-            
-            name = arguments.get("name")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            description = arguments.get("description")
-            min_reward = arguments.get("min_reward", 0.5)
-            
-            if not name:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "name is required"}],
-                    isError=True
-                )
-            
-            try:
-                dataset = dataset_builder.build_dataset(
-                    agent_id=agent_id,
-                    name=name,
-                    description=description,
-                    min_reward=min_reward,
-                )
-                
-                if dataset:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "dataset_id": dataset.id,
-                                "name": dataset.name,
-                                "training_count": dataset.training_count,
-                                "validation_count": dataset.validation_count,
-                                "episode_count": len(dataset.episode_ids),
-                                "local_path": dataset.local_path,
-                                "created_at": dataset.created_at,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": "No qualifying episodes found for dataset"}],
-                        isError=True
-                    )
-            except Exception as e:
-                logger.error(f"Error building dataset: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error building dataset: {str(e)}"}],
-                    isError=True
-                )
+            payload = _ll_get_metrics(episode_id, arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_list_datasets":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            limit = arguments.get("limit", 20)
-            
-            try:
-                datasets = rl_ledger.list_datasets(agent_id=agent_id, limit=limit)
-                
-                datasets_data = []
-                for ds in datasets:
-                    datasets_data.append({
-                        "id": ds.id,
-                        "name": ds.name,
-                        "training_count": ds.training_count,
-                        "validation_count": ds.validation_count,
-                        "episode_count": len(ds.episode_ids),
-                        "created_at": ds.created_at,
-                    })
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "agent_id": agent_id,
-                            "datasets_found": len(datasets_data),
-                            "datasets": datasets_data,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error listing datasets: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error listing datasets: {str(e)}"}],
-                    isError=True
-                )
+        elif tool_name == "learning_run_training":
+            payload = _ll_run_training(
+                arguments.get("agent_id"),
+                arguments.get("limit", 200),
+                arguments.get("score_missing", True),
+                arguments.get("start_date"),
+                arguments.get("end_date"),
+            )
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_start_training":
-            if not LIGHTNING_AVAILABLE or not training_runner:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            dataset_id = arguments.get("dataset_id")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            base_model = arguments.get("base_model")
-            n_epochs = arguments.get("n_epochs")
-            
-            if not dataset_id:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "dataset_id is required"}],
-                    isError=True
-                )
-            
-            try:
-                hyperparams = {}
-                if n_epochs:
-                    hyperparams["n_epochs"] = n_epochs
-                
-                run = training_runner.start_training(
-                    dataset_id=dataset_id,
-                    agent_id=agent_id,
-                    base_model=base_model,
-                    hyperparameters=hyperparams if hyperparams else None,
-                )
-                
-                if run:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "training_run_id": run.id,
-                                "dataset_id": run.dataset_id,
-                                "base_model": run.base_model,
-                                "status": run.status.value,
-                                "aoai_job_id": run.aoai_job_id,
-                                "created_at": run.created_at,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": "Failed to start training"}],
-                        isError=True
-                    )
-            except Exception as e:
-                logger.error(f"Error starting training: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error starting training: {str(e)}"}],
-                    isError=True
-                )
-        
-        elif tool_name == "lightning_get_training_status":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
+        elif tool_name == "learning_get_training_status":
             training_run_id = arguments.get("training_run_id")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            
             if not training_run_id:
                 return MCPToolResult(
                     content=[{"type": "text", "text": "training_run_id is required"}],
                     isError=True
                 )
-            
-            try:
-                # Use training_runner.check_status() to poll AOAI API and sync Cosmos
-                if training_runner:
-                    run = training_runner.check_status(training_run_id, agent_id)
-                else:
-                    # Fallback to direct Cosmos read if runner not available
-                    run = rl_ledger.get_training_run(training_run_id, agent_id)
-                
-                if not run:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": f"Training run {training_run_id} not found"}],
-                        isError=True
-                    )
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "id": run.id,
-                            "dataset_id": run.dataset_id,
-                            "base_model": run.base_model,
-                            "tuned_model_name": run.tuned_model_name,
-                            "status": run.status.value,
-                            "metrics": run.metrics,
-                            "aoai_job_id": run.aoai_job_id,
-                            "error_message": run.error_message,
-                            "started_at": run.started_at,
-                            "completed_at": run.completed_at,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error getting training status: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error getting training status: {str(e)}"}],
-                    isError=True
-                )
+            payload = _ll_get_training_status(training_run_id, arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_list_training_runs":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            limit = arguments.get("limit", 20)
-            
-            try:
-                runs = rl_ledger.list_training_runs(agent_id=agent_id, limit=limit)
-                
-                runs_data = []
-                for run in runs:
-                    runs_data.append({
-                        "id": run.id,
-                        "dataset_id": run.dataset_id,
-                        "base_model": run.base_model,
-                        "tuned_model_name": run.tuned_model_name,
-                        "status": run.status.value,
-                        "started_at": run.started_at,
-                        "completed_at": run.completed_at,
-                    })
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "agent_id": agent_id,
-                            "runs_found": len(runs_data),
-                            "training_runs": runs_data,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error listing training runs: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error listing training runs: {str(e)}"}],
-                    isError=True
-                )
+        elif tool_name == "learning_list_training_runs":
+            payload = _ll_list_training_runs(
+                arguments.get("agent_id"),
+                arguments.get("limit", 20),
+            )
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_promote_deployment":
-            if not LIGHTNING_AVAILABLE or not deployment_registry:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            training_run_id = arguments.get("training_run_id")
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            promoted_by = arguments.get("promoted_by")
-            
-            if not training_run_id:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "training_run_id is required"}],
-                    isError=True
-                )
-            
-            try:
-                deployment = deployment_registry.promote(
-                    agent_id=agent_id,
-                    training_run_id=training_run_id,
-                    promoted_by=promoted_by,
-                )
-                
-                if deployment:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "deployment_id": deployment.id,
-                                "tuned_model_name": deployment.tuned_model_name,
-                                "is_active": deployment.is_active,
-                                "promoted_at": deployment.promoted_at,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": "Failed to promote deployment"}],
-                        isError=True
-                    )
-            except Exception as e:
-                logger.error(f"Error promoting deployment: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error promoting deployment: {str(e)}"}],
-                    isError=True
-                )
+        elif tool_name == "learning_init_policy":
+            payload = _ll_init_policy(arguments.get("actions") or [], arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_get_active_deployment":
-            if not LIGHTNING_AVAILABLE or not deployment_registry:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            
-            try:
-                deployment = deployment_registry.get_active_deployment(agent_id)
-                
-                if deployment:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "has_active_deployment": True,
-                                "deployment_id": deployment.id,
-                                "tuned_model_name": deployment.tuned_model_name,
-                                "promoted_at": deployment.promoted_at,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "has_active_deployment": False,
-                                "message": "No active tuned model. Using base model.",
-                                "base_model": FOUNDRY_MODEL_DEPLOYMENT_NAME,
-                            }, indent=2)
-                        }]
-                    )
-            except Exception as e:
-                logger.error(f"Error getting active deployment: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error getting active deployment: {str(e)}"}],
-                    isError=True
-                )
+        elif tool_name == "learning_get_policy":
+            payload = _ll_get_policy(arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
-        elif tool_name == "lightning_list_deployments":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            limit = arguments.get("limit", 20)
-            
-            try:
-                deployments = rl_ledger.list_deployments(agent_id=agent_id, limit=limit)
-                
-                deployments_data = []
-                for dep in deployments:
-                    deployments_data.append({
-                        "id": dep.id,
-                        "tuned_model_name": dep.tuned_model_name,
-                        "is_active": dep.is_active,
-                        "promoted_at": dep.promoted_at,
-                        "rollback_from": dep.rollback_from,
-                    })
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "agent_id": agent_id,
-                            "deployments_found": len(deployments_data),
-                            "deployments": deployments_data,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error listing deployments: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error listing deployments: {str(e)}"}],
-                    isError=True
-                )
-        
-        elif tool_name == "lightning_rollback_deployment":
-            if not LIGHTNING_AVAILABLE or not deployment_registry:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            target_deployment_id = arguments.get("target_deployment_id")
-            reason = arguments.get("reason")
-            rolled_back_by = arguments.get("rolled_back_by")
-            
-            try:
-                deployment = deployment_registry.rollback(
-                    agent_id=agent_id,
-                    target_deployment_id=target_deployment_id,
-                    reason=reason,
-                    rolled_back_by=rolled_back_by,
-                )
-                
-                if deployment:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "deployment_id": deployment.id,
-                                "tuned_model_name": deployment.tuned_model_name,
-                                "is_active": deployment.is_active,
-                                "rollback_reason": reason,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": "No previous deployment to roll back to"}],
-                        isError=True
-                    )
-            except Exception as e:
-                logger.error(f"Error rolling back deployment: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error rolling back deployment: {str(e)}"}],
-                    isError=True
-                )
-        
-        elif tool_name == "lightning_deactivate_deployment":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            reason = arguments.get("reason")
-            
-            try:
-                success = rl_ledger.deactivate_deployment(agent_id=agent_id)
-                
-                if success:
-                    return MCPToolResult(
-                        content=[{
-                            "type": "text",
-                            "text": json.dumps({
-                                "success": True,
-                                "message": f"Tuned model deactivated. Now using base model.",
-                                "base_model": FOUNDRY_MODEL_DEPLOYMENT_NAME,
-                                "reason": reason,
-                            }, indent=2)
-                        }]
-                    )
-                else:
-                    return MCPToolResult(
-                        content=[{"type": "text", "text": "Failed to deactivate deployment"}],
-                        isError=True
-                    )
-            except Exception as e:
-                logger.error(f"Error deactivating deployment: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error deactivating deployment: {str(e)}"}],
-                    isError=True
-                )
-        
-        elif tool_name == "lightning_get_stats":
-            if not LIGHTNING_AVAILABLE or not rl_ledger:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "Agent Lightning not available"}],
-                    isError=True
-                )
-            
-            agent_id = arguments.get("agent_id") or LIGHTNING_AGENT_ID
-            
-            try:
-                episodes = rl_ledger.query_episodes(agent_id=agent_id, limit=1000)
-                rewards = rl_ledger.query_rewards(agent_id=agent_id, limit=1000)
-                datasets = rl_ledger.list_datasets(agent_id=agent_id, limit=100)
-                runs = rl_ledger.list_training_runs(agent_id=agent_id, limit=100)
-                deployments = rl_ledger.list_deployments(agent_id=agent_id, limit=100)
-                
-                active_deployment = deployment_registry.get_active_deployment(agent_id) if deployment_registry else None
-                
-                reward_values = [r.value for r in rewards]
-                avg_reward = sum(reward_values) / len(reward_values) if reward_values else 0
-                
-                status_counts = {}
-                for run in runs:
-                    status = run.status.value
-                    status_counts[status] = status_counts.get(status, 0) + 1
-                
-                return MCPToolResult(
-                    content=[{
-                        "type": "text",
-                        "text": json.dumps({
-                            "agent_id": agent_id,
-                            "lightning_enabled": ENABLE_LIGHTNING_CAPTURE,
-                            "use_tuned_model": USE_TUNED_MODEL,
-                            "statistics": {
-                                "total_episodes": len(episodes),
-                                "total_rewards": len(rewards),
-                                "average_reward": round(avg_reward, 3),
-                                "total_datasets": len(datasets),
-                                "total_training_runs": len(runs),
-                                "training_run_status": status_counts,
-                                "total_deployments": len(deployments),
-                            },
-                            "active_deployment": {
-                                "has_active": active_deployment is not None,
-                                "model_name": active_deployment.tuned_model_name if active_deployment else None,
-                            },
-                            "current_model": get_model_deployment(),
-                            "base_model": FOUNDRY_MODEL_DEPLOYMENT_NAME,
-                        }, indent=2)
-                    }]
-                )
-            except Exception as e:
-                logger.error(f"Error getting Lightning stats: {e}")
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Error getting Lightning stats: {str(e)}"}],
-                    isError=True
-                )
+        elif tool_name == "learning_get_stats":
+            payload = _ll_get_stats(arguments.get("agent_id"))
+            return MCPToolResult(
+                content=[{"type": "text", "text": json.dumps(payload, indent=2)}],
+                isError="error" in payload,
+            )
         
         # =========================================
         # Agent Evaluation Tool Handlers

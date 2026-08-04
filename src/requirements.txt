@@ -13,6 +13,19 @@ agent-framework-azure-ai==1.0.0b260107
 agent-framework-core==1.0.0b260107
 agent-framework-azure-ai-search==1.0.0b260107
 
+# Pin mcp to the 1.x line. agent-framework 1.0.0b260107 declares mcp[ws]>=1.23 and
+# imports `McpError` from `mcp.shared.exceptions`, which was relocated (and types split
+# into `mcp-types`) in mcp 2.0.0 — installing 2.x breaks agent_framework at import time.
+mcp[ws]>=1.23,<2
+
+# Pin azure-ai-projects to 2.0.0b3. agent-framework-azure-ai 1.0.0b260107 imports
+# `PromptAgentDefinitionText` from azure.ai.projects.models, which was renamed to
+# `PromptAgentDefinitionTextOptions` in azure-ai-projects 2.0.0b4 (2026-02-24) and is
+# absent from the 2.x stable line (pip otherwise resolves the loose `>=2.0.0b2` to 2.4.0).
+# 2.0.0b3 (2026-01-06) is the release contemporaneous with the agent-framework build.
+azure-ai-projects==2.0.0b3
+azure-ai-agents==1.2.0b5
+
 # Azure AI Search for long-term memory and Foundry IQ integration
 azure-search-documents>=11.5.0
 
@@ -21,6 +34,10 @@ openai>=1.0.0
 
 # Azure CosmosDB for task and plan storage
 azure-cosmos>=4.7.0
+
+# Azure Agents Learning SDK - in-process reinforcement learning for agents
+# https://github.com/microsoft/azure-agents-learning-sdk
+azure-agents-learning-sdk>=0.3.1
 
 # NumPy for vector operations (cosine similarity)
 numpy>=1.24.0

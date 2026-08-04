@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Post-provision hook for AKS setup
 
 Write-Host "🔧 Post-provision setup..." -ForegroundColor Cyan
@@ -12,7 +12,8 @@ $rgName = $envValues.AZURE_RESOURCE_GROUP_NAME.Trim('"')
 $containerRegistry = $envValues.CONTAINER_REGISTRY.Trim('"')
 $storageUrl = $envValues.AZURE_STORAGE_ACCOUNT_URL.Trim('"')
 $mcpIdentityClientId = $envValues.MCP_SERVER_IDENTITY_CLIENT_ID.Trim('"')
-$mcpPublicIpAddress = $envValues.MCP_PUBLIC_IP_ADDRESS.Trim('"')
+$mcpInternalLbIp = if ($envValues.MCP_INTERNAL_LB_IP) { $envValues.MCP_INTERNAL_LB_IP.Trim('"') } else { '10.0.4.4' }
+$mcpLbSubnetName = if ($envValues.MCP_LB_SUBNET_NAME) { $envValues.MCP_LB_SUBNET_NAME.Trim('"') } else { 'svc-lb' }
 $foundryProjectEndpoint = $envValues.FOUNDRY_PROJECT_ENDPOINT.Trim('"')
 $foundryModelDeploymentName = $envValues.FOUNDRY_MODEL_DEPLOYMENT_NAME.Trim('"')
 $embeddingModelDeploymentName = $envValues.EMBEDDING_MODEL_DEPLOYMENT_NAME.Trim('"')
@@ -29,7 +30,7 @@ $fabricOneLakeBlobEndpoint = $envValues.FABRIC_ONELAKE_BLOB_ENDPOINT.Trim('"')
 Write-Host "  AKS Cluster: $aksName" -ForegroundColor White
 Write-Host "  Resource Group: $rgName" -ForegroundColor White
 Write-Host "  Container Registry: $containerRegistry" -ForegroundColor White
-Write-Host "  MCP Public IP: $mcpPublicIpAddress" -ForegroundColor White
+Write-Host "  MCP Internal LB IP: $mcpInternalLbIp" -ForegroundColor White
 Write-Host "  Foundry Endpoint: $foundryProjectEndpoint" -ForegroundColor White
 Write-Host "  Foundry Model: $foundryModelDeploymentName" -ForegroundColor White
 Write-Host "  Embedding Model: $embeddingModelDeploymentName" -ForegroundColor White
@@ -99,11 +100,12 @@ $configuredDeployment = $deploymentTemplate `
 $configuredDeployment | Out-File -FilePath "./k8s/mcp-agents-deployment-configured.yaml" -Encoding utf8
 Write-Host "  ✅ Configured mcp-agents-deployment-configured.yaml" -ForegroundColor Green
 
-# Read and configure loadbalancer template
+# Read and configure loadbalancer template (internal / private LoadBalancer)
 $lbTemplate = Get-Content -Path "./k8s/mcp-agents-loadbalancer.yaml" -Raw
 $configuredLb = $lbTemplate `
   -replace '\$\{AZURE_RESOURCE_GROUP_NAME\}', $rgName `
-  -replace '\$\{MCP_PUBLIC_IP_ADDRESS\}', $mcpPublicIpAddress
+  -replace '\$\{MCP_INTERNAL_LB_IP\}', $mcpInternalLbIp `
+  -replace '\$\{MCP_LB_SUBNET_NAME\}', $mcpLbSubnetName
 $configuredLb | Out-File -FilePath "./k8s/mcp-agents-loadbalancer-configured.yaml" -Encoding utf8
 Write-Host "  ✅ Configured mcp-agents-loadbalancer-configured.yaml" -ForegroundColor Green
 
@@ -148,9 +150,9 @@ $retry = 0
 $lbReady = $false
 while ($retry -lt $maxRetries -and -not $lbReady) {
   $lbStatus = kubectl get svc mcp-agents-loadbalancer -n mcp-agents -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>$null
-  if ($lbStatus -eq $mcpPublicIpAddress) {
+  if ($lbStatus -eq $mcpInternalLbIp) {
     $lbReady = $true
-    Write-Host "✅ LoadBalancer ready with IP: $lbStatus" -ForegroundColor Green
+    Write-Host "✅ Internal LoadBalancer ready with private IP: $lbStatus" -ForegroundColor Green
   } else {
     Write-Host "  Waiting for LoadBalancer... ($retry/$maxRetries)" -ForegroundColor Yellow
     Start-Sleep -Seconds 10
@@ -167,6 +169,7 @@ Write-Host "`n📚 Provisioning AI Search index & ingesting task instructions...
 try {
   # Ensure current user can create indexes (useful if running script locally)
   $searchServiceName = $envValues.AZURE_SEARCH_SERVICE_NAME.Trim('"')
+  if (-not $searchServiceName) { throw "AI Search disabled (SEARCH_ENABLED=false); skipping index provisioning and task ingestion" }
   if ($searchServiceName) {
     $subscriptionId = az account show --query id -o tsv
     $searchScope = "/subscriptions/$subscriptionId/resourceGroups/$rgName/providers/Microsoft.Search/searchServices/$searchServiceName"
