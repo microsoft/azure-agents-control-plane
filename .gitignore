@@ -189,3 +189,13 @@ mcp_tokens.json
 .venv
 ./tests/mcp_test.env
 ./tests/mcp_test_config.json
+
+# Terraform working files and local inputs
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+infra/terraform/generated/
+infra/terraform/*.tfvars

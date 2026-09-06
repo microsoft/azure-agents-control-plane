@@ -1,0 +1,11 @@
+environment_name = "dev"
+location         = "eastus2"
+vnet_enabled     = true
+
+# The defaults above follow infra/main.parameters.json. Optional Bicep inputs that
+# do not have a typed Terraform variable can be supplied by their original name.
+template_parameters = {
+  # foundryModelCapacity      = 10
+  # grafanaEnabled            = true
+  # approvalLogicAppEnabled   = false
+}

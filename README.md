@@ -105,6 +105,21 @@ The `azd up` command deploys all infrastructure and automatically configures:
 - MCP server deployment with workload identity
 - LoadBalancer service connected to APIM backend
 
+### Terraform (Optional)
+
+Bicep remains the primary infrastructure definition and `azd up` remains
+unchanged. An opt-in Terraform workflow is available for teams that require
+Terraform state and commands; it compiles and deploys the canonical Bicep
+template rather than maintaining a second copy of every Azure resource.
+
+```powershell
+./infra/terraform/deploy.ps1 -Action plan
+./infra/terraform/deploy.ps1 -Action apply
+```
+
+See [infra/terraform/README.md](infra/terraform/README.md) for Bash commands,
+configuration, validation, and destroy behavior.
+
 ### Two-Phase Deployment (with Agent Identity)
 
 For deployments requiring Entra Agent Identity:
