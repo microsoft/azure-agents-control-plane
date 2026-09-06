@@ -1,14 +1,20 @@
 ﻿#!/usr/bin/env pwsh
 # Post-provision hook for AKS setup
 
+$ErrorActionPreference = "Stop"
+if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+  $PSNativeCommandUseErrorActionPreference = $false
+}
+
 Write-Host "🔧 Post-provision setup..." -ForegroundColor Cyan
 
 # Get environment values from azd
 Write-Host "`n📝 Loading environment values..." -ForegroundColor Cyan
-$envValues = azd env get-values | ConvertFrom-StringData -Delimiter '='
+$envValues = azd env get-values | ConvertFrom-StringData
 
 $aksName = $envValues.AKS_CLUSTER_NAME.Trim('"')
 $rgName = $envValues.AZURE_RESOURCE_GROUP_NAME.Trim('"')
+$subscriptionId = $envValues.AZURE_SUBSCRIPTION_ID.Trim('"')
 $containerRegistry = $envValues.CONTAINER_REGISTRY.Trim('"')
 $storageUrl = $envValues.AZURE_STORAGE_ACCOUNT_URL.Trim('"')
 $mcpIdentityClientId = $envValues.MCP_SERVER_IDENTITY_CLIENT_ID.Trim('"')
@@ -21,11 +27,17 @@ $cosmosDbEndpoint = $envValues.COSMOSDB_ENDPOINT.Trim('"')
 $cosmosDbDatabaseName = $envValues.COSMOSDB_DATABASE_NAME.Trim('"')
 $azureSearchEndpoint = $envValues.AZURE_SEARCH_ENDPOINT.Trim('"')
 $azureSearchIndexName = $envValues.AZURE_SEARCH_INDEX_NAME.Trim('"')
+$mcpAgentRuntime = if ($envValues.MCP_AGENT_RUNTIME) { $envValues.MCP_AGENT_RUNTIME.Trim('"').Trim().ToLowerInvariant() } else { 'python' }
+if ($mcpAgentRuntime -notin @('python', 'typescript')) {
+  Write-Host "Unsupported MCP_AGENT_RUNTIME '$mcpAgentRuntime'. Use 'python' or 'typescript'." -ForegroundColor Red
+  exit 1
+}
+$imageTag = if ($mcpAgentRuntime -eq 'typescript') { 'typescript' } else { 'latest' }
 # Fabric configuration
-$fabricEnabled = $envValues.FABRIC_ENABLED.Trim('"')
+$fabricEnabled = 'false'
 $fabricCapacityName = $envValues.FABRIC_CAPACITY_NAME.Trim('"')
-$fabricOneLakeDfsEndpoint = $envValues.FABRIC_ONELAKE_DFS_ENDPOINT.Trim('"')
-$fabricOneLakeBlobEndpoint = $envValues.FABRIC_ONELAKE_BLOB_ENDPOINT.Trim('"')
+$fabricOneLakeDfsEndpoint = ''
+$fabricOneLakeBlobEndpoint = ''
 
 Write-Host "  AKS Cluster: $aksName" -ForegroundColor White
 Write-Host "  Resource Group: $rgName" -ForegroundColor White
@@ -38,6 +50,7 @@ Write-Host "  CosmosDB Endpoint: $cosmosDbEndpoint" -ForegroundColor White
 Write-Host "  CosmosDB Database: $cosmosDbDatabaseName" -ForegroundColor White
 Write-Host "  AI Search Endpoint: $azureSearchEndpoint" -ForegroundColor White
 Write-Host "  AI Search Index: $azureSearchIndexName" -ForegroundColor White
+Write-Host "  MCP Agent Runtime: $mcpAgentRuntime" -ForegroundColor White
 Write-Host "  Fabric Enabled: $fabricEnabled" -ForegroundColor White
 Write-Host "  Fabric Capacity: $fabricCapacityName" -ForegroundColor White
 Write-Host "  OneLake DFS Endpoint: $fabricOneLakeDfsEndpoint" -ForegroundColor White
@@ -47,9 +60,15 @@ if (-not $aksName -or -not $rgName) {
   exit 1
 }
 
+az account set --subscription $subscriptionId
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to select Azure subscription $subscriptionId"
+}
+
 # Get AKS credentials
 Write-Host "`n🔑 Getting AKS credentials..." -ForegroundColor Cyan
 az aks get-credentials --resource-group $rgName --name $aksName --overwrite-existing --admin
+if ($LASTEXITCODE -ne 0) { throw "Failed to get AKS credentials" }
 Write-Host "✅ AKS credentials configured" -ForegroundColor Green
 
 # Grant current user AKS RBAC access
@@ -57,12 +76,14 @@ Write-Host "`n🔐 Granting AKS RBAC access..." -ForegroundColor Cyan
 $userId = az ad signed-in-user show --query id -o tsv
 $aksResourceId = az aks show --resource-group $rgName --name $aksName --query id -o tsv
 az role assignment create --role "Azure Kubernetes Service RBAC Cluster Admin" --assignee $userId --scope $aksResourceId 2>$null
+if ($LASTEXITCODE -ne 0) { throw "Failed to grant AKS RBAC access" }
 Write-Host "✅ RBAC access granted" -ForegroundColor Green
 
 # Attach ACR to AKS
 Write-Host "`n🔗 Attaching ACR to AKS..." -ForegroundColor Cyan
 $acrName = $containerRegistry -replace '\.azurecr\.io$', ''
 az aks update --resource-group $rgName --name $aksName --attach-acr $acrName
+if ($LASTEXITCODE -ne 0) { throw "Failed to attach ACR to AKS" }
 Write-Host "✅ ACR attached" -ForegroundColor Green
 
 # Configure Kubernetes deployment files
@@ -73,7 +94,7 @@ $deploymentTemplate = Get-Content -Path "./k8s/mcp-agents-deployment.yaml" -Raw
 $tenantId = $envValues.AZURE_TENANT_ID.Trim('"')
 $configuredDeployment = $deploymentTemplate `
   -replace '\$\{CONTAINER_REGISTRY\}', $containerRegistry `
-  -replace '\$\{IMAGE_TAG\}', 'latest' `
+  -replace '\$\{IMAGE_TAG\}', $imageTag `
   -replace '\$\{AZURE_STORAGE_ACCOUNT_URL\}', $storageUrl `
   -replace '\$\{AZURE_CLIENT_ID\}', $mcpIdentityClientId `
   -replace '\$\{AZURE_TENANT_ID\}', $tenantId `
@@ -86,8 +107,11 @@ $configuredDeployment = $deploymentTemplate `
   -replace '\$\{EMBEDDING_MODEL_DEPLOYMENT_NAME\}', $embeddingModelDeploymentName `
   -replace '\$\{COSMOSDB_ENDPOINT\}', $cosmosDbEndpoint `
   -replace '\$\{COSMOSDB_DATABASE_NAME\}', $cosmosDbDatabaseName `
+  -replace '\$\{AGENT_LEARNING_STORE_BACKEND:-cosmos\}', 'cosmos' `
+  -replace '\$\{AGENT_LEARNING_ENABLE_CAPTURE:-false\}', 'false' `
   -replace '\$\{AZURE_SEARCH_ENDPOINT\}', $azureSearchEndpoint `
   -replace '\$\{AZURE_SEARCH_INDEX_NAME\}', $azureSearchIndexName `
+  -replace '\$\{AZURE_SEARCH_KNOWLEDGE_BASE_NAME\}', 'task-instructions-kb' `
   -replace '\$\{FABRIC_ENABLED\}', $fabricEnabled `
   -replace '\$\{FABRIC_ENDPOINT\}', $fabricOneLakeDfsEndpoint `
   -replace '\$\{FABRIC_WORKSPACE_ID\}', '' `
@@ -96,6 +120,7 @@ $configuredDeployment = $deploymentTemplate `
   -replace '\$\{FABRIC_ONELAKE_BLOB_ENDPOINT\}', $fabricOneLakeBlobEndpoint `
   -replace '\$\{FABRIC_LAKEHOUSE_NAME\}', 'mcpontologies' `
   -replace '\$\{FABRIC_ONTOLOGY_PATH\}', 'Files/ontology' `
+  -replace '\$\{FABRIC_API_ENDPOINT\}', '' `
   -replace '\$\{ONTOLOGY_CONTAINER_NAME\}', 'ontologies'
 $configuredDeployment | Out-File -FilePath "./k8s/mcp-agents-deployment-configured.yaml" -Encoding utf8
 Write-Host "  ✅ Configured mcp-agents-deployment-configured.yaml" -ForegroundColor Green
@@ -115,7 +140,11 @@ $oidcIssuer = az aks show --resource-group $rgName --name $aksName --query "oidc
 $identityName = "id-mcp-" + ($aksName -replace '^aks-', '')
 
 # Check if federated credential already exists
-$existingCred = az identity federated-credential show --name mcp-agents-federated --identity-name $identityName --resource-group $rgName 2>$null
+$existingCred = az identity federated-credential list `
+  --identity-name $identityName `
+  --resource-group $rgName `
+  --query "[?name == 'mcp-agents-federated'].name | [0]" `
+  --output tsv
 if (-not $existingCred) {
   az identity federated-credential create `
     --name mcp-agents-federated `
@@ -123,7 +152,8 @@ if (-not $existingCred) {
     --resource-group $rgName `
     --issuer $oidcIssuer `
     --subject "system:serviceaccount:mcp-agents:mcp-agents-sa" `
-    --audience "api://AzureADTokenExchange"
+    --audiences "api://AzureADTokenExchange"
+  if ($LASTEXITCODE -ne 0) { throw "Failed to create the workload identity credential" }
   Write-Host "✅ Federated identity credential created" -ForegroundColor Green
 } else {
   Write-Host "✅ Federated identity credential already exists" -ForegroundColor Green
@@ -132,16 +162,24 @@ if (-not $existingCred) {
 # Build and push container image
 Write-Host "`n🐳 Building and pushing container image..." -ForegroundColor Cyan
 $env:CONTAINER_REGISTRY = $containerRegistry
+$env:MCP_AGENT_RUNTIME = $mcpAgentRuntime
+$env:IMAGE_TAG = $imageTag
 & "./scripts/build-and-push.ps1"
+if ($LASTEXITCODE -ne 0) { throw "Container image build failed" }
 
 # Deploy to Kubernetes
 Write-Host "`n🚀 Deploying to Kubernetes..." -ForegroundColor Cyan
 kubectl apply -f ./k8s/mcp-agents-deployment-configured.yaml
+if ($LASTEXITCODE -ne 0) { throw "Failed to apply the MCP deployment" }
 kubectl apply -f ./k8s/mcp-agents-loadbalancer-configured.yaml
+if ($LASTEXITCODE -ne 0) { throw "Failed to apply the MCP load balancer" }
+kubectl rollout restart deployment/mcp-agents -n mcp-agents
+if ($LASTEXITCODE -ne 0) { throw "Failed to restart the MCP deployment" }
 
 # Wait for deployment to be ready
 Write-Host "`n⏳ Waiting for deployment to be ready..." -ForegroundColor Cyan
 kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
+if ($LASTEXITCODE -ne 0) { throw "MCP deployment rollout failed" }
 
 # Wait for LoadBalancer to get external IP
 Write-Host "`n⏳ Waiting for LoadBalancer IP assignment..." -ForegroundColor Cyan

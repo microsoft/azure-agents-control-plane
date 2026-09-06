@@ -71,7 +71,7 @@ spec:
       containers:
       - name: mcp-agents
         image: ${CONTAINER_REGISTRY}/mcp-agents:${IMAGE_TAG}
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         ports:
         - containerPort: 8000
           name: http
@@ -142,28 +142,28 @@ spec:
         # Microsoft Fabric IQ Configuration
         # =========================================
         - name: FABRIC_ENABLED
-          value: "${FABRIC_ENABLED}"
+          value: "false"
         - name: FABRIC_ENDPOINT
-          value: "${FABRIC_ENDPOINT}"
+          value: ""
         - name: FABRIC_WORKSPACE_ID
-          value: "${FABRIC_WORKSPACE_ID}"
+          value: ""
         - name: FABRIC_ONTOLOGY_NAME
-          value: "${FABRIC_ONTOLOGY_NAME}"
+          value: ""
         - name: FABRIC_ONELAKE_DFS_ENDPOINT
-          value: "${FABRIC_ONELAKE_DFS_ENDPOINT}"
+          value: ""
         - name: FABRIC_ONELAKE_BLOB_ENDPOINT
-          value: "${FABRIC_ONELAKE_BLOB_ENDPOINT}"
+          value: ""
         - name: FABRIC_LAKEHOUSE_NAME
-          value: "${FABRIC_LAKEHOUSE_NAME}"
+          value: ""
         - name: FABRIC_ONTOLOGY_PATH
-          value: "${FABRIC_ONTOLOGY_PATH}"
+          value: ""
         # =========================================
         # Fabric Data Agents Configuration
         # =========================================
         - name: FABRIC_DATA_AGENTS_ENABLED
-          value: "${FABRIC_DATA_AGENTS_ENABLED}"
+          value: "false"
         - name: FABRIC_API_ENDPOINT
-          value: "${FABRIC_API_ENDPOINT}"
+          value: ""
         # =========================================
         # Ontology Storage (Azure Blob - Fabric fallback)
         # =========================================

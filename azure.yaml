@@ -12,6 +12,12 @@ services:
     resourceName: ${AKS_CLUSTER_NAME}
     docker:
       remoteBuild: true
+
+# The postprovision hook builds and deploys the selected Python or TypeScript image.
+workflows:
+  up:
+    steps:
+      - azd: provision
     
 hooks:
   postprovision:

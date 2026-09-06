@@ -21,7 +21,7 @@
       "value": "6441e54f-8149-487b-aac4-3a55a049a362"
     },
     "fabricEnabled": {
-      "value": "${FABRIC_ENABLED=true}"
+      "value": false
     },
     "fabricSkuName": {
       "value": "${FABRIC_SKU=F2}"
@@ -42,7 +42,7 @@
       "value": "${DEVELOPER_IP_ADDRESS=}"
     },
     "fabricDataAgentsEnabled": {
-      "value": "${FABRIC_DATA_AGENTS_ENABLED=true}"
+      "value": false
     },
     "fabricWorkspaceId": {
       "value": "${FABRIC_WORKSPACE_ID=}"

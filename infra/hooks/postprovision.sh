@@ -10,6 +10,8 @@ echo ""
 echo "📝 Loading environment values..."
 eval $(azd env get-values | sed 's/^/export /')
 
+az account set --subscription "$(echo "$AZURE_SUBSCRIPTION_ID" | tr -d '"')"
+
 AKS_NAME=$(echo $AKS_CLUSTER_NAME | tr -d '"')
 RG_NAME=$(echo $AZURE_RESOURCE_GROUP_NAME | tr -d '"')
 CONTAINER_REG=$(echo $CONTAINER_REGISTRY | tr -d '"')
@@ -24,6 +26,19 @@ COSMOS_ENDPOINT=$(echo $COSMOSDB_ENDPOINT | tr -d '"')
 COSMOS_DATABASE=$(echo $COSMOSDB_DATABASE_NAME | tr -d '"')
 SEARCH_ENDPOINT=$(echo $AZURE_SEARCH_ENDPOINT | tr -d '"')
 SEARCH_INDEX=$(echo $AZURE_SEARCH_INDEX_NAME | tr -d '"')
+MCP_AGENT_RUNTIME=$(echo "${MCP_AGENT_RUNTIME:-python}" | tr -d '"' | tr '[:upper:]' '[:lower:]')
+case "$MCP_AGENT_RUNTIME" in
+  python)
+    IMAGE_TAG="latest"
+    ;;
+  typescript)
+    IMAGE_TAG="typescript"
+    ;;
+  *)
+    echo "Unsupported MCP_AGENT_RUNTIME '$MCP_AGENT_RUNTIME'. Use 'python' or 'typescript'."
+    exit 1
+    ;;
+esac
 
 echo "  AKS Cluster: $AKS_NAME"
 echo "  Resource Group: $RG_NAME"
@@ -36,6 +51,7 @@ echo "  CosmosDB Endpoint: $COSMOS_ENDPOINT"
 echo "  CosmosDB Database: $COSMOS_DATABASE"
 echo "  AI Search Endpoint: $SEARCH_ENDPOINT"
 echo "  AI Search Index: $SEARCH_INDEX"
+echo "  MCP Agent Runtime: $MCP_AGENT_RUNTIME"
 
 if [ -z "$AKS_NAME" ] || [ -z "$RG_NAME" ]; then
   echo "⚠️  Could not find AKS cluster name or resource group"
@@ -69,7 +85,7 @@ echo "📄 Configuring Kubernetes manifests..."
 
 # Read and configure deployment template
 sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
-    -e "s|\${IMAGE_TAG}|latest|g" \
+  -e "s|\${IMAGE_TAG}|$IMAGE_TAG|g" \
     -e "s|\${AZURE_STORAGE_ACCOUNT_URL}|$STORAGE_URL|g" \
     -e "s|\${AZURE_CLIENT_ID}|$MCP_IDENTITY_CLIENT_ID|g" \
     -e "s|\${FOUNDRY_PROJECT_ENDPOINT}|$FOUNDRY_ENDPOINT|g" \
@@ -77,8 +93,12 @@ sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
     -e "s|\${EMBEDDING_MODEL_DEPLOYMENT_NAME}|$EMBEDDING_MODEL|g" \
     -e "s|\${COSMOSDB_ENDPOINT}|$COSMOS_ENDPOINT|g" \
     -e "s|\${COSMOSDB_DATABASE_NAME}|$COSMOS_DATABASE|g" \
+    -e "s|\${AGENT_LEARNING_STORE_BACKEND:-cosmos}|cosmos|g" \
+    -e "s|\${AGENT_LEARNING_ENABLE_CAPTURE:-false}|false|g" \
     -e "s|\${AZURE_SEARCH_ENDPOINT}|$SEARCH_ENDPOINT|g" \
     -e "s|\${AZURE_SEARCH_INDEX_NAME}|$SEARCH_INDEX|g" \
+    -e "s|\${AZURE_SEARCH_KNOWLEDGE_BASE_NAME}|task-instructions-kb|g" \
+    -e "s|\${FABRIC_API_ENDPOINT}||g" \
     ./k8s/mcp-agents-deployment.yaml > ./k8s/mcp-agents-deployment-configured.yaml
 echo "  ✅ Configured mcp-agents-deployment-configured.yaml"
 
@@ -113,6 +133,8 @@ fi
 echo ""
 echo "🐳 Building and pushing container image..."
 export CONTAINER_REGISTRY="$CONTAINER_REG"
+export MCP_AGENT_RUNTIME
+export IMAGE_TAG
 ./scripts/build-and-push.sh
 
 # Deploy to Kubernetes
@@ -120,6 +142,7 @@ echo ""
 echo "🚀 Deploying to Kubernetes..."
 kubectl apply -f ./k8s/mcp-agents-deployment-configured.yaml
 kubectl apply -f ./k8s/mcp-agents-loadbalancer-configured.yaml
+kubectl rollout restart deployment/mcp-agents -n mcp-agents
 
 # Wait for deployment to be ready
 echo ""

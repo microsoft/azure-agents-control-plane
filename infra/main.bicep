@@ -365,6 +365,35 @@ module aksCluster './core/aks/aks-cluster.bicep' = {
   ]
 }
 
+var networkContributorRoleDefinitionId = '4d97b98b-1d4f-4787-a291-c67834d212e7'
+module aksNodeSubnetRoleAssignment './core/network/subnet-role-assignment.bicep' = if (vnetEnabled) {
+  name: 'aksNodeSubnetRoleAssignment'
+  scope: rg
+  params: {
+    virtualNetworkName: serviceVirtualNetworkName
+    subnetName: serviceVirtualNetworkAppSubnetName
+    principalId: aksUserAssignedIdentity.outputs.identityPrincipalId
+    roleDefinitionId: networkContributorRoleDefinitionId
+  }
+  dependsOn: [
+    serviceVirtualNetworkEarly
+  ]
+}
+
+module aksLoadBalancerSubnetRoleAssignment './core/network/subnet-role-assignment.bicep' = if (vnetEnabled) {
+  name: 'aksLoadBalancerSubnetRoleAssignment'
+  scope: rg
+  params: {
+    virtualNetworkName: serviceVirtualNetworkName
+    subnetName: 'svc-lb'
+    principalId: aksUserAssignedIdentity.outputs.identityPrincipalId
+    roleDefinitionId: networkContributorRoleDefinitionId
+  }
+  dependsOn: [
+    serviceVirtualNetworkEarly
+  ]
+}
+
 // Grant AKS pull access to ACR
 var acrPullRoleDefinitionId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
 module acrPullRoleAssignment 'core/acr/acr-role-assignment.bicep' = {
@@ -1118,8 +1147,8 @@ output MCP_SERVER_IDENTITY_CLIENT_ID string = mcpUserAssignedIdentity.outputs.id
 output SERVICE_API_ENDPOINTS array = [ '${apimService.outputs.gatewayUrl}/mcp/sse' ]
 output APIM_GATEWAY_URL string = apimService.outputs.gatewayUrl
 output MCP_BASE_URL string = '${apimService.outputs.gatewayUrl}/mcp'
-output MCP_OAUTH_AUTHORIZE_URL string = '${apimService.outputs.gatewayUrl}/mcp/oauth/authorize'
-output MCP_OAUTH_TOKEN_URL string = '${apimService.outputs.gatewayUrl}/mcp/oauth/token'
+output MCP_OAUTH_AUTHORIZE_URL string = '${apimService.outputs.gatewayUrl}/authorize'
+output MCP_OAUTH_TOKEN_URL string = '${apimService.outputs.gatewayUrl}/token'
 output MCP_CLIENT_ID string = existingEntraAppId
 output AZURE_RESOURCE_GROUP_NAME string = rg.name
 output AZURE_SUBSCRIPTION_ID string = subscription().subscriptionId

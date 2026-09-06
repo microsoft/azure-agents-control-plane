@@ -87,6 +87,17 @@ azd auth login
 azd up
 ```
 
+Python is the default MCP agent runtime and uses `src/Dockerfile`. To deploy the
+TypeScript implementation from `src/Dockerfile.typescript`, select it in the azd
+environment before running the same command:
+
+```bash
+azd env set MCP_AGENT_RUNTIME typescript
+azd up
+```
+
+Switch back to Python with `azd env set MCP_AGENT_RUNTIME python`.
+
 The `azd up` command deploys all infrastructure and automatically configures:
 
 - AKS cluster with Container Registry

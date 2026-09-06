@@ -33,46 +33,81 @@ $tenantId = $subscriptionInfo.tenantId
 Write-Host "📍 Subscription: $($subscriptionInfo.name)" -ForegroundColor Yellow
 Write-Host "📍 Tenant: $tenantId`n" -ForegroundColor Yellow
 
-# Find the most recent deployment if no deployment name specified
-if ($DeploymentName -eq "main") {
-    Write-Host "🔍 Finding most recent deployment..." -ForegroundColor Cyan
-    $recentDeployment = az deployment sub list --query "[?starts_with(name, 'apim-mcp')] | [0].name" -o tsv
-    if ($recentDeployment) {
-        $DeploymentName = $recentDeployment
-        Write-Host "✅ Found deployment: $DeploymentName" -ForegroundColor Green
-    } else {
-        Write-Host "⚠️  No recent deployment found, checking 'main'..." -ForegroundColor Yellow
+function ConvertFrom-AzdValue([object]$Value) {
+    if ($null -eq $Value) {
+        return ""
     }
+    return ([string]$Value).Trim('"')
 }
 
-# Get deployment outputs
-Write-Host "`n📤 Retrieving deployment outputs..." -ForegroundColor Cyan
+# Prefer the current azd environment because it contains the outputs from the
+# exact deployment that invoked this post-provision hook.
+$azdEnvValues = $null
 try {
-    $outputsJson = az deployment sub show --name $DeploymentName --query "properties.outputs" -o json
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to get deployment outputs"
+    $azdEnvOutput = azd env get-values 2>$null
+    if ($LASTEXITCODE -eq 0 -and $azdEnvOutput) {
+        $azdEnvValues = $azdEnvOutput | ConvertFrom-StringData
     }
-    $outputs = $outputsJson | ConvertFrom-Json
 } catch {
-    Write-Host "❌ Error: Could not retrieve deployment outputs" -ForegroundColor Red
-    Write-Host "   Make sure the deployment exists and completed successfully" -ForegroundColor Red
-    Write-Host "   Deployment name: $DeploymentName" -ForegroundColor Yellow
-    exit 1
+    $azdEnvValues = $null
 }
 
-# Extract configuration values
-$config = @{
-    APIM_BASE_URL = $outputs.MCP_BASE_URL.value
-    APIM_GATEWAY_URL = $outputs.APIM_GATEWAY_URL.value
-    APIM_OAUTH_AUTHORIZE_URL = $outputs.MCP_OAUTH_AUTHORIZE_URL.value
-    APIM_OAUTH_TOKEN_URL = $outputs.MCP_OAUTH_TOKEN_URL.value
-    MCP_CLIENT_ID = $outputs.MCP_CLIENT_ID.value
-    AZURE_TENANT_ID = $outputs.AZURE_TENANT_ID.value
-    AZURE_SUBSCRIPTION_ID = $outputs.AZURE_SUBSCRIPTION_ID.value
-    AZURE_RESOURCE_GROUP_NAME = $outputs.AZURE_RESOURCE_GROUP_NAME.value
-    AZURE_LOCATION = $outputs.AZURE_LOCATION.value
-    AKS_CLUSTER_NAME = $outputs.AKS_CLUSTER_NAME.value
-    CONTAINER_REGISTRY = $outputs.CONTAINER_REGISTRY.value
+if ($azdEnvValues -and $azdEnvValues.MCP_BASE_URL) {
+    Write-Host "🔍 Using outputs from the active azd environment" -ForegroundColor Cyan
+    $DeploymentName = ConvertFrom-AzdValue $azdEnvValues.AZURE_ENV_NAME
+    $config = @{
+        APIM_BASE_URL = ConvertFrom-AzdValue $azdEnvValues.MCP_BASE_URL
+        APIM_GATEWAY_URL = ConvertFrom-AzdValue $azdEnvValues.APIM_GATEWAY_URL
+        APIM_OAUTH_AUTHORIZE_URL = ConvertFrom-AzdValue $azdEnvValues.MCP_OAUTH_AUTHORIZE_URL
+        APIM_OAUTH_TOKEN_URL = ConvertFrom-AzdValue $azdEnvValues.MCP_OAUTH_TOKEN_URL
+        MCP_CLIENT_ID = ConvertFrom-AzdValue $azdEnvValues.MCP_CLIENT_ID
+        AZURE_TENANT_ID = ConvertFrom-AzdValue $azdEnvValues.AZURE_TENANT_ID
+        AZURE_SUBSCRIPTION_ID = ConvertFrom-AzdValue $azdEnvValues.AZURE_SUBSCRIPTION_ID
+        AZURE_RESOURCE_GROUP_NAME = ConvertFrom-AzdValue $azdEnvValues.AZURE_RESOURCE_GROUP_NAME
+        AZURE_LOCATION = ConvertFrom-AzdValue $azdEnvValues.AZURE_LOCATION
+        AKS_CLUSTER_NAME = ConvertFrom-AzdValue $azdEnvValues.AKS_CLUSTER_NAME
+        CONTAINER_REGISTRY = ConvertFrom-AzdValue $azdEnvValues.CONTAINER_REGISTRY
+    }
+} else {
+    # Fall back to a subscription deployment lookup when no azd environment is active.
+    if ($DeploymentName -eq "main") {
+        Write-Host "🔍 Finding most recent deployment..." -ForegroundColor Cyan
+        $recentDeployment = az deployment sub list --query "[?starts_with(name, 'apim-mcp')] | [0].name" -o tsv
+        if ($recentDeployment) {
+            $DeploymentName = $recentDeployment
+            Write-Host "✅ Found deployment: $DeploymentName" -ForegroundColor Green
+        } else {
+            Write-Host "⚠️  No recent deployment found, checking 'main'..." -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "`n📤 Retrieving deployment outputs..." -ForegroundColor Cyan
+    try {
+        $outputsJson = az deployment sub show --name $DeploymentName --query "properties.outputs" -o json
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to get deployment outputs"
+        }
+        $outputs = $outputsJson | ConvertFrom-Json
+    } catch {
+        Write-Host "❌ Error: Could not retrieve deployment outputs" -ForegroundColor Red
+        Write-Host "   Make sure the deployment exists and completed successfully" -ForegroundColor Red
+        Write-Host "   Deployment name: $DeploymentName" -ForegroundColor Yellow
+        exit 1
+    }
+
+    $config = @{
+        APIM_BASE_URL = $outputs.MCP_BASE_URL.value
+        APIM_GATEWAY_URL = $outputs.APIM_GATEWAY_URL.value
+        APIM_OAUTH_AUTHORIZE_URL = $outputs.MCP_OAUTH_AUTHORIZE_URL.value
+        APIM_OAUTH_TOKEN_URL = $outputs.MCP_OAUTH_TOKEN_URL.value
+        MCP_CLIENT_ID = $outputs.MCP_CLIENT_ID.value
+        AZURE_TENANT_ID = $outputs.AZURE_TENANT_ID.value
+        AZURE_SUBSCRIPTION_ID = $outputs.AZURE_SUBSCRIPTION_ID.value
+        AZURE_RESOURCE_GROUP_NAME = $outputs.AZURE_RESOURCE_GROUP_NAME.value
+        AZURE_LOCATION = $outputs.AZURE_LOCATION.value
+        AKS_CLUSTER_NAME = $outputs.AKS_CLUSTER_NAME.value
+        CONTAINER_REGISTRY = $outputs.CONTAINER_REGISTRY.value
+    }
 }
 
 # Add redirect URI (standard for OAuth testing)
@@ -90,7 +125,7 @@ foreach ($key in $config.Keys | Sort-Object) {
 }
 
 # Ensure output directory exists
-$outputPath = Join-Path $PSScriptRoot ".." $OutputDir
+$outputPath = Join-Path (Join-Path $PSScriptRoot "..") $OutputDir
 if (-not (Test-Path $outputPath)) {
     New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
 }
@@ -123,7 +158,7 @@ AKS_CLUSTER_NAME=$($config.AKS_CLUSTER_NAME)
 CONTAINER_REGISTRY=$($config.CONTAINER_REGISTRY)
 "@
 
-Set-Content -Path $envFile -Value $envContent -Encoding UTF8
+[System.IO.File]::WriteAllText($envFile, $envContent, [System.Text.UTF8Encoding]::new($false))
 Write-Host "✅ .env file created: $envFile" -ForegroundColor Green
 
 # Generate .json file
@@ -156,7 +191,8 @@ $jsonConfig = @{
     }
 }
 
-$jsonConfig | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonFile -Encoding UTF8
+$jsonContent = $jsonConfig | ConvertTo-Json -Depth 10
+[System.IO.File]::WriteAllText($jsonFile, $jsonContent, [System.Text.UTF8Encoding]::new($false))
 Write-Host "✅ JSON file created: $jsonFile" -ForegroundColor Green
 
 Write-Host "`n🎉 Configuration files generated successfully!" -ForegroundColor Green
