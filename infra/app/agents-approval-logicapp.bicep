@@ -1,89 +1,86 @@
-// ============================================================================
-// Agents Approval Logic App Infrastructure
-// Deploys Azure Logic App for Teams-based approval workflow
-// ============================================================================
+// Consumption approval transport. Python alone validates decisions and persists
+// approval/audit records; this workflow has no Cosmos data access.
+// Requires Bicep >= 0.35.1 for the secure trigger URL output.
 
-@description('The name of the Logic App')
+@description('The name of the Consumption Logic App.')
+@minLength(1)
+@maxLength(80)
 param logicAppName string
 
-@description('The location for all resources')
+@description('The location for the workflow and Teams managed API connection.')
 param location string = resourceGroup().location
 
-@description('Tags to apply to all resources')
+@description('Tags to apply to the workflow and connection.')
 param tags object = {}
 
-@description('The CosmosDB account name for audit logging')
+@description('Existing Cosmos DB account used by the Python approval engine.')
+@minLength(1)
 param cosmosDbAccountName string
 
-@description('The CosmosDB database name')
+@description('Existing SQL database. The parent MUST depend on database provisioning before deploying this module.')
+@minLength(1)
 param cosmosDbDatabaseName string = 'mcpdb'
 
-@description('The CosmosDB container name for approvals')
+@description('Approval/audit container, partitioned by /environment. Python is its only application writer.')
+@minLength(1)
 param cosmosDbContainerName string = 'approvals'
 
-@description('The Teams channel ID for approval notifications')
+@description('Fixed Teams channel ID. Empty routing is allowed for staged provisioning and disables the workflow.')
+@maxLength(256)
 param teamsChannelId string = ''
 
-@description('The Teams group/team ID for approval notifications')
+@description('Fixed Teams team/group object ID (GUID). Empty routing disables the workflow.')
+@maxLength(36)
 param teamsGroupId string = ''
 
-@description('Approval timeout in hours')
+@description('Maximum Teams wait, in hours. The request expires_at can shorten this; Python enforces the durable deadline.')
+@minValue(1)
+@maxValue(24)
 param approvalTimeoutHours int = 2
 
-@description('The user-assigned managed identity ID')
-param userAssignedIdentityId string = ''
+@description('Fixed HTTPS APIM URL ending in /agent-approvals/callback, with no query, fragment or credentials. Empty disables the workflow. Compute from the gateway, not from the callback module output, to avoid a dependency cycle.')
+@maxLength(2048)
+param callbackUrl string = ''
 
-// ============================================================================
-// Existing Resources
-// ============================================================================
+@description('Entra application ID URI api://<blueprint-client-GUID> for the callback access token. Empty disables the workflow.')
+@maxLength(42)
+param callbackAudience string = ''
+
+@description('Allowed approver Entra user object IDs (GUIDs), in this subscription tenant. Request approvers may narrow but never widen this list. Empty disables the workflow.')
+@maxLength(100)
+param approverIds string[] = []
+
+// Stage 1 creates the system identity, connection and container without routing.
+// Authorize the Teams OAuth connection as a user, wire APIM with the principal
+// output, then provide routing. The workflow also validates configuration before
+// any outbound call, including if an operator manually enables an incomplete app.
+var workflowConfigured = !empty(trim(teamsChannelId))
+  && !empty(trim(teamsGroupId))
+  && !empty(approverIds)
+  && startsWith(callbackUrl, 'https://')
+  && endsWith(callbackUrl, '/agent-approvals/callback')
+  && startsWith(callbackAudience, 'api://')
+  && length(callbackAudience) == 42
 
 resource cosmosDbAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' existing = {
   name: cosmosDbAccountName
 }
 
-// Cosmos DB Built-in Data Contributor role
-var CosmosDBDataContributor = '00000000-0000-0000-0000-000000000002'
-
-// ============================================================================
-// API Connections
-// ============================================================================
-
-var cosmosConnectionName = '${logicAppName}-cosmos'
-var teamsConnectionName = '${logicAppName}-teams'
-
-// CosmosDB connection - Standard V1 connection (requires manual authentication or access key)
-// For managed identity, the Logic App uses its identity directly when accessing Cosmos DB
-resource cosmosDbConnection 'Microsoft.Web/connections@2016-06-01' = {
-  name: cosmosConnectionName
-  location: location
-  tags: tags
-  properties: {
-    displayName: 'CosmosDB Connection for Approvals'
-    api: {
-      id: subscriptionResourceId('Microsoft.Web/locations/managedApis', location, 'documentdb')
-    }
-    parameterValues: {
-      databaseAccount: cosmosDbAccountName
-      accessKey: cosmosDbAccount.listKeys().primaryMasterKey
-    }
-  }
-}
-
+// Consumption uses a V1 managed API connection. Teams requires interactive user
+// OAuth authorization; the workflow managed identity CANNOT authorize Teams.
+// Do not replace the user's authorization with empty tokens on redeployment.
 resource teamsConnection 'Microsoft.Web/connections@2016-06-01' = {
-  name: teamsConnectionName
+  name: '${logicAppName}-teams'
   location: location
   tags: tags
+  kind: 'V1'
   properties: {
-    displayName: 'Teams Connection for Approvals'
+    displayName: 'Teams Connection for Agent Approvals'
     api: {
       id: subscriptionResourceId('Microsoft.Web/locations/managedApis', location, 'teams')
     }
   }
 }
-
-// ============================================================================
-// Logic App Workflow
-// ============================================================================
 
 resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
   name: logicAppName
@@ -91,194 +88,53 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
   tags: union(tags, {
     'azd-service-name': 'agents-approval-workflow'
   })
-  identity: empty(userAssignedIdentityId) ? {
+  identity: {
     type: 'SystemAssigned'
-  } : {
-    type: 'UserAssigned'
-    userAssignedIdentities: {
-      '${userAssignedIdentityId}': {}
-    }
   }
   properties: {
-    state: 'Enabled'
-    definition: {
-      '$schema': 'https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#'
-      contentVersion: '1.0.0.0'
-      parameters: {
-        '$connections': {
-          defaultValue: {}
-          type: 'Object'
-        }
-        teamsChannelId: {
-          defaultValue: teamsChannelId
-          type: 'String'
-        }
-        teamsGroupId: {
-          defaultValue: teamsGroupId
-          type: 'String'
-        }
-        approvalTimeoutHours: {
-          defaultValue: approvalTimeoutHours
-          type: 'Int'
-        }
-        cosmosDbEndpoint: {
-          defaultValue: 'https://${cosmosDbAccountName}.documents.azure.com'
-          type: 'String'
-        }
-      }
-      triggers: {
-        When_an_HTTP_request_is_received: {
-          type: 'Request'
-          kind: 'Http'
-          inputs: {
-            schema: {
-              type: 'object'
-              properties: {
-                approval_id: { type: 'string' }
-                task: { type: 'string' }
-                environment: { type: 'string' }
-                cluster: { type: 'string' }
-                namespace: { type: 'string' }
-                image_tags: { type: 'array' }
-                commit_sha: { type: 'string' }
-                requested_by: { type: 'string' }
-                callback_url: { type: 'string' }
-              }
-              required: ['approval_id', 'task', 'environment', 'cluster', 'callback_url']
-            }
-          }
-        }
-      }
-      actions: {
-        Initialize_Approval_Record: {
-          type: 'InitializeVariable'
-          runAfter: {}
-          inputs: {
-            variables: [
-              {
-                name: 'approvalRecord'
-                type: 'object'
-                value: {
-                  approval_id: '@{triggerBody()?[\'approval_id\']}'
-                  task: '@{triggerBody()?[\'task\']}'
-                  environment: '@{triggerBody()?[\'environment\']}'
-                  status: 'pending'
-                  created_at: '@{utcNow()}'
-                }
-              }
-            ]
-          }
-        }
-        Start_Teams_Approval: {
-          type: 'ApiConnectionWebhook'
-          runAfter: {
-            Initialize_Approval_Record: ['Succeeded']
-          }
-          inputs: {
-            host: {
-              connection: {
-                name: '@parameters(\'$connections\')[\'teams\'][\'connectionId\']'
-              }
-            }
-            body: {
-              notificationUrl: '@{listCallbackUrl()}'
-              message: {
-                title: 'CI/CD Deployment Approval - @{triggerBody()?[\'environment\']}'
-                details: 'Deployment to @{triggerBody()?[\'cluster\']} requested'
-              }
-              approvalType: 'CustomResponse'
-              customResponses: [
-                {
-                  response: 'Approve'
-                  comment: { isOptional: true }
-                }
-                {
-                  response: 'Reject'
-                  comment: { isOptional: false }
-                }
-              ]
-            }
-            path: '/v2/approvals/create'
-          }
-          limit: {
-            timeout: 'PT@{parameters(\'approvalTimeoutHours\')}H'
-          }
-        }
-        Notify_Agent_Of_Decision: {
-          type: 'Http'
-          runAfter: {
-            Start_Teams_Approval: ['Succeeded']
-          }
-          inputs: {
-            method: 'POST'
-            uri: '@{triggerBody()?[\'callback_url\']}'
-            body: {
-              approval_id: '@{triggerBody()?[\'approval_id\']}'
-              decision: '@{body(\'Start_Teams_Approval\')?[\'outcome\']}'
-              approved_by: '@{body(\'Start_Teams_Approval\')?[\'responder\']?[\'displayName\']}'
-              timestamp: '@{utcNow()}'
-            }
-            headers: {
-              'Content-Type': 'application/json'
-            }
-          }
-        }
-        Response: {
-          type: 'Response'
-          runAfter: {
-            Notify_Agent_Of_Decision: ['Succeeded']
-          }
-          inputs: {
-            statusCode: 200
-            body: '@variables(\'approvalRecord\')'
-          }
-        }
-      }
-    }
+    state: workflowConfigured ? 'Enabled' : 'Disabled'
+    definition: loadJsonContent('../../agent365/workflows/agent_approval_logic_app.json')
     parameters: {
       '$connections': {
         value: {
-          documentdb: {
-            connectionId: cosmosDbConnection.id
-            connectionName: 'documentdb'
-            id: subscriptionResourceId('Microsoft.Web/locations/managedApis', location, 'documentdb')
-          }
           teams: {
             connectionId: teamsConnection.id
-            connectionName: 'teams'
+            connectionName: teamsConnection.name
             id: subscriptionResourceId('Microsoft.Web/locations/managedApis', location, 'teams')
           }
         }
       }
+      teamsChannelId: {
+        value: trim(teamsChannelId)
+      }
+      teamsGroupId: {
+        value: toLower(trim(teamsGroupId))
+      }
+      approvalTimeoutHours: {
+        value: approvalTimeoutHours
+      }
+      callbackUrl: {
+        value: callbackUrl
+      }
+      callbackAudience: {
+        value: toLower(callbackAudience)
+      }
+      approverIds: {
+        value: map(approverIds, id => toLower(trim(id)))
+      }
+      approverTenantId: {
+        value: toLower(subscription().tenantId)
+      }
     }
   }
 }
-
-// ============================================================================
-// CosmosDB Role Assignment for Logic App Managed Identity
-// ============================================================================
-
-// Assign Cosmos DB Data Contributor role to Logic App's managed identity
-resource cosmosRoleAssignmentLogicApp 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
-  name: guid(cosmosDbAccount.id, logicApp.id, CosmosDBDataContributor, 'logicapp')
-  parent: cosmosDbAccount
-  properties: {
-    principalId: logicApp.identity.principalId
-    roleDefinitionId: '${cosmosDbAccount.id}/sqlRoleDefinitions/${CosmosDBDataContributor}'
-    scope: cosmosDbAccount.id
-  }
-}
-
-// ============================================================================
-// CosmosDB Container for Approvals
-// ============================================================================
 
 resource cosmosDatabase 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2024-05-15' existing = {
   parent: cosmosDbAccount
   name: cosmosDbDatabaseName
 }
 
-resource approvalsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2023-04-15' = {
+resource approvalsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-05-15' = {
   parent: cosmosDatabase
   name: cosmosDbContainerName
   properties: {
@@ -297,27 +153,26 @@ resource approvalsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/
           { path: '/"_etag"/?' }
         ]
       }
-      defaultTtl: -1 // No automatic expiration for audit data
+      defaultTtl: -1
     }
   }
 }
 
-// ============================================================================
-// Outputs
-// ============================================================================
-
-@description('The Logic App trigger URL for approval requests')
-#disable-next-line outputs-should-not-contain-secrets
+@description('Sensitive SAS trigger URL. Never promote to an ordinary parent/azd output, environment file or manifest. The parent may instead retrieve listCallbackUrl and inject directly into a Kubernetes Secret without logging it.')
+@secure()
 output logicAppTriggerUrl string = listCallbackUrl('${logicApp.id}/triggers/When_an_HTTP_request_is_received', '2019-05-01').value
 
-@description('The Logic App resource ID')
+@description('The Logic App resource ID.')
 output logicAppId string = logicApp.id
 
-@description('The Logic App name')
+@description('The Logic App resource name.')
 output logicAppName string = logicApp.name
 
-@description('The Logic App managed identity principal ID')
+@description('System-assigned service principal OBJECT ID for the APIM oid allowlist and Python callback validation. Not a client ID or an agent/UAMI principal.')
 output logicAppPrincipalId string = logicApp.identity.principalId
 
-@description('The approvals container name')
+@description('Teams OAuth managed API connection name; an authorized user must authorize this connection before use.')
+output teamsConnectionName string = teamsConnection.name
+
+@description('Approvals container name for the Python engine.')
 output approvalsContainerName string = approvalsContainer.name

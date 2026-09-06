@@ -1,45 +1,52 @@
-@description('Name of the AKS cluster')
+// Optional DIRECT AKS -> blueprint federation. This is NOT the AKS -> bootstrap
+// MI federation required by get_agent_credential(); that ARM MI FIC must remain.
+// Do not annotate the bootstrap service account with the agent's client ID.
+// This module only configures trust; runtime direct-assertion mode is not provided.
+// Configuration MI requires pregranted Graph APPLICATION roles:
+// AgentIdentityBlueprint.Read.All, AgentIdentityBlueprint.AddRemoveCreds.All,
+// AgentIdentityBlueprint.UpdateBranding.All (for FIC PATCH).
+// https://learn.microsoft.com/graph/api/federatedidentitycredential-update?view=graph-rest-beta
+// Never resolves a child service principal to an application, and never skips.
+
 param aksClusterName string
-
-@description('Namespace for the Kubernetes service account')
 param serviceAccountNamespace string
-
-@description('Name of the Kubernetes service account')
 param serviceAccountName string
 
-@description('App ID (client ID) of the Agent Identity or User Assigned Identity')
-param identityClientId string
+@description('Application OBJECT ID of the blueprint (not blueprint principal ID or agent ID)')
+param blueprintObjectId string
 
-@description('Principal ID of the Agent Identity or User Assigned Identity')
-param identityPrincipalId string
+@description('Blueprint client/app ID; checked against the object ID before modifying trust')
+param blueprintAppId string
 
-@description('Name for the federated credential')
+@minLength(1)
 param federatedCredentialName string
 
-@description('Subject identifier for the service account (format: system:serviceaccount:namespace:serviceAccountName)')
 param subjectIdentifier string = 'system:serviceaccount:${serviceAccountNamespace}:${serviceAccountName}'
-
-@description('Location for deployment scripts')
 param location string = resourceGroup().location
-
-@description('Tags for resources')
 param tags object = {}
 
-@description('Resource ID of a managed identity with permissions to configure federated credentials')
+@description('Full ARM resource ID of a user-assigned MI with pregranted Graph FIC permissions')
 param configurationIdentityResourceId string
 
-// Get AKS cluster to obtain OIDC issuer URL
+param tenantId string = tenant().tenantId
+param forceUpdateTag string = 'identity-v2'
+
 resource aksCluster 'Microsoft.ContainerService/managedClusters@2024-02-01' existing = {
   name: aksClusterName
 }
 
-// Unique identifier for the deployment script
-var deploymentScriptName = 'ds-fed-cred-${uniqueString(identityClientId, serviceAccountName)}'
+var configuration = {
+  objectId: blueprintObjectId
+  appId: blueprintAppId
+  name: federatedCredentialName
+  issuer: aksCluster.properties.oidcIssuerProfile.issuerURL
+  subject: subjectIdentifier
+  tenantId: tenantId
+  cloud: environment().name
+}
 
-// Deployment script to create federated identity credential for the agent identity
-// This allows AKS workloads to authenticate as the agent identity
 resource federatedCredentialScript 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
-  name: deploymentScriptName
+  name: 'ds-fed-cred-${uniqueString(blueprintObjectId, serviceAccountNamespace, serviceAccountName)}'
   location: location
   tags: tags
   kind: 'AzurePowerShell'
@@ -51,94 +58,73 @@ resource federatedCredentialScript 'Microsoft.Resources/deploymentScripts@2023-0
   }
   properties: {
     azPowerShellVersion: '12.0'
-    timeout: 'PT30M'
+    timeout: 'PT15M'
     retentionInterval: 'P1D'
     cleanupPreference: 'OnSuccess'
-    arguments: '-IdentityPrincipalId "${identityPrincipalId}" -FederatedCredentialName "${federatedCredentialName}" -OidcIssuerUrl "${aksCluster.properties.oidcIssuerProfile.issuerURL}" -Subject "${subjectIdentifier}"'
+    forceUpdateTag: forceUpdateTag
+    environmentVariables: [
+      {
+        name: 'IDENTITY_CONFIG'
+        value: string(configuration)
+      }
+    ]
     scriptContent: '''
-      param(
-        [string]$IdentityPrincipalId,
-        [string]$FederatedCredentialName,
-        [string]$OidcIssuerUrl,
-        [string]$Subject
-      )
-
-      # Install Microsoft.Graph modules if needed
-      $modules = @('Microsoft.Graph.Authentication', 'Microsoft.Graph.Applications')
-      foreach ($module in $modules) {
-        if (-not (Get-Module -ListAvailable -Name $module)) {
-          Install-Module -Name $module -Force -Scope CurrentUser -AllowClobber
-        }
-        Import-Module $module -Force
-      }
-
-      # Connect to Microsoft Graph using managed identity
-      Connect-MgGraph -Identity -NoWelcome
-
-      # Get the service principal (agent identity)
-      $sp = Get-MgServicePrincipal -ServicePrincipalId $IdentityPrincipalId -ErrorAction SilentlyContinue
-
-      if (-not $sp) {
-        Write-Error "Service Principal not found with ID: $IdentityPrincipalId"
-        throw "Service principal not found"
-      }
-
-      # Get the associated application
-      $app = Get-MgApplication -Filter "appId eq '$($sp.AppId)'" -ErrorAction SilentlyContinue
-
-      if (-not $app) {
-        # For agent identities, the federated credential is added to the blueprint, not the agent identity itself
-        # Try to get the blueprint application
-        Write-Host "Application not found for service principal. Agent identities inherit credentials from their blueprint."
-        Write-Host "Skipping federated credential creation - ensure the blueprint has appropriate credentials configured."
-        
-        $DeploymentScriptOutputs = @{}
-        $DeploymentScriptOutputs['status'] = 'skipped'
-        $DeploymentScriptOutputs['message'] = 'Agent identities use blueprint credentials'
-        return
-      }
-
-      # Check if federated credential already exists
-      $existingCreds = Get-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id -ErrorAction SilentlyContinue
-      $existingCred = $existingCreds | Where-Object { $_.Name -eq $FederatedCredentialName }
-
-      if ($existingCred) {
-        Write-Host "Federated credential '$FederatedCredentialName' already exists"
-        $DeploymentScriptOutputs = @{}
-        $DeploymentScriptOutputs['status'] = 'exists'
-        $DeploymentScriptOutputs['credentialId'] = $existingCred.Id
-        return
-      }
-
-      # Create federated identity credential
-      $credBody = @{
-        name = $FederatedCredentialName
-        issuer = $OidcIssuerUrl
-        subject = $Subject
-        audiences = @('api://AzureADTokenExchange')
-        description = "AKS Workload Identity for MCP Agent"
-      }
-
+      $ErrorActionPreference = 'Stop'
+      $VerbosePreference = 'SilentlyContinue'
+      $DebugPreference = 'SilentlyContinue'
+      $c = $env:IDENTITY_CONFIG | ConvertFrom-Json
+      if ($c.cloud -ne 'AzureCloud') { throw 'Agent ID provisioning currently supports Azure public cloud only.' }
+      $objectId = ([guid]$c.objectId).ToString()
+      $appId = ([guid]$c.appId).ToString()
+      $tenant = ([guid]$c.tenantId).ToString()
+      if (-not $c.issuer -or -not $c.issuer.StartsWith('https://')) { throw 'AKS OIDC issuer is missing or invalid; enable OIDC before provisioning federation.' }
+      if ($c.subject -notmatch '^system:serviceaccount:[^:]+:[^:]+$') { throw 'Invalid Kubernetes service account subject.' }
       try {
-        $headers = @{
-          'OData-Version' = '4.0'
-          'Content-Type' = 'application/json'
-        }
-        
-        $newCred = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/beta/applications/$($app.Id)/federatedIdentityCredentials" -Body ($credBody | ConvertTo-Json) -Headers $headers
-        Write-Host "Created federated identity credential: $FederatedCredentialName"
-        
-        $DeploymentScriptOutputs = @{}
-        $DeploymentScriptOutputs['status'] = 'created'
-        $DeploymentScriptOutputs['credentialId'] = $newCred.id
-      } catch {
-        Write-Error "Failed to create federated identity credential: $_"
-        throw
+        $access = (Get-AzAccessToken -ResourceUrl 'https://graph.microsoft.com' -TenantId $tenant -ErrorAction Stop).Token
+        if ($access -is [securestring]) { $access = [pscredential]::new('token', $access).GetNetworkCredential().Password }
+      } catch { throw 'Configuration MI Graph authentication failed.' }
+      $headers = @{ Authorization = "Bearer $access"; 'OData-Version' = '4.0' }
+      function Invoke-Graph([string]$Method, [string]$Uri, $Body = $null) {
+        if (-not $Uri.StartsWith('https://graph.microsoft.com/')) { throw 'Unexpected Graph URL.' }
+        $request = @{ Method = $Method; Uri = $Uri; Headers = $headers; TimeoutSec = 30; MaximumRedirection = 0; ErrorAction = 'Stop' }
+        if ($null -ne $Body) { $request.Body = ConvertTo-Json -InputObject $Body -Depth 10 -Compress; $request.ContentType = 'application/json' }
+        try { Invoke-RestMethod @request }
+        catch { throw 'Blueprint AKS federation operation failed. Check Graph permissions, blueprint IDs and Entra logs; no skip/fallback is allowed.' }
       }
+      $app = Invoke-Graph GET "https://graph.microsoft.com/v1.0/applications/$objectId/microsoft.graph.agentIdentityBlueprint"
+      if ($app.appId -ne $appId) { throw 'Blueprint application object/client ID mismatch.' }
+      $ficUri = "https://graph.microsoft.com/beta/applications/$objectId/microsoft.graph.agentIdentityBlueprint/federatedIdentityCredentials"
+      $uri = $ficUri
+      $existing = @()
+      $pages = 0
+      while ($uri) {
+        if (++$pages -gt 100) { throw 'Graph pagination limit exceeded.' }
+        $page = Invoke-Graph GET $uri
+        if ($null -eq $page.value) { throw 'Invalid Graph collection response.' }
+        $existing += @($page.value | Where-Object { $_.name -ceq $c.name })
+        $uri = $page.'@odata.nextLink'
+      }
+      if ($existing.Count -gt 1) { throw 'Ambiguous AKS federated credential name.' }
+      $desired = @{ issuer = $c.issuer; subject = $c.subject; audiences = @('api://AzureADTokenExchange') }
+      if ($existing.Count -eq 0) {
+        $desired.name = $c.name
+        $credential = Invoke-Graph POST $ficUri $desired
+        $status = 'created'
+      } else {
+        $credential = $existing[0]
+        $status = 'exists'
+        if ($credential.issuer -cne $desired.issuer -or $credential.subject -cne $desired.subject -or @($credential.audiences).Count -ne 1 -or $credential.audiences[0] -cne $desired.audiences[0]) {
+          $null = Invoke-Graph PATCH "$ficUri/$($credential.id)" $desired
+          $status = 'updated'
+        }
+      }
+      if (-not $credential.id) { throw 'Federated credential response is missing its ID.' }
+      $DeploymentScriptOutputs = @{ status = $status; credentialId = $credential.id }
     '''
   }
 }
 
-// Outputs
 output oidcIssuerUrl string = aksCluster.properties.oidcIssuerProfile.issuerURL
 output subjectIdentifier string = subjectIdentifier
+output credentialId string = federatedCredentialScript.properties.outputs.credentialId
+output status string = federatedCredentialScript.properties.outputs.status

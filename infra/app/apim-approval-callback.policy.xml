@@ -1,0 +1,77 @@
+<!--
+  API-level policy for agent-approvals, NOT the sibling MCP API.
+  Place local authentication before global inbound policy inheritance so a
+  global early response cannot bypass JWT validation. The repository declares
+  no custom global authentication/cache policy. Global policies must continue
+  to exclude callback caching and must not log Authorization or request bodies.
+  Python independently validates this same Bearer token and persists decisions.
+-->
+<policies>
+  <inbound>
+    <validate-jwt header-name="Authorization"
+                  require-scheme="Bearer"
+                  require-signed-tokens="true"
+                  require-expiration-time="true"
+                  clock-skew="60"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Missing or invalid approval callback identity.">
+      <openid-config url="https://login.microsoftonline.com/__TENANT_ID__/.well-known/openid-configuration" validate-connectivity="false" />
+      <openid-config url="https://login.microsoftonline.com/__TENANT_ID__/v2.0/.well-known/openid-configuration" validate-connectivity="false" />
+      <audiences>
+        <audience>__CALLBACK_AUDIENCE__</audience>
+        <audience>__CALLBACK_CLIENT_ID__</audience>
+      </audiences>
+      <issuers>
+        <issuer>https://sts.windows.net/__TENANT_ID__/</issuer>
+        <issuer>https://login.microsoftonline.com/__TENANT_ID__/v2.0</issuer>
+      </issuers>
+      <required-claims>
+        <claim name="tid" match="all">
+          <value>__TENANT_ID__</value>
+        </claim>
+        <claim name="oid" match="all">
+          <value>__LOGIC_APP_PRINCIPAL_ID__</value>
+        </claim>
+      </required-claims>
+    </validate-jwt>
+    <rate-limit-by-key calls="60" renewal-period="60" counter-key="agent-approvals:__LOGIC_APP_PRINCIPAL_ID__" />
+    <!-- Size-only validation: the Python engine owns the callback body schema. -->
+    <validate-content unspecified-content-type-action="ignore" max-size="16384" size-exceeded-action="prevent" />
+    <choose>
+      <when condition="@(context.Request.Headers.GetValueOrDefault(&quot;Content-Type&quot;, &quot;&quot;).Split(';')[0].Trim().ToLowerInvariant() != &quot;application/json&quot;)">
+        <return-response>
+          <set-status code="415" reason="Unsupported Media Type" />
+          <set-header name="Cache-Control" exists-action="override">
+            <value>no-store</value>
+          </set-header>
+        </return-response>
+      </when>
+    </choose>
+    <set-variable name="approvalAuthorization" value="@(context.Request.Headers.GetValueOrDefault(&quot;Authorization&quot;, &quot;&quot;))" />
+    <base />
+    <!-- Preserve the original, already validated token for Python defense in depth. -->
+    <set-header name="Authorization" exists-action="override">
+      <value>@((string)context.Variables["approvalAuthorization"])</value>
+    </set-header>
+    <rewrite-uri template="/approvals/callback" copy-unmatched-params="false" />
+  </inbound>
+  <backend>
+    <!-- No gateway retries or redirects: retry and idempotency belong upstream/Python. -->
+    <forward-request timeout="30" follow-redirects="false" />
+  </backend>
+  <outbound>
+    <base />
+    <set-header name="Cache-Control" exists-action="override">
+      <value>no-store</value>
+    </set-header>
+    <set-header name="Pragma" exists-action="override">
+      <value>no-cache</value>
+    </set-header>
+  </outbound>
+  <on-error>
+    <base />
+    <set-header name="Cache-Control" exists-action="override">
+      <value>no-store</value>
+    </set-header>
+  </on-error>
+</policies>

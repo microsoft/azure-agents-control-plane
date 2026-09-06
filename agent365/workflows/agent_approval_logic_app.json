@@ -1,421 +1,392 @@
 {
   "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-  "contentVersion": "1.0.0.0",
+  "contentVersion": "2.0.0.0",
   "metadata": {
-    "description": "CI/CD Approval Workflow with Teams Integration and Agent Validation",
-    "version": "1.0.0",
-    "author": "Azure Agents Control Plane"
+    "description": "Teams approval transport only. Python is the sole authority for request binding, authorization, expiry, idempotency, agent validation and Cosmos audit persistence.",
+    "teamsOperationId": "PostCardAndWaitForResponse",
+    "teamsConnectorReference": "https://learn.microsoft.com/en-us/connectors/teams/#post-adaptive-card-and-wait-for-a-response",
+    "teamsContractVerification": "The connector documents dynamic input/output schemas. Before enabling, verify the Channel operation in the target region's Microsoft.Web/locations/managedApis/teams metadata or a designer export. Expected response: responder.objectId (or responder.id), responder.tenantId, data.decision and data.comment. Missing or changed identity fields fail closed.",
+    "operationalConstraints": "Commercial-cloud Flow bot, authorized Teams OAuth connection, Workflows app allowed and a supported non-private channel. The first channel response completes the card; restrict channel membership to approvers. Python expiry remains the fallback after cancellation or exhausted callback retries."
   },
   "parameters": {
     "$connections": {
-      "defaultValue": {},
-      "type": "Object"
+      "type": "Object",
+      "defaultValue": {}
     },
-    "teamsChannelId": {
-      "defaultValue": "",
-      "type": "String",
-      "metadata": {
-        "description": "Teams channel ID for approval notifications"
-      }
-    },
-    "teamsGroupId": {
-      "defaultValue": "",
-      "type": "String",
-      "metadata": {
-        "description": "Teams group/team ID for approval notifications"
-      }
-    },
-    "approvalTimeoutHours": {
-      "defaultValue": 2,
-      "type": "Int",
-      "metadata": {
-        "description": "Timeout in hours for approval requests"
-      }
-    },
-    "cosmosDbEndpoint": {
-      "defaultValue": "",
-      "type": "String",
-      "metadata": {
-        "description": "CosmosDB endpoint for audit logging"
-      }
-    }
+    "teamsChannelId": { "type": "String" },
+    "teamsGroupId": { "type": "String" },
+    "approvalTimeoutHours": { "type": "Int" },
+    "callbackUrl": { "type": "String" },
+    "callbackAudience": { "type": "String" },
+    "approverIds": { "type": "Array" },
+    "approverTenantId": { "type": "String" }
   },
   "triggers": {
     "When_an_HTTP_request_is_received": {
       "type": "Request",
       "kind": "Http",
       "inputs": {
+        "method": "POST",
         "schema": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "approval_id": {
-              "type": "string",
-              "description": "Unique approval request ID"
-            },
-            "task": {
-              "type": "string",
-              "description": "Task description"
-            },
-            "environment": {
-              "type": "string",
-              "enum": ["development", "staging", "production"]
-            },
-            "cluster": {
-              "type": "string"
-            },
-            "namespace": {
-              "type": "string"
-            },
+            "approval_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "request_hash": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
+            "task": { "type": "string", "minLength": 1, "maxLength": 4000 },
+            "environment": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "requested_by": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "cluster": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "namespace": { "type": "string", "maxLength": 256 },
             "image_tags": {
               "type": "array",
+              "maxItems": 20,
+              "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+            },
+            "commit_sha": { "type": "string", "maxLength": 64 },
+            "request_timestamp": { "type": "string", "format": "date-time" },
+            "expires_at": { "type": "string", "format": "date-time" },
+            "approvers": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "uniqueItems": true,
               "items": {
-                "type": "string"
+                "type": "string",
+                "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$"
               }
-            },
-            "commit_sha": {
-              "type": "string"
-            },
-            "requested_by": {
-              "type": "string"
-            },
-            "pipeline_url": {
-              "type": "string"
-            },
-            "cluster_url": {
-              "type": "string"
-            },
-            "rollback_url": {
-              "type": "string"
-            },
-            "callback_url": {
-              "type": "string",
-              "description": "Webhook URL to notify agent of decision"
             }
           },
-          "required": ["approval_id", "task", "environment", "cluster", "requested_by", "callback_url"]
+          "required": [
+            "approval_id", "request_hash", "task", "environment", "requested_by",
+            "cluster", "namespace", "image_tags", "commit_sha",
+            "request_timestamp", "expires_at", "approvers"
+          ]
         }
       },
-      "operationOptions": "EnableSchemaValidation"
+      "operationOptions": "EnableSchemaValidation",
+      "runtimeConfiguration": {
+        "secureData": { "properties": ["inputs", "outputs"] }
+      }
     }
   },
   "actions": {
-    "Initialize_Approval_Record": {
-      "type": "InitializeVariable",
+    "Acknowledge_Request": {
+      "type": "Response",
+      "kind": "Http",
       "runAfter": {},
       "inputs": {
-        "variables": [
-          {
-            "name": "approvalRecord",
-            "type": "object",
-            "value": {
-              "approval_id": "@{triggerBody()?['approval_id']}",
-              "task": "@{triggerBody()?['task']}",
-              "environment": "@{triggerBody()?['environment']}",
-              "cluster": "@{triggerBody()?['cluster']}",
-              "namespace": "@{triggerBody()?['namespace']}",
-              "requested_by": "@{triggerBody()?['requested_by']}",
-              "status": "pending",
-              "created_at": "@{utcNow()}",
-              "workflow_run_id": "@{workflow().run.id}"
-            }
-          }
-        ]
+        "statusCode": 202,
+        "headers": {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store"
+        },
+        "body": {
+          "approval_id": "@triggerBody()?['approval_id']",
+          "workflow_run_id": "@workflow().run.name",
+          "status": "accepted"
+        }
+      },
+      "runtimeConfiguration": {
+        "secureData": { "properties": ["inputs"] }
       }
     },
-    "Log_Approval_Request_to_CosmosDB": {
-      "type": "ApiConnection",
-      "runAfter": {
-        "Initialize_Approval_Record": ["Succeeded"]
-      },
+    "Validate_Deployment_Configuration": {
+      "type": "ParseJson",
+      "runAfter": { "Acknowledge_Request": ["Succeeded"] },
       "inputs": {
-        "host": {
-          "connection": {
-            "name": "@parameters('$connections')['documentdb']['connectionId']"
+        "content": {
+          "teamsChannelId": "@parameters('teamsChannelId')",
+          "teamsGroupId": "@parameters('teamsGroupId')",
+          "approvalTimeoutHours": "@parameters('approvalTimeoutHours')",
+          "callbackUrl": "@parameters('callbackUrl')",
+          "callbackAudience": "@parameters('callbackAudience')",
+          "approverIds": "@parameters('approverIds')",
+          "approverTenantId": "@parameters('approverTenantId')"
+        },
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "teamsChannelId": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^19:[^\\s/]+@thread\\.(tacv2|skype)$" },
+            "teamsGroupId": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+            "approvalTimeoutHours": { "type": "integer", "minimum": 1, "maximum": 24 },
+            "callbackUrl": { "type": "string", "maxLength": 2048, "pattern": "^https://[a-zA-Z0-9][a-zA-Z0-9.-]*(?::443)?/agent-approvals/callback$" },
+            "callbackAudience": { "type": "string", "pattern": "^api://[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+            "approverIds": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "items": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" }
+            },
+            "approverTenantId": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" }
+          },
+          "required": ["teamsChannelId", "teamsGroupId", "approvalTimeoutHours", "callbackUrl", "callbackAudience", "approverIds", "approverTenantId"]
+        }
+      },
+      "runtimeConfiguration": {
+        "secureData": { "properties": ["inputs"] }
+      }
+    },
+    "Collect_Decision": {
+      "type": "Scope",
+      "runAfter": { "Validate_Deployment_Configuration": ["Succeeded"] },
+      "actions": {
+        "Request_Is_Expired": {
+          "type": "Compose",
+          "runAfter": {},
+          "inputs": "@lessOrEquals(ticks(triggerBody()?['expires_at']), ticks(utcNow()))",
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
           }
         },
-        "method": "post",
-        "body": "@variables('approvalRecord')",
-        "path": "/dbs/@{encodeURIComponent('mcpdb')}/colls/@{encodeURIComponent('approvals')}/docs"
-      }
-    },
-    "Build_Adaptive_Card": {
-      "type": "Compose",
-      "runAfter": {
-        "Log_Approval_Request_to_CosmosDB": ["Succeeded"]
-      },
-      "inputs": {
-        "type": "AdaptiveCard",
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "version": "1.5",
-        "body": [
-          {
-            "type": "Container",
-            "style": "emphasis",
-            "items": [
-              {
-                "type": "TextBlock",
-                "text": "🚀 CI/CD Deployment Approval Required",
-                "weight": "Bolder",
-                "size": "Large",
-                "wrap": true
-              }
-            ]
+        "Validate_Request_Context": {
+          "type": "ParseJson",
+          "runAfter": { "Request_Is_Expired": ["Succeeded"] },
+          "inputs": {
+            "content": {
+              "unexpired": "@not(outputs('Request_Is_Expired'))",
+              "chronological": "@greater(ticks(triggerBody()?['expires_at']), ticks(triggerBody()?['request_timestamp']))",
+              "has_eligible_approver": "@not(empty(intersection(json(toLower(string(parameters('approverIds')))), json(toLower(string(triggerBody()?['approvers']))))))"
+            },
+            "schema": {
+              "type": "object",
+              "properties": {
+                "unexpired": { "type": "boolean", "enum": [true] },
+                "chronological": { "type": "boolean", "enum": [true] },
+                "has_eligible_approver": { "type": "boolean", "enum": [true] }
+              },
+              "required": ["unexpired", "chronological", "has_eligible_approver"]
+            }
           },
-          {
-            "type": "FactSet",
-            "facts": [
-              {
-                "title": "Environment",
-                "value": "@{triggerBody()?['environment']}"
-              },
-              {
-                "title": "Cluster",
-                "value": "@{triggerBody()?['cluster']}"
-              },
-              {
-                "title": "Namespace",
-                "value": "@{coalesce(triggerBody()?['namespace'], 'default')}"
-              },
-              {
-                "title": "Commit SHA",
-                "value": "@{coalesce(triggerBody()?['commit_sha'], 'N/A')}"
-              },
-              {
-                "title": "Requested By",
-                "value": "@{triggerBody()?['requested_by']}"
-              }
-            ]
-          },
-          {
-            "type": "TextBlock",
-            "text": "@{triggerBody()?['task']}",
-            "wrap": true
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
           }
-        ],
-        "msteams": {
-          "width": "Full"
+        },
+        "Build_Adaptive_Card": {
+          "type": "Compose",
+          "runAfter": { "Validate_Request_Context": ["Succeeded"] },
+          "inputs": {
+            "type": "AdaptiveCard",
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "version": "1.4",
+            "msteams": { "width": "Full" },
+            "body": [
+              { "type": "TextBlock", "text": "Deployment approval requested", "weight": "Bolder", "size": "Large", "wrap": true },
+              { "type": "TextBlock", "text": "@triggerBody()?['task']", "wrap": true },
+              {
+                "type": "FactSet",
+                "facts": [
+                  { "title": "Approval ID", "value": "@triggerBody()?['approval_id']" },
+                  { "title": "Request hash", "value": "@triggerBody()?['request_hash']" },
+                  { "title": "Environment", "value": "@triggerBody()?['environment']" },
+                  { "title": "Cluster", "value": "@triggerBody()?['cluster']" },
+                  { "title": "Namespace", "value": "@triggerBody()?['namespace']" },
+                  { "title": "Images", "value": "@join(triggerBody()?['image_tags'], ', ')" },
+                  { "title": "Commit SHA", "value": "@triggerBody()?['commit_sha']" },
+                  { "title": "Requested by", "value": "@triggerBody()?['requested_by']" },
+                  { "title": "Requested at", "value": "@triggerBody()?['request_timestamp']" },
+                  { "title": "Expires at", "value": "@triggerBody()?['expires_at']" }
+                ]
+              },
+              { "type": "TextBlock", "text": "Only configured approvers may decide. Submitting this card does not authorize deployment: the Python engine verifies the request and records the outcome.", "wrap": true },
+              { "type": "Input.Text", "id": "comment", "label": "Approval notes or rejection reason", "isMultiline": true, "maxLength": 2000 }
+            ],
+            "actions": [
+              { "type": "Action.Submit", "title": "Approve", "style": "positive", "data": { "decision": "approved" } },
+              { "type": "Action.Submit", "title": "Reject", "style": "destructive", "data": { "decision": "rejected" } }
+            ]
+          },
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
+        },
+        "Wait_for_Teams_Response": {
+          "type": "ApiConnectionWebhook",
+          "runAfter": { "Build_Adaptive_Card": ["Succeeded"] },
+          "inputs": {
+            "host": {
+              "connection": { "name": "@parameters('$connections')['teams']['connectionId']" }
+            },
+            "path": "/flowbot/actions/flowcontinuation/poster/Flow%20bot/location/Channel",
+            "body": {
+              "notificationUrl": "@listCallbackUrl()",
+              "body": {
+                "recipient": {
+                  "groupId": "@parameters('teamsGroupId')",
+                  "channelId": "@parameters('teamsChannelId')"
+                },
+                "messageBody": "@string(outputs('Build_Adaptive_Card'))",
+                "updateMessage": "Response received. The Python approval engine must still verify and record the outcome."
+              }
+            },
+            "retryPolicy": { "type": "none" }
+          },
+          "limit": {
+            "timeout": "@concat('PT', string(max(1, min(mul(parameters('approvalTimeoutHours'), 3600), div(sub(ticks(triggerBody()?['expires_at']), ticks(utcNow())), 10000000)))), 'S')"
+          },
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs", "outputs"] }
+          }
+        },
+        "Normalize_Submitted_Decision": {
+          "type": "Compose",
+          "runAfter": { "Wait_for_Teams_Response": ["Succeeded"] },
+          "inputs": "@toLower(trim(string(coalesce(body('Wait_for_Teams_Response')?['data']?['decision'], ''))))",
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
+        },
+        "Parse_Teams_Response": {
+          "type": "ParseJson",
+          "runAfter": { "Normalize_Submitted_Decision": ["Succeeded"] },
+          "inputs": {
+            "content": {
+              "decision": "@if(contains(createArray('approve', 'approved'), outputs('Normalize_Submitted_Decision')), 'approved', if(contains(createArray('reject', 'rejected'), outputs('Normalize_Submitted_Decision')), 'rejected', 'error'))",
+              "approved_by": "@toLower(string(coalesce(body('Wait_for_Teams_Response')?['responder']?['objectId'], body('Wait_for_Teams_Response')?['responder']?['id'], '')))",
+              "approver_tenant_id": "@toLower(string(coalesce(body('Wait_for_Teams_Response')?['responder']?['tenantId'], '')))",
+              "comment": "@string(coalesce(body('Wait_for_Teams_Response')?['data']?['comment'], ''))"
+            },
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "decision": { "type": "string", "enum": ["approved", "rejected"] },
+                "approved_by": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+                "approver_tenant_id": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+                "comment": { "type": "string", "maxLength": 2000 }
+              },
+              "required": ["decision", "approved_by", "approver_tenant_id", "comment"]
+            }
+          },
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
+        },
+        "Responder_Is_Authorized": {
+          "type": "Compose",
+          "runAfter": { "Parse_Teams_Response": ["Succeeded"] },
+          "inputs": "@and(contains(json(toLower(string(parameters('approverIds')))), body('Parse_Teams_Response')?['approved_by']), contains(json(toLower(string(triggerBody()?['approvers']))), body('Parse_Teams_Response')?['approved_by']), equals(body('Parse_Teams_Response')?['approver_tenant_id'], toLower(parameters('approverTenantId'))))",
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
+        },
+        "Select_Terminal_Decision": {
+          "type": "Compose",
+          "runAfter": { "Responder_Is_Authorized": ["Succeeded"] },
+          "inputs": "@if(outputs('Responder_Is_Authorized'), if(lessOrEquals(ticks(triggerBody()?['expires_at']), ticks(utcNow())), 'timeout', body('Parse_Teams_Response')?['decision']), 'error')",
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
+        },
+        "Build_Decision_Callback": {
+          "type": "Compose",
+          "runAfter": { "Select_Terminal_Decision": ["Succeeded"] },
+          "inputs": {
+            "approval_id": "@triggerBody()?['approval_id']",
+            "environment": "@triggerBody()?['environment']",
+            "request_hash": "@triggerBody()?['request_hash']",
+            "decision": "@outputs('Select_Terminal_Decision')",
+            "approved_by": "@if(contains(createArray('approved', 'rejected'), outputs('Select_Terminal_Decision')), body('Parse_Teams_Response')?['approved_by'], 'system')",
+            "approver_tenant_id": "@if(contains(createArray('approved', 'rejected'), outputs('Select_Terminal_Decision')), body('Parse_Teams_Response')?['approver_tenant_id'], '')",
+            "comment": "@if(equals(outputs('Select_Terminal_Decision'), 'timeout'), 'Approval request expired before its response was processed.', if(equals(outputs('Select_Terminal_Decision'), 'error'), 'Teams responder is not an authorized approver for this request.', body('Parse_Teams_Response')?['comment']))",
+            "workflow_run_id": "@workflow().run.name",
+            "timestamp": "@utcNow()"
+          },
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
         }
       }
     },
-    "Start_Teams_Approval": {
-      "type": "ApiConnectionWebhook",
-      "runAfter": {
-        "Build_Adaptive_Card": ["Succeeded"]
-      },
-      "inputs": {
-        "host": {
-          "connection": {
-            "name": "@parameters('$connections')['teams']['connectionId']"
-          }
-        },
-        "body": {
-          "notificationUrl": "@{listCallbackUrl()}",
-          "message": {
-            "title": "CI/CD Deployment Approval - @{triggerBody()?['environment']}",
-            "details": "Deployment to @{triggerBody()?['cluster']} requested by @{triggerBody()?['requested_by']}",
-            "itemLink": "@{coalesce(triggerBody()?['pipeline_url'], '')}",
-            "itemLinkDescription": "View Pipeline"
-          },
-          "approvalType": "CustomResponse",
-          "customResponses": [
-            {
-              "response": "Approve",
-              "comment": {
-                "isOptional": true,
-                "placeholder": "Add approval notes..."
-              }
-            },
-            {
-              "response": "Reject",
-              "comment": {
-                "isOptional": false,
-                "placeholder": "Rejection reason is required..."
-              }
-            }
-          ],
-          "expiresAt": "@{addHours(utcNow(), parameters('approvalTimeoutHours'))}"
-        },
-        "path": "/v2/approvals/create"
-      },
-      "limit": {
-        "timeout": "PT@{parameters('approvalTimeoutHours')}H"
-      }
-    },
-    "Condition_Check_Approval_Response": {
-      "type": "If",
-      "runAfter": {
-        "Start_Teams_Approval": ["Succeeded"]
-      },
-      "expression": {
-        "and": [
-          {
-            "equals": [
-              "@body('Start_Teams_Approval')?['outcome']",
-              "Approve"
-            ]
-          }
-        ]
-      },
+    "Notify_Decision": {
+      "type": "Scope",
+      "runAfter": { "Collect_Decision": ["Succeeded"] },
       "actions": {
-        "Set_Decision_Approved": {
-          "type": "SetVariable",
+        "Send_Decision_Callback": {
+          "type": "Http",
           "runAfter": {},
           "inputs": {
-            "name": "approvalRecord",
-            "value": {
-              "approval_id": "@{triggerBody()?['approval_id']}",
-              "task": "@{triggerBody()?['task']}",
-              "environment": "@{triggerBody()?['environment']}",
-              "cluster": "@{triggerBody()?['cluster']}",
-              "decision": "approved",
-              "approved_by": "@{body('Start_Teams_Approval')?['responder']?['displayName']}",
-              "approver_email": "@{body('Start_Teams_Approval')?['responder']?['email']}",
-              "comment": "@{coalesce(body('Start_Teams_Approval')?['responses']?[0]?['comment'], '')}",
-              "timestamp": "@{utcNow()}",
-              "agent_validation": "pending"
-            }
-          }
-        },
-        "Validate_Approval_With_Agent": {
-          "type": "Http",
-          "runAfter": {
-            "Set_Decision_Approved": ["Succeeded"]
-          },
-          "inputs": {
             "method": "POST",
-            "uri": "@{triggerBody()?['callback_url']}",
-            "body": "@variables('approvalRecord')",
-            "headers": {
-              "Content-Type": "application/json",
-              "X-Agent-Validation": "true"
+            "uri": "@parameters('callbackUrl')",
+            "headers": { "Content-Type": "application/json" },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "@parameters('callbackAudience')"
             },
+            "body": "@outputs('Build_Decision_Callback')",
             "retryPolicy": {
               "type": "exponential",
               "count": 3,
-              "interval": "PT10S"
+              "interval": "PT10S",
+              "minimumInterval": "PT10S",
+              "maximumInterval": "PT1M"
             }
-          }
-        },
-        "Update_Record_Validation_Passed": {
-          "type": "SetVariable",
-          "runAfter": {
-            "Validate_Approval_With_Agent": ["Succeeded"]
           },
+          "operationOptions": "DisableAsyncPattern",
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs", "outputs"] }
+          }
+        }
+      }
+    },
+    "Handle_Timeout_Or_Error": {
+      "type": "Scope",
+      "runAfter": { "Collect_Decision": ["Failed", "TimedOut"] },
+      "actions": {
+        "Build_Failure_Callback": {
+          "type": "Compose",
+          "runAfter": {},
           "inputs": {
-            "name": "approvalRecord",
-            "value": "@setProperty(variables('approvalRecord'), 'agent_validation', 'passed')"
+            "approval_id": "@triggerBody()?['approval_id']",
+            "environment": "@triggerBody()?['environment']",
+            "request_hash": "@triggerBody()?['request_hash']",
+            "decision": "@if(or(equals(actions('Request_Is_Expired')?['outputs'], true), equals(actions('Wait_for_Teams_Response')?['status'], 'TimedOut'), equals(actions('Wait_for_Teams_Response')?['code'], 'ActionTimedOut')), 'timeout', 'error')",
+            "approved_by": "system",
+            "approver_tenant_id": "",
+            "comment": "Approval transport timed out or failed; no human decision is being asserted.",
+            "workflow_run_id": "@workflow().run.name",
+            "timestamp": "@utcNow()"
+          },
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
           }
-        }
-      },
-      "else": {
-        "actions": {
-          "Set_Decision_Rejected": {
-            "type": "SetVariable",
-            "runAfter": {},
-            "inputs": {
-              "name": "approvalRecord",
-              "value": {
-                "approval_id": "@{triggerBody()?['approval_id']}",
-                "task": "@{triggerBody()?['task']}",
-                "environment": "@{triggerBody()?['environment']}",
-                "cluster": "@{triggerBody()?['cluster']}",
-                "decision": "rejected",
-                "approved_by": "@{body('Start_Teams_Approval')?['responder']?['displayName']}",
-                "approver_email": "@{body('Start_Teams_Approval')?['responder']?['email']}",
-                "comment": "@{coalesce(body('Start_Teams_Approval')?['responses']?[0]?['comment'], 'No reason provided')}",
-                "timestamp": "@{utcNow()}",
-                "agent_validation": "passed"
-              }
+        },
+        "Send_Failure_Callback": {
+          "type": "Http",
+          "runAfter": { "Build_Failure_Callback": ["Succeeded"] },
+          "inputs": {
+            "method": "POST",
+            "uri": "@parameters('callbackUrl')",
+            "headers": { "Content-Type": "application/json" },
+            "authentication": {
+              "type": "ManagedServiceIdentity",
+              "audience": "@parameters('callbackAudience')"
+            },
+            "body": "@outputs('Build_Failure_Callback')",
+            "retryPolicy": {
+              "type": "exponential",
+              "count": 3,
+              "interval": "PT10S",
+              "minimumInterval": "PT10S",
+              "maximumInterval": "PT1M"
             }
           },
-          "Notify_Agent_Of_Rejection": {
-            "type": "Http",
-            "runAfter": {
-              "Set_Decision_Rejected": ["Succeeded"]
-            },
-            "inputs": {
-              "method": "POST",
-              "uri": "@{triggerBody()?['callback_url']}",
-              "body": "@variables('approvalRecord')",
-              "headers": {
-                "Content-Type": "application/json",
-                "X-Agent-Validation": "true"
-              }
-            }
+          "operationOptions": "DisableAsyncPattern",
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs", "outputs"] }
           }
         }
       }
     },
-    "Log_Final_Decision_to_CosmosDB": {
-      "type": "ApiConnection",
-      "runAfter": {
-        "Condition_Check_Approval_Response": ["Succeeded"]
-      },
+    "Stop_On_Invalid_Configuration": {
+      "type": "Terminate",
+      "runAfter": { "Validate_Deployment_Configuration": ["Failed", "TimedOut"] },
       "inputs": {
-        "host": {
-          "connection": {
-            "name": "@parameters('$connections')['documentdb']['connectionId']"
-          }
-        },
-        "method": "patch",
-        "body": {
-          "operations": [
-            {
-              "op": "set",
-              "path": "/decision",
-              "value": "@{variables('approvalRecord')?['decision']}"
-            },
-            {
-              "op": "set",
-              "path": "/approved_by",
-              "value": "@{variables('approvalRecord')?['approved_by']}"
-            },
-            {
-              "op": "set",
-              "path": "/agent_validation",
-              "value": "@{variables('approvalRecord')?['agent_validation']}"
-            },
-            {
-              "op": "set",
-              "path": "/completed_at",
-              "value": "@{utcNow()}"
-            },
-            {
-              "op": "set",
-              "path": "/status",
-              "value": "completed"
-            }
-          ]
-        },
-        "path": "/dbs/@{encodeURIComponent('mcpdb')}/colls/@{encodeURIComponent('approvals')}/docs/@{encodeURIComponent(triggerBody()?['approval_id'])}"
-      }
-    },
-    "Response": {
-      "type": "Response",
-      "runAfter": {
-        "Log_Final_Decision_to_CosmosDB": ["Succeeded"]
-      },
-      "inputs": {
-        "statusCode": 200,
-        "body": "@variables('approvalRecord')",
-        "headers": {
-          "Content-Type": "application/json"
-        }
-      }
-    },
-    "Handle_Timeout": {
-      "type": "Response",
-      "runAfter": {
-        "Start_Teams_Approval": ["TimedOut"]
-      },
-      "inputs": {
-        "statusCode": 408,
-        "body": {
-          "approval_id": "@{triggerBody()?['approval_id']}",
-          "decision": "timeout",
-          "message": "Approval request timed out after @{parameters('approvalTimeoutHours')} hours",
-          "timestamp": "@{utcNow()}",
-          "agent_validation": "failed"
+        "runStatus": "Failed",
+        "runError": {
+          "code": "InvalidApprovalTransportConfiguration",
+          "message": "Approval routing is not valid. No outbound request was sent. Python must expire the pending approval."
         }
       }
     }

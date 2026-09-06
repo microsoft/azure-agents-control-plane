@@ -15,8 +15,8 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY next_best_action_agent.py .
+# Copy all application modules, including optional integrations
+COPY *.py ./
 
 # Copy memory module
 COPY memory/ ./memory/

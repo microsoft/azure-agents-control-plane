@@ -1,42 +1,89 @@
-"""
-Agent 365 Approval Workflow Module
+"""Durable, fail-closed deployment approvals using Cosmos and a Logic App.
 
-This module provides the agent approval workflow implementation for Agents pipeline
-deployments with Microsoft Teams human-in-the-loop integration.
+All public workflow operations are async. Synchronous Cosmos/credential work is
+offloaded to threads; importing this module does not acquire credentials, access
+Azure, or register agents. The container must already exist, partitioned by
+/environment (or the legacy /partitionKey, whose value is also environment).
 
-Components:
-1. Agent365AvailabilityChecker - Checks if Microsoft Agent 365 is available
-2. EntraAgentRegistryClient - Registers agents with Microsoft Entra Agent Registry
-3. ApprovalWorkflowEngine - Orchestrates the dual-track approval (Teams + Agent)
-4. TeamsApprovalClient - Handles Microsoft Teams approval card interactions
-5. ApprovalContract - Defines the approval data structure
-
-References:
-- Microsoft Entra Agent Registry: https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/what-is-agent-registry
-- Teams Approvals: https://learn.microsoft.com/en-us/graph/approvals-app-api
-- Agent 365 Governance: https://learn.microsoft.com/en-us/microsoft-agent-365/admin/capabilities-entra
+The initial HTTP 202 acknowledges dispatch, NEVER human approval. A caller must
+resume with the same complete request context before proceeding, and require
+decision=approved AND agent_validation=passed. There is no local approval cache,
+Graph fallback, automatic re-notification, or automatic approval of other tasks.
 """
 
-import json
-import logging
-import uuid
+from __future__ import annotations
+
 import asyncio
-import aiohttp
-from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Callable, Awaitable
-from enum import Enum
+import hashlib
+import hmac
+import json
+import math
 import os
+import re
+import threading
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Any, Callable
+from urllib.parse import parse_qs, urlsplit
+from uuid import UUID, uuid4
 
-from azure.identity import DefaultAzureCredential
+import aiohttp
+from azure.core import MatchConditions
 from azure.cosmos import CosmosClient, exceptions as cosmos_exceptions
 
-# Configure logging
-logger = logging.getLogger(__name__)
+if __package__:
+    from .agent_identity import get_agent_credential
+else:
+    from agent_identity import get_agent_credential
+
+
+_GUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+_HASH = re.compile(r"[0-9a-f]{64}")
+_ENVIRONMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_CAS_ATTEMPTS = 6
+_SYSTEM_FIELDS = frozenset({"_etag", "_rid", "_self", "_attachments", "_ts"})
+
+
+class ApprovalError(Exception):
+    """A deliberately secret-safe error suitable for an API response."""
+
+    status_code = 503
+
+
+class ApprovalValidationError(ApprovalError, ValueError):
+    status_code = 400
+
+
+class ApprovalAuthorizationError(ApprovalError):
+    status_code = 403
+
+
+class ApprovalNotFoundError(ApprovalError):
+    status_code = 404
+
+
+class ApprovalConflictError(ApprovalError):
+    status_code = 409
+
+
+class ApprovalInfrastructureError(ApprovalError):
+    status_code = 503
+
+
+class ApprovalConfigurationError(ApprovalInfrastructureError):
+    pass
+
+
+class ApprovalStorageError(ApprovalInfrastructureError):
+    pass
+
+
+class ApprovalNotificationError(ApprovalInfrastructureError):
+    pass
 
 
 class ApprovalDecision(Enum):
-    """Approval decision outcomes."""
     PENDING = "pending"
     APPROVED = "approved"
     REJECTED = "rejected"
@@ -45,931 +92,646 @@ class ApprovalDecision(Enum):
 
 
 class AgentValidationStatus(Enum):
-    """Agent validation status after human decision."""
     PENDING = "pending"
     PASSED = "passed"
     FAILED = "failed"
 
 
+_HUMAN_DECISIONS = frozenset({"approved", "rejected"})
+_TERMINAL_DECISIONS = frozenset({"approved", "rejected", "timeout", "error"})
+
+
+def normalize_decision(decision: str) -> str:
+    """Normalize only the documented Logic App decision aliases."""
+    aliases = {
+        "approve": "approved", "approved": "approved",
+        "reject": "rejected", "rejected": "rejected",
+        "timeout": "timeout", "error": "error",
+    }
+    if not isinstance(decision, str) or len(decision) > 16:
+        raise ApprovalValidationError("Invalid approval decision.")
+    result = aliases.get(decision.strip().lower())
+    if result is None:
+        raise ApprovalValidationError("Invalid approval decision.")
+    return result
+
+
+def _text(value: Any, name: str, maximum: int, *, empty: bool = False) -> str:
+    if (
+        not isinstance(value, str) or len(value) > maximum
+        or (not empty and not value.strip())
+        or any(ord(c) < 32 and c not in "\t\r\n" for c in value)
+    ):
+        raise ApprovalValidationError(f"Invalid {name}.")
+    try:
+        value.encode("utf-8")
+    except UnicodeError:
+        raise ApprovalValidationError(f"Invalid {name}.") from None
+    return value
+
+
+def _guid(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not _GUID.fullmatch(value):
+        raise ApprovalValidationError(f"{name} must be a GUID.")
+    result = UUID(value)
+    if result.int == 0:
+        raise ApprovalValidationError(f"{name} must be a nonzero GUID.")
+    return str(result)
+
+
+def _environment(value: str) -> str:
+    if not isinstance(value, str) or not _ENVIRONMENT.fullmatch(value):
+        raise ApprovalValidationError("Invalid environment.")
+    return value
+
+
+def _parse_timestamp(value: Any, name: str) -> datetime:
+    value = _text(value, name, 64)
+    try:
+        result = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        if result.tzinfo is None or result.utcoffset() is None:
+            raise ValueError
+        return result.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise ApprovalValidationError(f"{name} must be a timezone-aware ISO timestamp.") from None
+
+
+def _timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _digest(value: dict[str, Any]) -> str:
+    data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _request_context(
+    task: str, requested_by: str, environment: str, cluster: str,
+    namespace: str = "default", image_tags: list[str] | None = None,
+    commit_sha: str | None = None, pipeline_url: str | None = None,
+    rollback_url: str | None = None,
+) -> dict[str, Any]:
+    """Preserve exact text and image order; only absent image_tags becomes []."""
+    if image_tags is not None and (not isinstance(image_tags, list) or len(image_tags) > 100):
+        raise ApprovalValidationError("Invalid image_tags.")
+    return {
+        "task": _text(task, "task", 8192),
+        "requested_by": _text(requested_by, "requested_by", 256),
+        "environment": _environment(environment),
+        "cluster": _text(cluster, "cluster", 256),
+        "namespace": _text(namespace, "namespace", 253),
+        "image_tags": [_text(tag, "image_tags", 512) for tag in (image_tags or [])],
+        "commit_sha": None if commit_sha is None else _text(commit_sha, "commit_sha", 128, empty=True),
+        "pipeline_url": None if pipeline_url is None else _text(pipeline_url, "pipeline_url", 2048, empty=True),
+        "rollback_url": None if rollback_url is None else _text(rollback_url, "rollback_url", 2048, empty=True),
+    }
+
+
+def _https_url(value: str, name: str, *, query: bool = False) -> str:
+    try:
+        _text(value, name, 8192)
+        parts = urlsplit(value)
+        if (
+            parts.scheme != "https" or not parts.hostname or parts.username is not None
+            or parts.password is not None or parts.fragment or (parts.query and not query)
+            or any(c.isspace() for c in value) or parts.port not in (None, 443)
+        ):
+            raise ValueError
+    except (ValueError, ApprovalValidationError):
+        raise ApprovalConfigurationError(f"{name} must be a valid HTTPS URL.") from None
+    return value
+
+
+@dataclass(frozen=True)
+class CallbackAuthSettings:
+    """Trusted server configuration, never derived from a token or x-headers."""
+
+    tenant_id: str
+    audience: str
+    principal_id: str
+
+    @property
+    def audiences(self) -> tuple[str, str]:
+        return (self.audience, self.audience.removeprefix("api://"))
+
+
+def get_callback_auth_settings() -> CallbackAuthSettings:
+    """Read the single tenant, blueprint audience, and Logic App MI object ID."""
+    try:
+        tenant = _guid(os.getenv("AZURE_TENANT_ID", "").strip(), "AZURE_TENANT_ID")
+        audience_id = _guid(
+            os.getenv("APPROVAL_CALLBACK_AUDIENCE", "").strip().removeprefix("api://"),
+            "APPROVAL_CALLBACK_AUDIENCE",
+        )
+        principal = _guid(
+            os.getenv("APPROVAL_CALLBACK_PRINCIPAL_ID", "").strip(),
+            "APPROVAL_CALLBACK_PRINCIPAL_ID",
+        )
+    except ApprovalValidationError:
+        raise ApprovalConfigurationError("Approval callback identity configuration is missing or invalid.") from None
+    return CallbackAuthSettings(tenant, f"api://{audience_id}", principal)
+
+
 @dataclass
 class ApprovalContract:
-    """
-    Standard approval contract as specified in requirements.
-    
-    This contract represents the complete state of an approval request
-    including both human decision and agent validation.
-    """
     approval_id: str
     requested_by: str
     task: str
     environment: str
     decision: str = ApprovalDecision.PENDING.value
-    approved_by: Optional[str] = None
-    timestamp: Optional[str] = None
+    approved_by: str | None = None
+    timestamp: str | None = None
     agent_validation: str = AgentValidationStatus.PENDING.value
-    
-    # Extended fields for audit trail
-    cluster: Optional[str] = None
-    namespace: Optional[str] = None
-    image_tags: Optional[List[str]] = None
-    commit_sha: Optional[str] = None
-    pipeline_url: Optional[str] = None
-    rollback_url: Optional[str] = None
-    comment: Optional[str] = None
-    request_timestamp: Optional[str] = None
-    resolution_time_seconds: Optional[float] = None
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for JSON serialization."""
-        return {k: v for k, v in asdict(self).items() if v is not None}
-    
+    cluster: str | None = None
+    namespace: str | None = None
+    image_tags: list[str] | None = None
+    commit_sha: str | None = None
+    pipeline_url: str | None = None
+    rollback_url: str | None = None
+    comment: str | None = None
+    request_timestamp: str | None = None
+    expires_at: str | None = None
+    request_hash: str | None = None
+    approvers: list[str] = field(default_factory=list)
+    approval_tenant_id: str | None = None
+    approver_tenant_id: str | None = None
+    workflow_run_id: str | None = None
+    response_timestamp: str | None = None
+    resolution_time_seconds: float | None = None
+    notification_status: str = "pending"
+    notification_timestamp: str | None = None
+    error_code: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return public state, never Cosmos metadata, tokens, or trigger URLs."""
+        return {key: value for key, value in asdict(self).items() if value is not None}
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ApprovalContract":
-        """Create from dictionary."""
-        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
-    
+    def from_dict(cls, data: dict[str, Any]) -> ApprovalContract:
+        return cls(**{key: value for key, value in data.items() if key in cls.__dataclass_fields__})
+
     def is_complete(self) -> bool:
-        """Check if approval is complete (human decided + agent validated)."""
+        """Terminal does not mean authorized: rejection, timeout and error finish too."""
         return (
-            self.decision in [ApprovalDecision.APPROVED.value, ApprovalDecision.REJECTED.value]
-            and self.agent_validation == AgentValidationStatus.PASSED.value
+            self.decision in _HUMAN_DECISIONS and self.agent_validation == "passed"
+        ) or (
+            self.decision in {"timeout", "error"} and self.agent_validation == "failed"
         )
 
 
-@dataclass
-class Agent365AvailabilityResult:
-    """Result of Agent 365 availability check."""
-    available: bool
-    frontier_enrolled: bool = False
-    agent_registry_accessible: bool = False
-    graph_api_accessible: bool = False
-    error_message: Optional[str] = None
-    tenant_verification_steps: Optional[List[str]] = None
+class LogicAppApprovalClient:
+    """Single signed-trigger POST; no redirects, retries, polling, or Graph API."""
 
+    def __init__(self, webhook_url: str) -> None:
+        self._webhook_url = _https_url(webhook_url, "LOGIC_APP_APPROVAL_WEBHOOK", query=True)
+        if not parse_qs(urlsplit(webhook_url).query).get("sig", [""])[0]:
+            raise ApprovalConfigurationError("LOGIC_APP_APPROVAL_WEBHOOK must be a signed trigger URL.")
 
-class Agent365AvailabilityChecker:
-    """
-    Checks whether Microsoft Agent 365 (Frontier preview) is available.
-    
-    Agent 365 availability requires:
-    1. Enrollment in Microsoft Frontier preview program
-    2. Access to Microsoft Entra Agent Registry APIs
-    3. Proper Graph API permissions
-    
-    Reference: https://learn.microsoft.com/en-us/microsoft-agent-365/admin/capabilities-entra
-    """
-    
-    GRAPH_API_BASE = "https://graph.microsoft.com/beta"
-    AGENT_REGISTRY_PATH = "/agentRegistry/agentInstances"
-    
-    def __init__(self):
-        self.credential = DefaultAzureCredential()
-    
-    async def check_availability(self) -> Agent365AvailabilityResult:
-        """
-        Perform comprehensive Agent 365 availability check.
-        
-        Returns:
-            Agent365AvailabilityResult with availability status and diagnostics
-        """
-        result = Agent365AvailabilityResult(
-            available=False,
-            tenant_verification_steps=[]
-        )
-        
+    async def send(self, payload: dict[str, Any]) -> None:
+        """Accept only the immediate 202; never read or expose a response body."""
         try:
-            # Step 1: Get access token for Graph API
-            token = self.credential.get_token("https://graph.microsoft.com/.default")
-            
-            if not token:
-                result.error_message = "Failed to acquire Graph API token"
-                result.tenant_verification_steps = self._get_verification_checklist()
-                return result
-            
-            result.graph_api_accessible = True
-            
-            # Step 2: Test Agent Registry API availability
-            async with aiohttp.ClientSession() as session:
-                headers = {
-                    "Authorization": f"Bearer {token.token}",
-                    "Content-Type": "application/json"
-                }
-                
-                # Test agent registry endpoint
-                url = f"{self.GRAPH_API_BASE}{self.AGENT_REGISTRY_PATH}"
-                async with session.get(url, headers=headers) as response:
-                    if response.status == 200:
-                        result.agent_registry_accessible = True
-                        result.frontier_enrolled = True
-                        result.available = True
-                    elif response.status == 403:
-                        result.error_message = "Access denied - Frontier enrollment may be required"
-                        result.tenant_verification_steps = self._get_verification_checklist()
-                    elif response.status == 404:
-                        result.error_message = "Agent Registry API not available - Frontier preview not enabled"
-                        result.tenant_verification_steps = self._get_verification_checklist()
-                    else:
-                        body = await response.text()
-                        result.error_message = f"Unexpected response: {response.status} - {body}"
-            
-        except Exception as e:
-            result.error_message = f"Availability check failed: {str(e)}"
-            result.tenant_verification_steps = self._get_verification_checklist()
-        
-        return result
-    
-    def _get_verification_checklist(self) -> List[str]:
-        """
-        Return tenant/admin verification checklist for Agent 365 access.
-        
-        Reference: https://adoption.microsoft.com/copilot/frontier-program/
-        """
-        return [
-            "1. FRONTIER ENROLLMENT: Verify your organization is enrolled in Microsoft Frontier preview program",
-            "   - Visit: https://adoption.microsoft.com/copilot/frontier-program/",
-            "   - Contact your Microsoft account team for enrollment",
-            "",
-            "2. ADMIN CENTER ACCESS: Verify Agent Registry is visible in Microsoft 365 Admin Center",
-            "   - Navigate to: https://admin.microsoft.com",
-            "   - Look for 'Agent Registry' under Settings > Agents",
-            "",
-            "3. ENTRA ID PERMISSIONS: Verify required Graph API permissions are granted",
-            "   - Required: AgentInstance.ReadWrite.All",
-            "   - Required: AgentInstance.ReadWrite.ManagedBy (for app-only flows)",
-            "   - Admin consent may be required",
-            "",
-            "4. ROLE ASSIGNMENT: Verify the Agent Registry Administrator role is assigned",
-            "   - Navigate to Entra ID > Roles and administrators",
-            "   - Assign 'Agent Registry Administrator' to the service principal",
-            "",
-            "5. CONDITIONAL ACCESS: Verify no policies are blocking API access",
-            "   - Check for location-based restrictions",
-            "   - Check for device compliance requirements",
-            "",
-            "6. TENANT CONFIGURATION: Contact Microsoft support if all above are verified",
-            "   - Agent 365 may require additional tenant-level configuration",
-            "   - Preview features may have limited regional availability"
-        ]
-
-
-class EntraAgentRegistryClient:
-    """
-    Client for Microsoft Entra Agent Registry operations.
-    
-    Handles agent instance and agent card registration with the registry.
-    
-    Reference: https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/publish-agents-to-registry
-    """
-    
-    GRAPH_API_BASE = "https://graph.microsoft.com/beta"
-    
-    def __init__(self):
-        self.credential = DefaultAzureCredential()
-        self._token_cache = None
-    
-    async def _get_token(self) -> str:
-        """Get Graph API access token."""
-        token = self.credential.get_token("https://graph.microsoft.com/.default")
-        return token.token
-    
-    async def register_agent_instance(
-        self,
-        agent_id: str,
-        display_name: str,
-        description: str,
-        url: str,
-        originating_store: str = "AzureAIFoundry",
-        owner_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Register an agent instance in the Entra Agent Registry.
-        
-        Args:
-            agent_id: Unique identifier for the agent
-            display_name: Human-readable agent name
-            description: Agent description
-            url: Agent endpoint URL
-            originating_store: Source platform (e.g., AzureAIFoundry, Custom)
-            owner_id: Owner user ID (optional)
-        
-        Returns:
-            Created agent instance data
-        
-        Reference: https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/publish-agents-to-registry#register-an-agent-instance
-        """
-        token = await self._get_token()
-        
-        payload = {
-            "id": agent_id,
-            "displayName": display_name,
-            "description": description,
-            "url": url,
-            "isBlocked": False,
-            "originatingStore": originating_store,
-            "sourceAgentId": agent_id
-        }
-        
-        if owner_id:
-            payload["ownerId"] = owner_id
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            url = f"{self.GRAPH_API_BASE}/agentRegistry/agentInstances"
-            
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status == 201:
-                    return await response.json()
-                elif response.status == 409:
-                    logger.warning(f"Agent {agent_id} already registered, updating...")
-                    return await self.update_agent_instance(agent_id, display_name, description, url)
-                else:
-                    body = await response.text()
-                    raise Exception(f"Failed to register agent: {response.status} - {body}")
-    
-    async def update_agent_instance(
-        self,
-        agent_id: str,
-        display_name: str,
-        description: str,
-        url: str
-    ) -> Dict[str, Any]:
-        """Update an existing agent instance."""
-        token = await self._get_token()
-        
-        payload = {
-            "displayName": display_name,
-            "description": description,
-            "url": url
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            api_url = f"{self.GRAPH_API_BASE}/agentRegistry/agentInstances/{agent_id}"
-            
-            async with session.patch(api_url, headers=headers, json=payload) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    body = await response.text()
-                    raise Exception(f"Failed to update agent: {response.status} - {body}")
-    
-    async def register_agent_card(
-        self,
-        agent_instance_id: str,
-        name: str,
-        description: str,
-        skills: List[Dict[str, Any]],
-        capabilities: Optional[Dict[str, bool]] = None
-    ) -> Dict[str, Any]:
-        """
-        Register an agent card manifest for discovery.
-        
-        Reference: https://learn.microsoft.com/en-us/entra/agent-id/identity-platform/publish-agents-to-registry#register-agent-card
-        """
-        token = await self._get_token()
-        
-        payload = {
-            "name": name,
-            "description": description,
-            "skills": skills,
-            "capabilities": capabilities or {
-                "supportsA2A": True,
-                "supportsMCP": True
-            }
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            url = f"{self.GRAPH_API_BASE}/agentRegistry/agentInstances/{agent_instance_id}/agentCardManifest"
-            
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status in [200, 201]:
-                    return await response.json()
-                else:
-                    body = await response.text()
-                    raise Exception(f"Failed to register agent card: {response.status} - {body}")
-    
-    async def get_agent_instance(self, agent_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieve an agent instance by ID."""
-        token = await self._get_token()
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            url = f"{self.GRAPH_API_BASE}/agentRegistry/agentInstances/{agent_id}"
-            
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 404:
-                    return None
-                else:
-                    body = await response.text()
-                    raise Exception(f"Failed to get agent: {response.status} - {body}")
-
-
-class TeamsApprovalClient:
-    """
-    Microsoft Teams approval client using Graph API.
-    
-    Handles creation and management of approval requests in Teams.
-    
-    Reference: https://learn.microsoft.com/en-us/graph/approvals-app-api
-    """
-    
-    GRAPH_API_BASE = "https://graph.microsoft.com/v1.0"
-    
-    def __init__(self):
-        self.credential = DefaultAzureCredential()
-    
-    async def _get_token(self) -> str:
-        """Get Graph API access token."""
-        token = self.credential.get_token("https://graph.microsoft.com/.default")
-        return token.token
-    
-    async def create_approval_request(
-        self,
-        approval_contract: ApprovalContract,
-        approvers: List[str],
-        callback_url: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Create an approval request in Microsoft Teams.
-        
-        Args:
-            approval_contract: The approval contract with request details
-            approvers: List of approver user IDs or email addresses
-            callback_url: Webhook URL for approval response (for Logic Apps integration)
-        
-        Returns:
-            Created approval request data
-        """
-        token = await self._get_token()
-        
-        # Build approval request payload
-        payload = {
-            "displayName": f"Agents Deployment Approval - {approval_contract.environment}",
-            "description": approval_contract.task,
-            "approvalType": "basic",
-            "assignedTo": [
-                {"user": {"id": approver}} for approver in approvers
-            ],
-            "customData": json.dumps(approval_contract.to_dict())
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            # TODO: Graph API Approvals endpoint requires specific permissions
-            # and may need Power Automate integration for full Teams experience
-            url = f"{self.GRAPH_API_BASE}/solutions/approval/approvalItems"
-            
-            async with session.post(url, headers=headers, json=payload) as response:
-                if response.status in [200, 201]:
-                    return await response.json()
-                else:
-                    body = await response.text()
-                    logger.warning(f"Graph Approvals API not available: {response.status}")
-                    # Fallback to Logic Apps webhook
-                    if callback_url:
-                        return await self._trigger_logic_app_approval(
-                            approval_contract, approvers, callback_url
-                        )
-                    raise Exception(f"Failed to create approval: {response.status} - {body}")
-    
-    async def _trigger_logic_app_approval(
-        self,
-        approval_contract: ApprovalContract,
-        approvers: List[str],
-        webhook_url: str
-    ) -> Dict[str, Any]:
-        """
-        Trigger approval workflow via Azure Logic Apps.
-        
-        This is the fallback when direct Graph API is not available.
-        """
-        payload = {
-            **approval_contract.to_dict(),
-            "approvers": approvers,
-            "callback_url": webhook_url
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {"Content-Type": "application/json"}
-            
-            async with session.post(webhook_url, headers=headers, json=payload) as response:
-                if response.status in [200, 202]:
-                    return {"status": "triggered", "approval_id": approval_contract.approval_id}
-                else:
-                    body = await response.text()
-                    raise Exception(f"Failed to trigger Logic App: {response.status} - {body}")
-    
-    async def get_approval_status(self, approval_id: str) -> Optional[Dict[str, Any]]:
-        """Get the status of an approval request."""
-        token = await self._get_token()
-        
-        async with aiohttp.ClientSession() as session:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            
-            url = f"{self.GRAPH_API_BASE}/solutions/approval/approvalItems/{approval_id}"
-            
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    return await response.json()
-                elif response.status == 404:
-                    return None
-                else:
-                    body = await response.text()
-                    raise Exception(f"Failed to get approval: {response.status} - {body}")
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=15), trust_env=False,
+            ) as session:
+                async with session.post(self._webhook_url, json=payload, allow_redirects=False) as response:
+                    if response.status != 202:
+                        raise ApprovalNotificationError("Approval notification was not acknowledged.")
+        except Exception:
+            # HTTP exceptions can include the signed trigger URL. Suppress their
+            # chain as well as their text; do not log bodies, headers, or tokens.
+            raise ApprovalNotificationError("Approval notification was not acknowledged.") from None
 
 
 class ApprovalWorkflowEngine:
+    """Cosmos is the only authoritative state, including dispatch and callback CAS.
+
+    container_client, transport, and clock are explicit test seams, not fallbacks.
+    Unconfirmed dispatch after a crash stays blocked until expiry; resume never
+    sends again. Deployments should use a single Cosmos write region for CAS.
     """
-    Agent Approval Workflow Engine.
-    
-    Orchestrates the dual-track approval process:
-    1. Teams human approval - Decision surface for humans
-    2. Agent validation - Validates completeness, records outcome, enforces continuation
-    
-    CRITICAL: Approval is NOT complete unless:
-    - A human approves or rejects in Teams
-    - AND the agent workflow validates, records, and returns the decision
-    """
-    
-    # Agents task pattern that requires approval
-    CICD_TASK_PATTERN = "Set up a Agents pipeline for deploying microservices to Kubernetes"
-    
+
     def __init__(
-        self,
-        cosmos_endpoint: Optional[str] = None,
-        cosmos_database: str = "mcpdb",
-        cosmos_container: str = "approvals",
-        logic_app_webhook_url: Optional[str] = None
-    ):
-        self.cosmos_endpoint = cosmos_endpoint or os.getenv("COSMOSDB_ENDPOINT", "")
-        self.cosmos_database = cosmos_database
-        self.cosmos_container = cosmos_container
-        self.logic_app_webhook_url = logic_app_webhook_url or os.getenv("LOGIC_APP_APPROVAL_WEBHOOK", "")
-        
-        # Initialize clients
-        self.availability_checker = Agent365AvailabilityChecker()
-        self.registry_client = EntraAgentRegistryClient()
-        self.teams_client = TeamsApprovalClient()
-        
-        # Initialize CosmosDB
-        self._cosmos_client = None
-        self._cosmos_container_client = None
-        
-        # Pending approvals cache
-        self._pending_approvals: Dict[str, ApprovalContract] = {}
-        
-        # Callback handlers
-        self._approval_callbacks: Dict[str, Callable[[ApprovalContract], Awaitable[None]]] = {}
-    
-    async def _init_cosmos(self):
-        """Initialize CosmosDB client."""
-        if not self._cosmos_client and self.cosmos_endpoint:
-            try:
-                credential = DefaultAzureCredential()
-                self._cosmos_client = CosmosClient(self.cosmos_endpoint, credential=credential)
+        self, cosmos_endpoint: str | None = None, cosmos_database: str | None = None,
+        cosmos_container: str | None = None, logic_app_webhook_url: str | None = None,
+        *, container_client: Any = None, transport: LogicAppApprovalClient | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.cosmos_endpoint = os.getenv("COSMOSDB_ENDPOINT", "") if cosmos_endpoint is None else cosmos_endpoint
+        self.cosmos_database = os.getenv("COSMOSDB_DATABASE_NAME", "mcpdb") if cosmos_database is None else cosmos_database
+        self.cosmos_container = os.getenv("COSMOSDB_APPROVALS_CONTAINER", "approvals") if cosmos_container is None else cosmos_container
+        self.logic_app_webhook_url = os.getenv("LOGIC_APP_APPROVAL_WEBHOOK", "") if logic_app_webhook_url is None else logic_app_webhook_url
+        self._cosmos_container_client = container_client
+        self._cosmos_client: Any = None
+        self._credential: Any = None
+        self._client_lock = threading.Lock()
+        self._transport = transport
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    @staticmethod
+    def requires_approval(task: str) -> bool:
+        """Conservative deterministic gate, not a model decision or exact sentence."""
+        _text(task, "task", 8192)
+        return bool(re.search(
+            r"\bci\s*[/_-]\s*cd\b|\bcicd\b|\bci\s+cd\b|"
+            r"\bcontinuous\s+(?:integration|delivery|deployment)\b|"
+            r"\bpipelines?\b|\bkubernetes\b|\bk8s\b|"
+            r"\b(?:re[- ]?)?deploy(?:s|ed|ing|ment|ments)?\b|"
+            r"\broll(?:out|back)\b|\broll\s+(?:out|back)\b|\bkubectl\b|\bhelm\b",
+            task, flags=re.IGNORECASE,
+        ))
+
+    def _now(self) -> datetime:
+        result = self._clock()
+        if result.tzinfo is None or result.utcoffset() is None:
+            raise ApprovalInfrastructureError("Approval clock is not timezone-aware.")
+        return result.astimezone(timezone.utc)
+
+    def _container(self) -> Any:
+        """Called only in worker threads; never creates databases or containers."""
+        if self._cosmos_container_client is not None:
+            return self._cosmos_container_client
+        with self._client_lock:
+            if self._cosmos_container_client is None:
+                _https_url(self.cosmos_endpoint, "COSMOSDB_ENDPOINT")
+                if not all(
+                    isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}", name)
+                    for name in (self.cosmos_database, self.cosmos_container)
+                ):
+                    raise ApprovalConfigurationError("Cosmos approval database/container configuration is invalid.")
+                self._credential = get_agent_credential()
+                self._cosmos_client = CosmosClient(self.cosmos_endpoint, credential=self._credential)
                 database = self._cosmos_client.get_database_client(self.cosmos_database)
                 self._cosmos_container_client = database.get_container_client(self.cosmos_container)
-                logger.info("CosmosDB initialized for approval workflow")
-            except Exception as e:
-                logger.error(f"Failed to initialize CosmosDB: {e}")
-    
-    def requires_approval(self, task: str) -> bool:
-        """
-        Check if a task requires approval.
-        
-        Currently, only Agents pipeline tasks (task 2) require approval.
-        """
-        return self.CICD_TASK_PATTERN.lower() in task.lower() or "ci/cd" in task.lower()
-    
-    async def initiate_approval(
-        self,
-        task: str,
-        requested_by: str,
-        environment: str,
-        cluster: str,
-        namespace: str = "default",
-        image_tags: Optional[List[str]] = None,
-        commit_sha: Optional[str] = None,
-        pipeline_url: Optional[str] = None,
-        rollback_url: Optional[str] = None,
-        approvers: Optional[List[str]] = None,
-        on_complete: Optional[Callable[[ApprovalContract], Awaitable[None]]] = None
-    ) -> ApprovalContract:
-        """
-        Initiate the approval workflow for a Agents deployment.
-        
-        This method:
-        1. Creates an approval contract
-        2. Stores it in CosmosDB for audit
-        3. Sends approval request to Teams
-        4. Registers a callback for completion
-        
-        Args:
-            task: The task description
-            requested_by: User/service requesting the deployment
-            environment: Target environment (development, staging, production)
-            cluster: Target Kubernetes cluster
-            namespace: Target namespace
-            image_tags: Container image tags to deploy
-            commit_sha: Git commit SHA
-            pipeline_url: URL to the pipeline run
-            rollback_url: URL for rollback action
-            approvers: List of approver user IDs
-            on_complete: Async callback when approval completes
-        
-        Returns:
-            ApprovalContract with pending status
-        """
-        await self._init_cosmos()
-        
-        # Generate approval ID
-        approval_id = str(uuid.uuid4())
-        timestamp = datetime.utcnow().isoformat() + "Z"
-        
-        # Create approval contract
-        contract = ApprovalContract(
-            approval_id=approval_id,
-            requested_by=requested_by,
-            task=task,
-            environment=environment,
-            decision=ApprovalDecision.PENDING.value,
-            agent_validation=AgentValidationStatus.PENDING.value,
-            cluster=cluster,
-            namespace=namespace,
-            image_tags=image_tags or [],
-            commit_sha=commit_sha,
-            pipeline_url=pipeline_url,
-            rollback_url=rollback_url,
-            request_timestamp=timestamp
-        )
-        
-        # Store in pending approvals
-        self._pending_approvals[approval_id] = contract
-        
-        # Register callback
-        if on_complete:
-            self._approval_callbacks[approval_id] = on_complete
-        
-        # Store in CosmosDB for audit trail
-        if self._cosmos_container_client:
-            try:
-                doc = {
-                    "id": approval_id,
-                    "partitionKey": environment,
-                    **contract.to_dict(),
-                    "status": "pending",
-                    "created_at": timestamp
-                }
-                self._cosmos_container_client.upsert_item(doc)
-                logger.info(f"Approval request {approval_id} stored in CosmosDB")
-            except Exception as e:
-                logger.error(f"Failed to store approval in CosmosDB: {e}")
-        
-        # Send to Teams
+        return self._cosmos_container_client
+
+    def _validate_document(self, doc: Any, approval_id: str, environment: str) -> dict[str, Any]:
+        """Reject legacy, corrupt, or incomplete state rather than trusting a flag."""
         try:
-            if self.logic_app_webhook_url:
-                # Use Logic Apps for Teams integration
-                await self.teams_client._trigger_logic_app_approval(
-                    contract,
-                    approvers or [],
-                    self.logic_app_webhook_url
+            tenant = _guid(os.getenv("AZURE_TENANT_ID", "").strip(), "AZURE_TENANT_ID")
+        except ApprovalValidationError:
+            raise ApprovalConfigurationError("AZURE_TENANT_ID is missing or invalid.") from None
+        try:
+            if (
+                not isinstance(doc, dict) or doc.get("id") != approval_id
+                or doc.get("approval_id") != approval_id or doc.get("environment") != environment
+                or doc.get("partitionKey") != environment or doc.get("schema_version") != 1
+                or not isinstance(doc.get("_etag"), str) or not doc["_etag"]
+            ):
+                raise ValueError
+            context = _request_context(**{
+                key: doc.get(key) for key in (
+                    "task", "requested_by", "environment", "cluster", "namespace",
+                    "image_tags", "commit_sha", "pipeline_url", "rollback_url",
                 )
-                logger.info(f"Approval request {approval_id} sent to Logic Apps")
+            })
+            if not isinstance(doc.get("request_hash"), str) or not hmac.compare_digest(doc["request_hash"], _digest(context)):
+                raise ValueError
+            approvers = doc.get("approvers")
+            if (
+                not isinstance(approvers, list) or not 1 <= len(approvers) <= 100
+                or approvers != sorted({_guid(item, "approvers") for item in approvers})
+                or doc.get("approval_tenant_id") != tenant
+            ):
+                raise ValueError
+            requested = _parse_timestamp(doc["request_timestamp"], "request_timestamp")
+            expires = _parse_timestamp(doc["expires_at"], "expires_at")
+            if expires <= requested or doc.get("notification_status") not in {"pending", "sent", "failed"}:
+                raise ValueError
+            decision = doc["decision"]
+            if decision == "pending":
+                if (
+                    doc.get("agent_validation") != "pending" or doc.get("timestamp") is not None
+                    or doc.get("response_hash") or doc["notification_status"] == "failed"
+                ):
+                    raise ValueError
+            elif decision in _TERMINAL_DECISIONS:
+                completed = _parse_timestamp(doc["timestamp"], "timestamp")
+                expected = "passed" if decision in _HUMAN_DECISIONS else "failed"
+                if doc.get("agent_validation") != expected or completed < requested:
+                    raise ValueError
+                if decision in _HUMAN_DECISIONS and (
+                    doc.get("approved_by") not in approvers or doc.get("approver_tenant_id") != tenant
+                    or doc.get("notification_status") != "sent" or completed >= expires
+                    or not doc.get("response_hash") or not doc.get("workflow_run_id")
+                ):
+                    raise ValueError
             else:
-                # Try direct Graph API
-                await self.teams_client.create_approval_request(
-                    contract,
-                    approvers or []
-                )
-                logger.info(f"Approval request {approval_id} sent to Teams")
-        except Exception as e:
-            logger.error(f"Failed to send approval to Teams: {e}")
-            contract.agent_validation = AgentValidationStatus.FAILED.value
-        
-        return contract
-    
-    async def process_approval_response(
-        self,
-        approval_id: str,
-        decision: str,
-        approved_by: str,
-        comment: Optional[str] = None
-    ) -> ApprovalContract:
-        """
-        Process an approval response from Teams.
-        
-        This method:
-        1. Receives the human decision
-        2. Validates the decision schema
-        3. Records the outcome
-        4. Updates the agent validation status
-        5. Triggers the completion callback
-        
-        Args:
-            approval_id: The approval ID
-            decision: "approved" or "rejected"
-            approved_by: The approver's identity
-            comment: Optional comment from the approver
-        
-        Returns:
-            Updated ApprovalContract with final status
-        """
-        await self._init_cosmos()
-        
-        # Get pending approval
-        contract = self._pending_approvals.get(approval_id)
-        if not contract:
-            # Try to load from CosmosDB
-            if self._cosmos_container_client:
-                try:
-                    items = list(self._cosmos_container_client.query_items(
-                        query=f"SELECT * FROM c WHERE c.id = '{approval_id}'",
-                        enable_cross_partition_query=True
-                    ))
-                    if items:
-                        contract = ApprovalContract.from_dict(items[0])
-                except Exception as e:
-                    logger.error(f"Failed to load approval from CosmosDB: {e}")
-        
-        if not contract:
-            raise ValueError(f"Approval {approval_id} not found")
-        
-        # Validate decision schema
-        if decision not in [ApprovalDecision.APPROVED.value, ApprovalDecision.REJECTED.value]:
-            raise ValueError(f"Invalid decision: {decision}")
-        
-        # Calculate resolution time
-        request_time = datetime.fromisoformat(contract.request_timestamp.rstrip("Z"))
-        resolution_time = (datetime.utcnow() - request_time).total_seconds()
-        
-        # Update contract
-        contract.decision = decision
-        contract.approved_by = approved_by
-        contract.timestamp = datetime.utcnow().isoformat() + "Z"
-        contract.comment = comment
-        contract.resolution_time_seconds = resolution_time
-        
-        # Agent validation - verify decision completeness
-        validation_passed = self._validate_approval_decision(contract)
-        contract.agent_validation = (
-            AgentValidationStatus.PASSED.value if validation_passed
-            else AgentValidationStatus.FAILED.value
-        )
-        
-        # Update in CosmosDB
-        if self._cosmos_container_client:
-            try:
-                doc = {
-                    "id": approval_id,
-                    "partitionKey": contract.environment,
-                    **contract.to_dict(),
-                    "status": "completed",
-                    "completed_at": datetime.utcnow().isoformat() + "Z"
-                }
-                self._cosmos_container_client.upsert_item(doc)
-                logger.info(f"Approval {approval_id} completed and stored")
-            except Exception as e:
-                logger.error(f"Failed to update approval in CosmosDB: {e}")
-        
-        # Remove from pending
-        self._pending_approvals.pop(approval_id, None)
-        
-        # Trigger callback
-        callback = self._approval_callbacks.pop(approval_id, None)
-        if callback:
-            try:
-                await callback(contract)
-            except Exception as e:
-                logger.error(f"Approval callback failed: {e}")
-        
-        return contract
-    
-    def _validate_approval_decision(self, contract: ApprovalContract) -> bool:
-        """
-        Validate the approval decision meets all requirements.
-        
-        Validation checks:
-        1. Decision is present and valid
-        2. Approver identity is recorded
-        3. Timestamp is present
-        4. Required fields are complete
-        5. Rejection has a comment (optional enforcement)
-        
-        Returns:
-            True if validation passes, False otherwise
-        """
-        # Required fields
-        if not contract.decision or contract.decision == ApprovalDecision.PENDING.value:
-            logger.warning("Validation failed: decision not set")
-            return False
-        
-        if not contract.approved_by:
-            logger.warning("Validation failed: approver not recorded")
-            return False
-        
-        if not contract.timestamp:
-            logger.warning("Validation failed: timestamp not set")
-            return False
-        
-        # Optional: require comment for rejections
-        # if contract.decision == ApprovalDecision.REJECTED.value and not contract.comment:
-        #     logger.warning("Validation failed: rejection requires comment")
-        #     return False
-        
-        logger.info(f"Approval {contract.approval_id} validation passed")
-        return True
-    
-    async def wait_for_approval(
-        self,
-        approval_id: str,
-        timeout_seconds: int = 7200  # 2 hours default
-    ) -> ApprovalContract:
-        """
-        Wait for an approval to complete (blocking).
-        
-        This method polls for approval completion with exponential backoff.
-        
-        Args:
-            approval_id: The approval ID to wait for
-            timeout_seconds: Maximum time to wait
-        
-        Returns:
-            Completed ApprovalContract
-        
-        Raises:
-            TimeoutError: If approval times out
-        """
-        start_time = datetime.utcnow()
-        poll_interval = 5  # Start with 5 seconds
-        max_poll_interval = 60  # Max 1 minute between polls
-        
-        while True:
-            # Check timeout
-            elapsed = (datetime.utcnow() - start_time).total_seconds()
-            if elapsed > timeout_seconds:
-                # Handle timeout
-                contract = self._pending_approvals.get(approval_id)
-                if contract:
-                    contract.decision = ApprovalDecision.TIMEOUT.value
-                    contract.agent_validation = AgentValidationStatus.FAILED.value
-                    contract.timestamp = datetime.utcnow().isoformat() + "Z"
-                    await self.process_approval_response(
-                        approval_id,
-                        ApprovalDecision.TIMEOUT.value,
-                        "system",
-                        "Approval timed out"
+                raise ValueError
+            if doc.get("response_hash") is not None:
+                if not isinstance(doc["response_hash"], str) or not _HASH.fullmatch(doc["response_hash"]):
+                    raise ValueError
+                _text(doc.get("workflow_run_id"), "workflow_run_id", 512)
+                if doc.get("comment") is not None:
+                    _text(doc["comment"], "comment", 4096, empty=True)
+                response = {
+                    key: doc.get(key) for key in (
+                        "approval_id", "environment", "request_hash", "decision", "approved_by",
+                        "approver_tenant_id", "comment", "workflow_run_id",
                     )
-                raise TimeoutError(f"Approval {approval_id} timed out after {timeout_seconds}s")
-            
-            # Check if completed
-            contract = self._pending_approvals.get(approval_id)
-            if contract and contract.is_complete():
-                return contract
-            
-            # Poll CosmosDB for external updates
-            if self._cosmos_container_client:
-                try:
-                    items = list(self._cosmos_container_client.query_items(
-                        query=f"SELECT * FROM c WHERE c.id = '{approval_id}' AND c.status = 'completed'",
-                        enable_cross_partition_query=True
-                    ))
-                    if items:
-                        return ApprovalContract.from_dict(items[0])
-                except Exception as e:
-                    logger.warning(f"Failed to poll CosmosDB: {e}")
-            
-            # Wait with exponential backoff
-            await asyncio.sleep(poll_interval)
-            poll_interval = min(poll_interval * 1.5, max_poll_interval)
+                }
+                response["timestamp"] = doc.get("response_timestamp")
+                if not hmac.compare_digest(doc["response_hash"], _digest(response)):
+                    raise ValueError
+        except (KeyError, TypeError, ValueError, ApprovalValidationError):
+            raise ApprovalStorageError("Stored approval state failed integrity validation.") from None
+        return doc
+
+    async def _load(self, approval_id: str, environment: str) -> dict[str, Any]:
+        try:
+            doc = await asyncio.to_thread(
+                lambda: self._container().read_item(item=approval_id, partition_key=environment)
+            )
+        except ApprovalError:
+            raise
+        except cosmos_exceptions.CosmosHttpResponseError as error:
+            if error.status_code == 404:
+                raise ApprovalNotFoundError("Approval was not found in this environment.") from None
+            raise ApprovalStorageError("Approval storage read failed.") from None
+        except Exception:
+            raise ApprovalStorageError("Approval storage read failed.") from None
+        return self._validate_document(doc, approval_id, environment)
+
+    async def _create(self, doc: dict[str, Any]) -> dict[str, Any]:
+        try:
+            result = await asyncio.to_thread(lambda: self._container().create_item(body=doc))
+        except ApprovalError:
+            raise
+        except Exception:
+            raise ApprovalStorageError("Approval could not be persisted; no notification was sent.") from None
+        return self._validate_document(result, doc["id"], doc["environment"])
+
+    async def _replace(self, previous: dict[str, Any], updated: dict[str, Any]) -> dict[str, Any] | None:
+        body = {key: value for key, value in updated.items() if key not in _SYSTEM_FIELDS}
+        try:
+            # The SDK obtains the partition key from the immutable body. The
+            # ETag condition prevents overwriting a winner from another worker.
+            result = await asyncio.to_thread(lambda: self._container().replace_item(
+                item=previous["id"], body=body, etag=previous["_etag"],
+                match_condition=MatchConditions.IfNotModified,
+            ))
+        except cosmos_exceptions.CosmosHttpResponseError as error:
+            if error.status_code == 412:
+                return None
+            raise ApprovalStorageError("Approval state could not be persisted.") from None
+        except ApprovalError:
+            raise
+        except Exception:
+            raise ApprovalStorageError("Approval state could not be persisted.") from None
+        return self._validate_document(result, previous["id"], previous["environment"])
+
+    def _terminal(self, doc: dict[str, Any], decision: str, now: datetime, **fields: Any) -> dict[str, Any]:
+        return {
+            **doc, "decision": decision,
+            "agent_validation": "passed" if decision in _HUMAN_DECISIONS else "failed",
+            "timestamp": _timestamp(now),
+            "resolution_time_seconds": max(0, (now - _parse_timestamp(doc["request_timestamp"], "request_timestamp")).total_seconds()),
+            **fields,
+        }
+
+    async def _record_notification(self, approval_id: str, environment: str, *, sent: bool) -> ApprovalContract:
+        for _ in range(_CAS_ATTEMPTS):
+            doc = await self._load(approval_id, environment)
+            if doc["decision"] != "pending":
+                raise ApprovalConflictError("Approval ended before notification was confirmed.")
+            now = self._now()
+            if sent and now >= _parse_timestamp(doc["expires_at"], "expires_at"):
+                updated = self._terminal(doc, "timeout", now, approved_by="system", error_code="approval_expired")
+            elif sent:
+                updated = {**doc, "notification_status": "sent", "notification_timestamp": _timestamp(now)}
+            else:
+                updated = self._terminal(
+                    doc, "error", now, approved_by="system", notification_status="failed",
+                    error_code="notification_failed",
+                )
+            saved = await self._replace(doc, updated)
+            if saved is not None:
+                if saved["decision"] == "timeout":
+                    raise ApprovalConflictError("Approval expired before notification was confirmed.")
+                return ApprovalContract.from_dict(saved)
+        raise ApprovalStorageError("Approval changed concurrently; retry reading its state.")
+
+    async def initiate_approval(
+        self, task: str, requested_by: str, environment: str, cluster: str,
+        namespace: str = "default", image_tags: list[str] | None = None,
+        commit_sha: str | None = None, pipeline_url: str | None = None,
+        rollback_url: str | None = None,
+    ) -> ApprovalContract:
+        """Persist, dispatch once, persist dispatch outcome, return pending/error.
+
+        Configuration and persistence failures raise ApprovalError (never a
+        usable approval). A transport failure returns a durably recorded ERROR;
+        if recording it also fails, a storage error is raised instead.
+        """
+        context = _request_context(task, requested_by, environment, cluster, namespace, image_tags, commit_sha, pipeline_url, rollback_url)
+        settings = get_callback_auth_settings()
+        try:
+            raw_approvers = os.getenv("APPROVAL_APPROVER_IDS", "").split(",")
+            if not 1 <= len(raw_approvers) <= 100:
+                raise ValueError
+            approvers = sorted({_guid(value.strip(), "APPROVAL_APPROVER_IDS") for value in raw_approvers})
+            timeout = float(os.getenv("APPROVAL_TIMEOUT_HOURS", "2"))
+            if not math.isfinite(timeout) or not 0 < timeout <= 168:
+                raise ValueError
+        except (ValueError, ApprovalValidationError):
+            raise ApprovalConfigurationError("Approval approvers or timeout configuration is missing or invalid.") from None
+        # Validate even when a transport has been injected. Only trusted server
+        # configuration can route a request or choose its callback target.
+        configured_transport = LogicAppApprovalClient(self.logic_app_webhook_url)
+        callback_url = os.getenv("APPROVAL_CALLBACK_URL", "")
+        if callback_url:
+            _https_url(callback_url, "APPROVAL_CALLBACK_URL")
+            callback = urlsplit(callback_url)
+            trigger = urlsplit(self.logic_app_webhook_url)
+            if (
+                (callback.netloc.lower(), callback.path.rstrip("/")) == (trigger.netloc.lower(), trigger.path.rstrip("/"))
+                or "/triggers/" in callback.path.lower()
+            ):
+                raise ApprovalConfigurationError("APPROVAL_CALLBACK_URL must not be a workflow trigger.")
+        now = self._now()
+        contract = ApprovalContract(
+            approval_id=str(uuid4()), **context, request_hash=_digest(context),
+            request_timestamp=_timestamp(now), expires_at=_timestamp(now + timedelta(hours=timeout)),
+            approvers=approvers, approval_tenant_id=settings.tenant_id,
+        )
+        await self._create({
+            **contract.to_dict(), "id": contract.approval_id,
+            "partitionKey": environment, "schema_version": 1,
+        })
+        payload = {
+            **context, "approval_id": contract.approval_id, "request_hash": contract.request_hash,
+            "request_timestamp": contract.request_timestamp, "expires_at": contract.expires_at,
+            "approvers": list(approvers),
+        }
+        if callback_url:
+            payload["callback_url"] = callback_url
+        sent = False
+        try:
+            await (self._transport or configured_transport).send(payload)
+            sent = True
+        except Exception:
+            pass
+        # Do not retain a transport exception as the context of a later storage
+        # or conflict error: that exception might contain the signed URL.
+        return await self._record_notification(contract.approval_id, environment, sent=sent)
+
+    async def get_approval(self, approval_id: str, environment: str) -> ApprovalContract:
+        """Read audit state from Cosmos, durably expiring any overdue pending item."""
+        approval_id = _guid(approval_id, "approval_id")
+        environment = _environment(environment)
+        for _ in range(_CAS_ATTEMPTS):
+            doc = await self._load(approval_id, environment)
+            now = self._now()
+            if doc["decision"] != "pending" or now < _parse_timestamp(doc["expires_at"], "expires_at"):
+                return ApprovalContract.from_dict(doc)
+            updated = self._terminal(doc, "timeout", now, approved_by="system", error_code="approval_expired")
+            saved = await self._replace(doc, updated)
+            if saved is not None:
+                return ApprovalContract.from_dict(saved)
+        raise ApprovalStorageError("Approval changed concurrently; retry reading its state.")
+
+    async def resume_approval(
+        self, approval_id: str, task: str, requested_by: str, environment: str, cluster: str,
+        namespace: str = "default", image_tags: list[str] | None = None,
+        commit_sha: str | None = None, pipeline_url: str | None = None,
+        rollback_url: str | None = None,
+    ) -> ApprovalContract:
+        """Resume only identical context; never notify, recreate, or extend expiry.
+
+        Pending expiration returns a persisted TIMEOUT. An earlier APPROVED
+        decision remains immutable for audit/idempotency but cannot be reused
+        after expires_at: that resume raises ApprovalConflictError.
+        """
+        context = _request_context(task, requested_by, environment, cluster, namespace, image_tags, commit_sha, pipeline_url, rollback_url)
+        contract = await self.get_approval(approval_id, environment)
+        if not hmac.compare_digest(contract.request_hash or "", _digest(context)):
+            raise ApprovalConflictError("Approval request context does not match.")
+        if contract.decision == "approved" and self._now() >= _parse_timestamp(contract.expires_at, "expires_at"):
+            raise ApprovalConflictError("Approval has expired and cannot authorize this request.")
+        return contract
+
+    async def process_approval_response(
+        self, approval_id: str, *, environment: str, request_hash: str, decision: str,
+        workflow_run_id: str, approved_by: str | None = None,
+        approver_tenant_id: str | None = None, comment: str | None = None,
+        timestamp: str | None = None,
+    ) -> ApprovalContract:
+        """Validate and CAS a normalized authenticated callback before returning.
+
+        The HTTP adapter MUST authenticate the Logic App principal first. Human
+        identity is then checked against the immutable stored user/tenant list.
+        Exact normalized redelivery returns the original result, even after its
+        expiry; it does not renew the request or authorize an expired resume.
+        """
+        approval_id = _guid(approval_id, "approval_id")
+        environment = _environment(environment)
+        decision = normalize_decision(decision)
+        if not isinstance(request_hash, str) or not _HASH.fullmatch(request_hash):
+            raise ApprovalValidationError("Invalid request_hash.")
+        workflow_run_id = _text(workflow_run_id, "workflow_run_id", 512)
+        if comment is not None:
+            comment = _text(comment, "comment", 4096, empty=True)
+        response_time = None if timestamp is None else _parse_timestamp(timestamp, "timestamp")
+        try:
+            if decision in _HUMAN_DECISIONS:
+                approved_by = _guid(approved_by, "approved_by")
+                approver_tenant_id = _guid(approver_tenant_id, "approver_tenant_id")
+            else:
+                if approved_by not in (None, "", "system"):
+                    raise ApprovalValidationError("System decisions cannot name a human approver.")
+                approved_by = "system"
+                if approver_tenant_id in (None, ""):
+                    approver_tenant_id = None
+                else:
+                    approver_tenant_id = _guid(approver_tenant_id, "approver_tenant_id")
+        except ApprovalValidationError:
+            raise ApprovalAuthorizationError("Callback responder identity is not authorized.") from None
+        response = {
+            "approval_id": approval_id, "environment": environment, "request_hash": request_hash,
+            "decision": decision, "approved_by": approved_by, "approver_tenant_id": approver_tenant_id,
+            "comment": comment, "workflow_run_id": workflow_run_id,
+            "timestamp": None if response_time is None else _timestamp(response_time),
+        }
+        response_hash = _digest(response)
+        for _ in range(_CAS_ATTEMPTS):
+            doc = await self._load(approval_id, environment)
+            if not hmac.compare_digest(doc["request_hash"], request_hash):
+                raise ApprovalConflictError("Callback request_hash does not match.")
+            if (
+                (decision in _HUMAN_DECISIONS and approved_by not in doc["approvers"])
+                or (approver_tenant_id is not None and approver_tenant_id != doc["approval_tenant_id"])
+            ):
+                raise ApprovalAuthorizationError("Callback responder identity is not authorized.")
+            if doc.get("response_hash"):
+                if hmac.compare_digest(doc["response_hash"], response_hash):
+                    return ApprovalContract.from_dict(doc)
+                raise ApprovalConflictError("Approval already has a different terminal response.")
+            now = self._now()
+            expired = now >= _parse_timestamp(doc["expires_at"], "expires_at")
+            if doc["decision"] == "pending" and expired:
+                saved = await self._replace(doc, self._terminal(
+                    doc, "timeout", now, approved_by="system", error_code="approval_expired",
+                ))
+                if saved is None:
+                    continue
+                doc = saved
+            # A local expiry has no workflow response yet. A first timeout
+            # acknowledgment can attach its audit identity without changing the
+            # terminal decision/time; all subsequent redeliveries use the hash.
+            attaching_timeout = doc["decision"] == "timeout" and decision == "timeout"
+            if doc["decision"] != "pending" and not attaching_timeout:
+                raise ApprovalConflictError("Approval is already terminal or has expired.")
+            if not attaching_timeout and doc["notification_status"] != "sent":
+                raise ApprovalInfrastructureError("Approval notification is not durably confirmed; retry callback.")
+            if response_time is not None:
+                if response_time < _parse_timestamp(doc["request_timestamp"], "request_timestamp") or response_time > now + timedelta(minutes=5):
+                    raise ApprovalValidationError("Callback timestamp is outside the request interval.")
+                if decision in _HUMAN_DECISIONS and response_time >= _parse_timestamp(doc["expires_at"], "expires_at"):
+                    raise ApprovalConflictError("Callback decision is outside the approval lifetime.")
+            fields = {
+                "approved_by": approved_by, "approver_tenant_id": approver_tenant_id,
+                "comment": comment, "workflow_run_id": workflow_run_id,
+                "response_timestamp": response["timestamp"], "response_hash": response_hash,
+            }
+            updated = {**doc, **fields} if attaching_timeout else self._terminal(doc, decision, now, **fields)
+            saved = await self._replace(doc, updated)
+            if saved is not None:
+                return ApprovalContract.from_dict(saved)
+        raise ApprovalStorageError("Approval changed concurrently; retry callback.")
 
 
-# Singleton instance for import
-_workflow_engine: Optional[ApprovalWorkflowEngine] = None
+_workflow_engine: ApprovalWorkflowEngine | None = None
+_workflow_engine_lock = threading.Lock()
 
 
 def get_approval_workflow_engine() -> ApprovalWorkflowEngine:
-    """Get or create the approval workflow engine singleton."""
+    """Return the process-local client singleton; approval state is NOT local."""
     global _workflow_engine
-    if _workflow_engine is None:
-        _workflow_engine = ApprovalWorkflowEngine()
-    return _workflow_engine
+    with _workflow_engine_lock:
+        if _workflow_engine is None:
+            _workflow_engine = ApprovalWorkflowEngine()
+        return _workflow_engine
 
 
-# Convenience function for Agents approval checkpoint
 async def require_agents_approval(
-    task: str,
-    requested_by: str,
-    environment: str,
-    cluster: str,
-    **kwargs
+    task: str, requested_by: str, environment: str, cluster: str,
+    *, approval_id: str | None = None, **deployment_context: Any,
 ) -> ApprovalContract:
-    """
-    Require Agents approval before proceeding.
-    
-    This is the main entry point for the approval checkpoint in mcp_agents.py.
-    It blocks execution until approval is received.
-    
-    Args:
-        task: Task description
-        requested_by: Requester identity
-        environment: Target environment
-        cluster: Target cluster
-        **kwargs: Additional deployment parameters
-    
-    Returns:
-        ApprovalContract with final decision
-    
-    Raises:
-        ValueError: If approval is rejected
-        TimeoutError: If approval times out
+    """Nonblocking compatibility checkpoint; never auto-approve or poll in-process.
+
+    Without approval_id initiate once; with it resume. The caller must check
+    both approved/passed before continuing, and present the same context.
     """
     engine = get_approval_workflow_engine()
-    
-    # Check if approval is required
-    if not engine.requires_approval(task):
-        # Return auto-approved contract for non-Agents tasks
-        return ApprovalContract(
-            approval_id=str(uuid.uuid4()),
-            requested_by=requested_by,
-            task=task,
-            environment=environment,
-            decision=ApprovalDecision.APPROVED.value,
-            approved_by="system",
-            timestamp=datetime.utcnow().isoformat() + "Z",
-            agent_validation=AgentValidationStatus.PASSED.value,
-            cluster=cluster
-        )
-    
-    # Initiate approval
-    contract = await engine.initiate_approval(
-        task=task,
-        requested_by=requested_by,
-        environment=environment,
-        cluster=cluster,
-        **kwargs
-    )
-    
-    logger.info(f"Agents approval initiated: {contract.approval_id}")
-    logger.info(f"Waiting for human approval in Microsoft Teams...")
-    
-    # Wait for approval
-    try:
-        completed = await engine.wait_for_approval(contract.approval_id)
-        
-        if completed.decision == ApprovalDecision.REJECTED.value:
-            raise ValueError(
-                f"Agents deployment rejected by {completed.approved_by}: {completed.comment or 'No reason provided'}"
-            )
-        
-        if completed.agent_validation != AgentValidationStatus.PASSED.value:
-            raise ValueError(
-                f"Agent validation failed for approval {completed.approval_id}"
-            )
-        
-        logger.info(f"Agents approval granted by {completed.approved_by}")
-        return completed
-        
-    except TimeoutError:
-        logger.error(f"Agents approval timed out for {contract.approval_id}")
-        raise
+    context = dict(task=task, requested_by=requested_by, environment=environment, cluster=cluster, **deployment_context)
+    if approval_id is not None:
+        return await engine.resume_approval(approval_id=approval_id, **context)
+    return await engine.initiate_approval(**context)
 
 
-# Export public API
 __all__ = [
-    "ApprovalContract",
-    "ApprovalDecision",
-    "AgentValidationStatus",
-    "Agent365AvailabilityChecker",
-    "Agent365AvailabilityResult",
-    "EntraAgentRegistryClient",
-    "TeamsApprovalClient",
-    "ApprovalWorkflowEngine",
-    "get_approval_workflow_engine",
-    "require_agents_approval",
+    "ApprovalContract", "ApprovalDecision", "AgentValidationStatus",
+    "ApprovalWorkflowEngine", "LogicAppApprovalClient", "get_approval_workflow_engine",
+    "require_agents_approval", "ApprovalError", "ApprovalValidationError",
+    "ApprovalAuthorizationError", "ApprovalNotFoundError", "ApprovalConflictError",
+    "ApprovalInfrastructureError", "ApprovalConfigurationError", "ApprovalStorageError",
 ]

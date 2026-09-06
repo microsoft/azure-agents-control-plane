@@ -1,121 +1,23 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/agent-card/v1.0/agent-card.json",
-  "version": "1.0",
-  "id": "next-best-action-agent",
-  "name": "next_best_action",
-  "displayName": "Next Best Action Agent",
-  "description": "AI agent that analyzes tasks and generates action plans with semantic reasoning. Handles customer churn analysis, CI/CD pipeline setup, and REST API design with governance controls.",
-  "publisher": {
-    "name": "Azure Agents Control Plane",
-    "organizationId": "${TENANT_ID}"
-  },
-  "capabilities": {
-    "supportsA2A": true,
-    "supportsMCP": true,
-    "supportsHITL": true,
-    "supportsApprovalWorkflows": true
-  },
+  "name": "${AGENT_IDENTITY_DISPLAY_NAME}",
+  "description": "Task analysis and action planning exposed by an MCP service. This metadata does not declare A2A support or confer permission to execute actions.",
+  "version": "1.0.0",
+  "url": "${AGENT_ENDPOINT_URL}",
+  "documentationUrl": "https://github.com/microsoft/azure-agents-control-plane",
+  "defaultInputModes": ["application/json"],
+  "defaultOutputModes": ["application/json"],
   "skills": [
     {
       "id": "task-analysis",
       "name": "Task Analysis",
-      "description": "Analyzes natural language task descriptions and categorizes intent",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "task": {
-            "type": "string",
-            "description": "Natural language task description"
-          }
-        },
-        "required": ["task"]
-      }
+      "description": "Analyzes natural language task descriptions and categorizes intent.",
+      "tags": ["task-analysis", "mcp"]
     },
     {
       "id": "action-planning",
       "name": "Action Planning",
-      "description": "Generates structured action plans with steps and estimated effort",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "task": {
-            "type": "string"
-          },
-          "context": {
-            "type": "object",
-            "description": "Additional context from memory providers"
-          }
-        },
-        "required": ["task"]
-      }
-    },
-    {
-      "id": "agents-approval-workflow",
-      "name": "Agents Approval Workflow",
-      "description": "Manages human-in-the-loop approvals for Agents pipeline deployments",
-      "inputSchema": {
-        "type": "object",
-        "properties": {
-          "environment": {
-            "type": "string",
-            "enum": ["development", "staging", "production"]
-          },
-          "cluster": {
-            "type": "string"
-          },
-          "namespace": {
-            "type": "string"
-          },
-          "image_tags": {
-            "type": "array",
-            "items": {"type": "string"}
-          },
-          "commit_sha": {
-            "type": "string"
-          }
-        },
-        "required": ["environment", "cluster"]
-      }
+      "description": "Generates structured action plans from a task and its context.",
+      "tags": ["action-planning", "mcp"]
     }
-  ],
-  "securityRequirements": {
-    "authentication": {
-      "type": "MicrosoftEntraID",
-      "scopes": [
-        "https://graph.microsoft.com/.default"
-      ]
-    },
-    "authorization": {
-      "minimumRoles": ["Agent.ReadWrite.All"],
-      "requiredPermissions": [
-        "AgentInstance.ReadWrite.All",
-        "Approvals.ReadWrite.All"
-      ]
-    }
-  },
-  "governanceMetadata": {
-    "approvalRequired": true,
-    "approvalRoles": ["DevOps Lead", "Platform Engineer", "Release Manager"],
-    "auditLoggingEnabled": true,
-    "dataClassification": "Internal",
-    "complianceFrameworks": ["SOC2", "ISO27001"]
-  },
-  "endpoints": {
-    "primary": {
-      "url": "${AGENT_ENDPOINT_URL}",
-      "protocol": "MCP",
-      "version": "1.0"
-    },
-    "a2a": {
-      "url": "${AGENT_ENDPOINT_URL}/a2a/v1",
-      "protocol": "A2A",
-      "version": "1.0"
-    }
-  },
-  "metadata": {
-    "createdAt": "2026-02-01T00:00:00Z",
-    "lastModifiedAt": "2026-02-01T00:00:00Z",
-    "domain": "DevOps",
-    "tags": ["ci-cd", "kubernetes", "deployment", "approval-workflow", "hitl"]
-  }
+  ]
 }

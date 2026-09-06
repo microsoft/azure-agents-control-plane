@@ -1,79 +1,10 @@
 {
-  "$schema": "https://graph.microsoft.com/beta/agentRegistry/agentInstances",
-  "id": "next-best-action-agent-instance-001",
-  "displayName": "Next Best Action Agent",
-  "description": "Production instance of the Next Best Action Agent for Agents approval workflows",
-  "url": "${AGENT_ENDPOINT_URL}",
-  "isBlocked": false,
-  "originatingStore": "AzureAIFoundry",
-  "sourceAgentId": "next-best-action-mcp-server",
-  "agentIdentity": {
-    "type": "ManagedIdentity",
-    "clientId": "${MANAGED_IDENTITY_CLIENT_ID}",
-    "objectId": "${MANAGED_IDENTITY_OBJECT_ID}",
-    "tenantId": "${TENANT_ID}"
-  },
-  "owner": {
-    "id": "${OWNER_USER_ID}",
-    "displayName": "${OWNER_DISPLAY_NAME}",
-    "email": "${OWNER_EMAIL}",
-    "role": "Agent Sponsor"
-  },
-  "managers": [
-    {
-      "id": "${MANAGER_USER_ID}",
-      "displayName": "${MANAGER_DISPLAY_NAME}",
-      "email": "${MANAGER_EMAIL}",
-      "role": "Agent Manager"
-    }
+  "displayName": "${AGENT_IDENTITY_DISPLAY_NAME}",
+  "description": "Task analysis and action planning through the Next Best Action MCP service. Registry publication is metadata only; identity permissions and runtime approvals are configured separately.",
+  "ownerIds": [
+    "${AGENT_REGISTRY_OWNER_ID}"
   ],
-  "environment": {
-    "type": "Production",
-    "region": "${AZURE_REGION}",
-    "resourceGroup": "${AZURE_RESOURCE_GROUP}",
-    "subscription": "${AZURE_SUBSCRIPTION_ID}"
-  },
-  "purpose": {
-    "category": "DevOps Automation",
-    "useCases": [
-      "Agents Pipeline Approval",
-      "Deployment Governance",
-      "Human-in-the-Loop Verification"
-    ],
-    "dataAccess": [
-      "Pipeline Metadata",
-      "Cluster Configuration",
-      "Deployment Status"
-    ]
-  },
-  "securityProfile": {
-    "blueprint": "StandardDevOpsAgent",
-    "conditionalAccess": {
-      "enabled": true,
-      "policies": ["RequireMFA", "TrustedLocationOnly"]
-    },
-    "accessGovernance": {
-      "accessPackage": "DevOps-Agent-Access",
-      "reviewRequired": true,
-      "reviewFrequencyDays": 90
-    }
-  },
-  "approvalConfiguration": {
-    "enabled": true,
-    "defaultApproverRole": "DevOps Lead",
-    "slaHours": 2,
-    "escalationPath": ["Platform Engineer", "IT Manager"],
-    "autoApproveAfterSLA": false,
-    "requireMFA": true,
-    "notificationChannels": ["Teams", "Email"]
-  },
-  "auditConfiguration": {
-    "enabled": true,
-    "retentionDays": 2555,
-    "exportToLogAnalytics": true,
-    "logAnalyticsWorkspaceId": "${LOG_ANALYTICS_WORKSPACE_ID}"
-  },
-  "createdAt": "2026-02-01T00:00:00Z",
-  "lastModifiedAt": "2026-02-01T00:00:00Z",
-  "status": "Active"
+  "originatingStore": "${AGENT_REGISTRY_ORIGINATING_STORE}",
+  "sourceAgentId": "${AGENT_REGISTRY_SOURCE_AGENT_ID}",
+  "agentIdentityId": "${AGENT_IDENTITY_APP_ID}"
 }
