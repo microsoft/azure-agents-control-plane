@@ -35,6 +35,7 @@ WEBHOOK = "https://workflow.example/workflows/approval/triggers/manual/paths/inv
 CALLBACK = "https://gateway.example/mcp/approvals/callback"
 CONFIG = {
     "AZURE_TENANT_ID": TENANT,
+    "APPROVAL_APPROVER_TENANT_ID": TENANT,
     "APPROVAL_CALLBACK_AUDIENCE": f"api://{BLUEPRINT}",
     "APPROVAL_CALLBACK_PRINCIPAL_ID": PRINCIPAL,
     "APPROVAL_APPROVER_IDS": f"{SECOND_APPROVER}, {APPROVER.upper()}, {APPROVER}",
@@ -208,8 +209,9 @@ class ApprovalEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((contract.decision, contract.agent_validation), ("pending", "pending"))
         self.assertEqual(contract.notification_status, "sent")
         self.assertFalse(contract.is_complete())
-        self.assertEqual(payload["callback_url"], CALLBACK)
-        self.assertNotEqual(payload["callback_url"], WEBHOOK)
+        self.assertNotIn("callback_url", payload)
+        self.assertEqual(payload["pipeline_url"], CONTEXT["pipeline_url"])
+        self.assertEqual(payload["rollback_url"], CONTEXT["rollback_url"])
         self.assertEqual(payload["approvers"], [APPROVER, SECOND_APPROVER])
         self.assertNotIn("sig=", json.dumps(self.stored(contract)))
         self.assertEqual(
@@ -329,6 +331,27 @@ class ApprovalEngineTests(unittest.IsolatedAsyncioTestCase):
                 await self.new_engine().process_approval_response(**self.callback(contract, approved_by=OUTSIDER))
             completed = await self.new_engine().process_approval_response(**self.callback(contract, approved_by=APPROVER.upper()))
         self.assertEqual(completed.approved_by, APPROVER)
+
+    async def test_human_tenant_is_pinned_separately_from_callback_identity(self) -> None:
+        with patch.dict(os.environ, {"APPROVAL_APPROVER_TENANT_ID": OUTSIDER}):
+            contract = await self.initiate()
+            self.assertEqual(contract.approval_tenant_id, OUTSIDER)
+            self.assertEqual(approvals.get_callback_auth_settings().tenant_id, TENANT)
+            with self.assertRaises(approvals.ApprovalAuthorizationError):
+                await self.engine.process_approval_response(**self.callback(contract))
+            completed = await self.engine.process_approval_response(**self.callback(contract, approver_tenant_id=OUTSIDER))
+            self.assertEqual((completed.decision, completed.agent_validation), ("approved", "passed"))
+            self.assertEqual(completed.approver_tenant_id, OUTSIDER)
+        # Changing the trusted tenant invalidates an old approval rather than
+        # silently remapping its allowlisted human identities.
+        with self.assertRaises(approvals.ApprovalStorageError):
+            await self.engine.resume_approval(contract.approval_id, **CONTEXT)
+
+    def test_explicit_bad_human_tenant_has_no_hosting_tenant_fallback(self) -> None:
+        for tenant in ("", "invalid", "00000000-0000-0000-0000-000000000000"):
+            with patch.dict(os.environ, {"APPROVAL_APPROVER_TENANT_ID": tenant}):
+                with self.assertRaises(approvals.ApprovalConfigurationError):
+                    approvals.get_approver_tenant_id()
 
     async def test_aliases_and_all_terminal_states(self) -> None:
         for alias, expected in (

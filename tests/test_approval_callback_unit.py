@@ -44,6 +44,7 @@ JWKS_URL = f"https://login.microsoftonline.com/{TENANT}/discovery/v2.0/keys"
 ROUTE = "/approvals/callback"
 CONFIG = {
     "AZURE_TENANT_ID": TENANT,
+    "APPROVAL_APPROVER_TENANT_ID": TENANT,
     "APPROVAL_CALLBACK_AUDIENCE": AUDIENCE,
     "APPROVAL_CALLBACK_PRINCIPAL_ID": PRINCIPAL,
     "APPROVAL_APPROVER_IDS": APPROVER,
@@ -280,6 +281,17 @@ class ApprovalCallbackTests(unittest.TestCase):
     def test_delegated_tokens_are_forbidden_even_with_correct_oid(self) -> None:
         for changes in ({"scp": "Approval.Write"}, {"scp": ""}, {"idtyp": "user"}):
             self.assertEqual(self.post(token=self.token(changes)).status_code, 403)
+
+    def test_cross_tenant_human_does_not_relax_callback_jwt_tenant(self) -> None:
+        with patch.dict(os.environ, {"APPROVAL_APPROVER_TENANT_ID": OUTSIDER}):
+            contract = asyncio.run(self.engine.initiate_approval(**CONTEXT))
+            body = self.body_for(contract, approver_tenant_id=OUTSIDER)
+            self.assertEqual(self.post(body, token=self.token({"tid": OUTSIDER})).status_code, 401)
+            self.assertEqual(self.post({**body, "approver_tenant_id": TENANT}).status_code, 403)
+            response = self.post(body)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["approval_tenant_id"], OUTSIDER)
+            self.assertEqual(response.json()["decision"], "approved")
 
     def test_x_headers_never_authenticate_or_override_a_signed_identity(self) -> None:
         headers = {

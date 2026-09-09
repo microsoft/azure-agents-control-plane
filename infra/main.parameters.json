@@ -35,11 +35,41 @@
     "agentIdentityEnabled": {
       "value": "${AGENT_IDENTITY_ENABLED=false}"
     },
+    "agentSponsorPrincipalId": {
+      "value": "${AGENT_SPONSOR_PRINCIPAL_ID=}"
+    },
+    "existingAgentIdentityBlueprintAppId": {
+      "value": "${EXISTING_AGENT_IDENTITY_BLUEPRINT_APP_ID=}"
+    },
+    "existingAgentIdentityId": {
+      "value": "${EXISTING_AGENT_IDENTITY_ID=}"
+    },
     "developerPrincipalId": {
       "value": "${DEVELOPER_PRINCIPAL_ID=}"
     },
     "developerIpAddress": {
       "value": "${DEVELOPER_IP_ADDRESS=}"
+    },
+    "approvalLogicAppEnabled": {
+      "value": "${APPROVAL_LOGIC_APP_ENABLED=false}"
+    },
+    "teamsChannelId": {
+      "value": "${TEAMS_CHANNEL_ID=}"
+    },
+    "teamsGroupId": {
+      "value": "${TEAMS_GROUP_ID=}"
+    },
+    "approvalTimeoutHours": {
+      "value": "${APPROVAL_TIMEOUT_HOURS=2}"
+    },
+    "existingApprovalCallbackAppUri": {
+      "value": "${EXISTING_APPROVAL_CALLBACK_APP_URI=}"
+    },
+    "approvalApproverIds": {
+      "value": "${APPROVAL_APPROVER_IDS=}"
+    },
+    "approvalApproverTenantId": {
+      "value": "${APPROVAL_APPROVER_TENANT_ID=}"
     },
     "fabricDataAgentsEnabled": {
       "value": false

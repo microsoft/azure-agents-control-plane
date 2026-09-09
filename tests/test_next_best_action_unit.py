@@ -169,6 +169,43 @@ def _run(coro):
 
 
 # ===========================================================================
+#  Tests - Runtime credential selection
+# ===========================================================================
+
+
+class TestRuntimeCredentialSelection(unittest.TestCase):
+    def test_disabled_uses_default_credential(self):
+        selected = MagicMock()
+        with patch.dict(os.environ, {"AGENT_IDENTITY_ENABLED": "false"}), \
+             patch.object(agent, "_runtime_agent_credential", None), \
+             patch.object(agent, "DefaultAzureCredential", return_value=selected), \
+             patch.object(agent, "get_agent_credential") as get_agent:
+            self.assertIs(agent._runtime_credential(), selected)
+        get_agent.assert_not_called()
+
+    def test_enabled_uses_agent_identity_without_default_fallback(self):
+        selected = MagicMock()
+        with patch.dict(os.environ, {"AGENT_IDENTITY_ENABLED": "true"}), \
+             patch.object(agent, "_runtime_agent_credential", None), \
+             patch.object(agent, "get_agent_credential", return_value=selected), \
+             patch.object(agent, "DefaultAzureCredential") as default:
+            self.assertIs(agent._runtime_credential(), selected)
+        default.assert_not_called()
+
+    def test_async_agent_identity_is_only_created_when_enabled(self):
+        selected = MagicMock()
+        with patch.dict(os.environ, {"AGENT_IDENTITY_ENABLED": "true"}), \
+             patch.object(agent, "_runtime_agent_async_credential", None), \
+             patch.object(agent, "get_async_agent_credential", return_value=selected):
+            self.assertIs(agent._runtime_async_credential(), selected)
+        with patch.dict(os.environ, {"AGENT_IDENTITY_ENABLED": "false"}), \
+               patch.object(agent, "_runtime_agent_async_credential", None), \
+             patch.object(agent, "get_async_agent_credential") as get_async:
+            self.assertIsNone(agent._runtime_async_credential())
+        get_async.assert_not_called()
+
+
+# ===========================================================================
 #  Tests – Pure functions
 # ===========================================================================
 

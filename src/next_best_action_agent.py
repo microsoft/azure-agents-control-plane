@@ -16,7 +16,7 @@ import time
 import numpy as np
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -87,26 +87,45 @@ except ImportError:
     EVALUATION_AVAILABLE = False
     # Logger not yet defined, will log later in startup
 
-# Agent 365 / Entra Agent Registry imports (for Agents approval workflows)
-try:
-    from agent365_approval import (
-        ApprovalContract,
-        ApprovalDecision,
-        AgentValidationStatus,
-        Agent365AvailabilityChecker,
-        ApprovalWorkflowEngine,
-        get_approval_workflow_engine,
-        require_agents_approval,
-    )
-    AGENT365_APPROVAL_AVAILABLE = True
-except ImportError:
-    AGENT365_APPROVAL_AVAILABLE = False
-    # Fallback: approval features will be disabled
+# Approval enforcement is mandatory. A missing module must prevent startup,
+# not silently turn a deployment request into an ungated recommendation.
+from agent365_approval import (
+    ApprovalError, ApprovalValidationError, ApprovalWorkflowEngine,
+    get_approval_workflow_engine,
+)
+from approval_api import router as approval_router
+from agent_identity import get_agent_credential, get_async_agent_credential
+
+AGENT365_APPROVAL_AVAILABLE = True
 
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(override=True)
+
+_runtime_agent_credential = None
+_runtime_agent_async_credential = None
+
+
+def _runtime_credential():
+    """Select Agent ID explicitly while preserving the disabled credential path."""
+    global _runtime_agent_credential
+    enabled = os.getenv("AGENT_IDENTITY_ENABLED", "false").strip().lower()
+    if enabled in ("false", "0"):
+        return DefaultAzureCredential()
+    if _runtime_agent_credential is None:
+        _runtime_agent_credential = get_agent_credential()
+    return _runtime_agent_credential
+
+
+def _runtime_async_credential():
+    global _runtime_agent_async_credential
+    enabled = os.getenv("AGENT_IDENTITY_ENABLED", "false").strip().lower()
+    if enabled in ("false", "0"):
+        return None
+    if _runtime_agent_async_credential is None:
+        _runtime_agent_async_credential = get_async_agent_credential()
+    return _runtime_agent_async_credential
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -120,7 +139,7 @@ if not EVALUATION_AVAILABLE:
 if AGENT365_APPROVAL_AVAILABLE:
     logger.info("Agent 365 approval workflow available - Agents tasks will require human-in-the-loop approval")
 else:
-    logger.warning("agent365_approval not available - Agents approval workflows will be disabled")
+    logger.error("Approval support unavailable - next_best_action requests are blocked")
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -128,6 +147,7 @@ app = FastAPI(
     description="Model Context Protocol Server for AI Agents with Semantic Reasoning",
     version="1.0.0"
 )
+app.include_router(approval_router)
 
 # Azure Storage configuration
 STORAGE_ACCOUNT_URL = os.getenv("AZURE_STORAGE_ACCOUNT_URL", "")
@@ -143,7 +163,7 @@ COSMOSDB_PLANS_CONTAINER = "plans"
 if STORAGE_CONNECTION_STRING:
     blob_service_client = BlobServiceClient.from_connection_string(STORAGE_CONNECTION_STRING)
 elif STORAGE_ACCOUNT_URL:
-    credential = DefaultAzureCredential()
+    credential = _runtime_credential()
     blob_service_client = BlobServiceClient(account_url=STORAGE_ACCOUNT_URL, credential=credential)
 else:
     logger.warning("No storage configuration found - snippet storage will not work")
@@ -157,7 +177,7 @@ cosmos_plans_container = None
 
 if COSMOSDB_ENDPOINT:
     try:
-        credential = DefaultAzureCredential()
+        credential = _runtime_credential()
         cosmos_client = CosmosClient(COSMOSDB_ENDPOINT, credential=credential)
         cosmos_database = cosmos_client.get_database_client(COSMOSDB_DATABASE_NAME)
         cosmos_tasks_container = cosmos_database.get_container_client(COSMOSDB_TASKS_CONTAINER)
@@ -178,6 +198,7 @@ if COSMOSDB_ENDPOINT:
             endpoint=COSMOSDB_ENDPOINT,
             database_name=COSMOSDB_DATABASE_NAME,
             container_name="short_term_memory",
+            credential=_runtime_credential(),
             default_ttl=3600,  # 1 hour default TTL
         )
         
@@ -285,7 +306,7 @@ def get_embedding(text: str) -> List[float]:
     
     from openai import AzureOpenAI
     
-    credential = DefaultAzureCredential()
+    credential = _runtime_credential()
     token = credential.get_token("https://cognitiveservices.azure.com/.default")
     
     base_endpoint = FOUNDRY_PROJECT_ENDPOINT.split('/api/projects')[0] if '/api/projects' in FOUNDRY_PROJECT_ENDPOINT else FOUNDRY_PROJECT_ENDPOINT
@@ -386,7 +407,7 @@ def analyze_intent(task: str) -> str:
     try:
         from openai import AzureOpenAI
         
-        credential = DefaultAzureCredential()
+        credential = _runtime_credential()
         token = credential.get_token("https://cognitiveservices.azure.com/.default")
         
         base_endpoint = FOUNDRY_PROJECT_ENDPOINT.split('/api/projects')[0] if '/api/projects' in FOUNDRY_PROJECT_ENDPOINT else FOUNDRY_PROJECT_ENDPOINT
@@ -437,7 +458,7 @@ def generate_plan(task: str, similar_tasks: List[Dict[str, Any]]) -> List[Dict[s
     try:
         from openai import AzureOpenAI
         
-        credential = DefaultAzureCredential()
+        credential = _runtime_credential()
         token = credential.get_token("https://cognitiveservices.azure.com/.default")
         
         base_endpoint = FOUNDRY_PROJECT_ENDPOINT.split('/api/projects')[0] if '/api/projects' in FOUNDRY_PROJECT_ENDPOINT else FOUNDRY_PROJECT_ENDPOINT
@@ -526,7 +547,7 @@ def generate_plan_with_instructions(
     try:
         from openai import AzureOpenAI
         
-        credential = DefaultAzureCredential()
+        credential = _runtime_credential()
         token = credential.get_token("https://cognitiveservices.azure.com/.default")
         
         base_endpoint = FOUNDRY_PROJECT_ENDPOINT.split('/api/projects')[0] if '/api/projects' in FOUNDRY_PROJECT_ENDPOINT else FOUNDRY_PROJECT_ENDPOINT
@@ -691,6 +712,8 @@ def _initialize_long_term_memory():
                 foundry_endpoint=FOUNDRY_PROJECT_ENDPOINT,
                 index_name=AZURE_SEARCH_INDEX_NAME,
                 knowledge_base_name=AZURE_SEARCH_KNOWLEDGE_BASE_NAME,
+                credential=_runtime_credential(),
+                async_credential=_runtime_async_credential(),
                 mode="agentic",
             )
             # Set embedding function for the long-term memory
@@ -731,6 +754,7 @@ def _initialize_facts_memory():
             fabric_endpoint=FABRIC_ENDPOINT,
             workspace_id=FABRIC_WORKSPACE_ID,
             ontology_name=FABRIC_ONTOLOGY_NAME,
+            credential=_runtime_credential(),
         )
         
         # Set embedding function if available
@@ -1031,7 +1055,7 @@ def ask_foundry_tool(question: str) -> str:
     try:
         from openai import AzureOpenAI
         
-        credential = DefaultAzureCredential()
+        credential = _runtime_credential()
         # Get a token for Azure Cognitive Services
         token = credential.get_token("https://cognitiveservices.azure.com/.default")
         
@@ -1063,312 +1087,71 @@ def ask_foundry_tool(question: str) -> str:
 
 
 @ai_function
-def next_best_action_tool(task: str) -> str:
+async def next_best_action_tool(task: str, approval_id: Optional[str] = None) -> str:
+    """Generate a recommendation through the same gate as the MCP entry point.
+
+    Deployment/CI-CD requests first return approval_pending. After the human
+    decision, call again with the exact task and its approval_id. No deployments
+    are executed by this tool; approval binds the request, not a future plan.
     """
-    Analyze a task using semantic reasoning with three memory layers:
-    1. Short-term memory (CosmosDB) - finds similar past tasks using cosine similarity
-    2. Long-term memory (Foundry IQ) - retrieves relevant task instructions
-    3. Facts memory (Fabric IQ) - queries domain facts from ontologies
-    
-    The planning is grounded in domain knowledge from Fabric IQ ontologies:
-    - Customer domain: churn predictions, segment analysis, risk assessments
-    - DevOps domain: pipeline health, deployment status, failure patterns
-    - User Management domain: authentication patterns, security alerts
-    
-    Args:
-        task: The task description in natural language (English sentence)
-    
-    Returns:
-        A JSON response containing task analysis, similar tasks, domain facts, and planned steps
+    result = await _execute_tool_impl("next_best_action", {"task": task, "approval_id": approval_id})
+    return result.content[0]["text"]
+
+
+async def _next_best_action_approval(task: str, approval_id: Optional[str] = None):
+    """Return (blocking result, approved contract); exceptions never permit planning.
+
+    Policy and deployment context are server-owned. Supplying an ID always
+    invokes resume, even if a changed task no longer matches the policy regex.
+    The requester is this service's identity, not an unverified human claim.
     """
-    if not FOUNDRY_PROJECT_ENDPOINT:
-        return json.dumps({"error": "Foundry endpoint not configured"})
-    
-    if not cosmos_tasks_container or not cosmos_plans_container:
-        return json.dumps({"error": "CosmosDB not configured"})
-    
+    if not AGENT365_APPROVAL_AVAILABLE:
+        return {"status": "approval_error", "error": "Approval support is unavailable; request blocked."}, None
     try:
-        import asyncio
-        
-        task_id = str(uuid.uuid4())
-        timestamp = datetime.utcnow().isoformat()
-        
-        # ================================================================
-        # AGENT 365 CI/CD APPROVAL CHECKPOINT
-        # For CI/CD pipeline tasks, require human-in-the-loop approval
-        # via Microsoft Teams before proceeding with plan generation.
-        # ================================================================
-        approval_result = None
-        agents_approval_required = False
-        CICD_TASK_PATTERN = "Set up a Agents pipeline for deploying microservices to Kubernetes"
-        
-        if AGENT365_APPROVAL_AVAILABLE and CICD_TASK_PATTERN.lower() in task.lower():
-            agents_approval_required = True
-            logger.info("=" * 70)
-            logger.info("🔒 Agents APPROVAL CHECKPOINT TRIGGERED")
-            logger.info("=" * 70)
-            logger.info(f"Task: {task}")
-            logger.info("This task requires human-in-the-loop approval via Microsoft Teams")
-            
-            try:
-                # Initialize approval workflow engine
-                approval_engine = get_approval_workflow_engine()
-                
-                # Create approval request
-                loop = asyncio.new_event_loop()
-                approval_contract = loop.run_until_complete(
-                    approval_engine.initiate_approval(
-                        task=task,
-                        requested_by=os.getenv("AZURE_CLIENT_ID", "mcp-agent"),
-                        environment=os.getenv("DEPLOYMENT_ENVIRONMENT", "staging"),
-                        cluster=os.getenv("AKS_CLUSTER_NAME", "aks-mcp-cluster"),
-                        namespace=os.getenv("K8S_NAMESPACE", "mcp-agents"),
-                        image_tags=[os.getenv("IMAGE_TAG", "latest")],
-                        commit_sha=os.getenv("COMMIT_SHA", "unknown"),
-                        pipeline_url=os.getenv("PIPELINE_URL", ""),
-                        rollback_url=os.getenv("ROLLBACK_URL", ""),
-                    )
-                )
-                loop.close()
-                
-                logger.info(f"📋 Approval ID: {approval_contract.approval_id}")
-                logger.info(f"⏳ Waiting for approval in Microsoft Teams...")
-                
-                # NOTE: In production, this would block until approval is received
-                # For demo/testing, we'll check if approval was pre-configured
-                approval_result = {
-                    "approval_id": approval_contract.approval_id,
-                    "status": approval_contract.decision,
-                    "agent_validation": approval_contract.agent_validation,
-                    "message": "Approval request sent to Microsoft Teams",
-                    "approval_contract": approval_contract.to_dict()
-                }
-                
-                # If approval is still pending, return early with approval info
-                if approval_contract.decision == ApprovalDecision.PENDING.value:
-                    logger.warning("⚠️ Approval is pending - task execution blocked")
-                    return json.dumps({
-                        "task_id": task_id,
-                        "task": task,
-                        "status": "approval_pending",
-                        "approval": approval_result,
-                        "message": "Agents deployment requires human approval via Microsoft Teams. "
-                                   "Please approve the request in Teams to proceed.",
-                        "approval_contract": {
-                            "approval_id": approval_contract.approval_id,
-                            "requested_by": approval_contract.requested_by,
-                            "task": task,
-                            "environment": approval_contract.environment,
-                            "decision": approval_contract.decision,
-                            "approved_by": approval_contract.approved_by,
-                            "timestamp": approval_contract.timestamp,
-                            "agent_validation": approval_contract.agent_validation
-                        }
-                    }, indent=2)
-                
-                # Check if approval was rejected
-                if approval_contract.decision == ApprovalDecision.REJECTED.value:
-                    logger.error(f"❌ Approval rejected by {approval_contract.approved_by}")
-                    return json.dumps({
-                        "task_id": task_id,
-                        "task": task,
-                        "status": "approval_rejected",
-                        "approval": approval_result,
-                        "error": f"Agents deployment rejected: {approval_contract.comment or 'No reason provided'}",
-                        "approval_contract": approval_contract.to_dict()
-                    }, indent=2)
-                
-                logger.info(f"✅ Approval granted by {approval_contract.approved_by}")
-                logger.info(f"✅ Agent validation: {approval_contract.agent_validation}")
-                
-            except Exception as e:
-                logger.error(f"Approval workflow error: {e}")
-                approval_result = {
-                    "error": str(e),
-                    "status": "approval_error",
-                    "message": "Approval workflow encountered an error. Proceeding with caution."
-                }
-        
-        # Step 1: Generate embedding for the task
-        logger.info(f"Generating embedding for task: {task[:100]}...")
-        task_embedding = get_embedding(task)
-        
-        # Step 2: Analyze intent
-        logger.info("Analyzing task intent...")
-        intent = analyze_intent(task)
-        
-        # Step 3: Find similar tasks using cosine similarity (short-term memory from CosmosDB)
-        logger.info("Searching for similar past tasks in CosmosDB...")
-        similar_tasks = find_similar_tasks(task_embedding, threshold=0.7, limit=5)
-        
-        # Step 4: Search for task instructions in AI Search long-term memory
-        # Uses AzureAISearchContextProvider for enhanced agentic retrieval
-        task_instructions = []
-        long_term_context = ""
-        
-        if long_term_memory:
-            # First, get context via AzureAISearchContextProvider
-            logger.info("Retrieving context via LongTermMemory with AzureAISearchContextProvider...")
-            try:
-                loop = asyncio.new_event_loop()
-                long_term_context = loop.run_until_complete(
-                    long_term_memory.get_context(task)
-                )
-                loop.close()
-                if long_term_context:
-                    logger.info(f"AzureAISearchContextProvider returned context: {len(long_term_context)} chars")
-                else:
-                    logger.info("AzureAISearchContextProvider returned no context")
-            except Exception as e:
-                logger.warning(f"Failed to retrieve context from AzureAISearchContextProvider: {e}")
-            
-            # Also get structured task instructions via hybrid search
-            logger.info("Searching for task instructions in LongTermMemory...")
-            try:
-                loop = asyncio.new_event_loop()
-                task_instructions = loop.run_until_complete(
-                    long_term_memory.search_task_instructions(
-                        task_description=task,
-                        limit=3,
-                        include_steps=True
-                    )
-                )
-                loop.close()
-                logger.info(f"Found {len(task_instructions)} relevant task instructions from LongTermMemory")
-            except Exception as e:
-                logger.warning(f"Failed to retrieve task instructions from LongTermMemory: {e}")
+        required = ApprovalWorkflowEngine.requires_approval(task)
+        if approval_id is not None and (
+            not isinstance(approval_id, str) or len(approval_id) != 36
+            or str(uuid.UUID(approval_id)) != approval_id or uuid.UUID(approval_id).int == 0
+        ):
+            raise ApprovalValidationError("Invalid approval_id.")
+        if not required and approval_id is None:
+            return None, None
+        context = {
+            "task": task,
+            "requested_by": os.getenv("AZURE_CLIENT_ID", ""),
+            "environment": os.getenv("DEPLOYMENT_ENVIRONMENT", ""),
+            "cluster": os.getenv("AKS_CLUSTER_NAME", ""),
+            "namespace": os.getenv("K8S_NAMESPACE", ""),
+            "image_tags": [os.getenv("IMAGE_TAG", "")],
+            "commit_sha": os.getenv("COMMIT_SHA"),
+            "pipeline_url": os.getenv("PIPELINE_URL"),
+            "rollback_url": os.getenv("ROLLBACK_URL"),
+        }
+        engine = get_approval_workflow_engine()
+        if approval_id is None:
+            contract = await engine.initiate_approval(**context)
         else:
-            logger.info("Long-term memory not configured - skipping task instructions lookup")
-        
-        # Step 5: Search for domain facts in Fabric IQ facts memory
-        domain_facts = []
-        if facts_memory:
-            logger.info("Searching for domain facts in Fabric IQ...")
-            try:
-                loop = asyncio.new_event_loop()
-                # Search for facts relevant to the task across all domains
-                fact_results = loop.run_until_complete(
-                    facts_memory.search_facts(
-                        query=task,
-                        domain=None,  # Search all domains
-                        limit=5,
-                    )
-                )
-                loop.close()
-                
-                # Convert fact results to dictionary format for planning
-                for result in fact_results:
-                    domain_facts.append({
-                        'id': result.fact.id,
-                        'statement': result.fact.statement,
-                        'domain': result.fact.domain,
-                        'fact_type': result.fact.fact_type,
-                        'confidence': result.fact.confidence,
-                        'relevance_score': result.score,
-                        'context': result.fact.context,
-                        'evidence': result.fact.evidence,
-                    })
-                logger.info(f"Found {len(domain_facts)} relevant domain facts from Fabric IQ")
-            except Exception as e:
-                logger.warning(f"Failed to retrieve facts from Fabric IQ: {e}")
-        else:
-            logger.info("Fabric IQ facts memory not configured - skipping domain facts lookup")
-        
-        # Step 6: Generate plan based on task, similar past tasks, task instructions, AND domain facts
-        logger.info("Generating execution plan with all memory contexts...")
-        plan_steps = _normalize_plan_steps(generate_plan_with_instructions(task, similar_tasks, task_instructions, domain_facts))
-        
-        # Step 7: Store task in CosmosDB
-        task_doc = {
-            'id': task_id,
-            'task': task,
-            'intent': intent,
-            'embedding': task_embedding,
-            'created_at': timestamp,
-            'similar_task_count': len(similar_tasks),
-            'task_instructions_found': len(task_instructions),
-            'domain_facts_found': len(domain_facts)
-        }
-        cosmos_tasks_container.upsert_item(task_doc)
-        logger.info(f"Task stored in CosmosDB with id: {task_id}")
-        
-        # Step 8: Store plan in CosmosDB
-        plan_doc = {
-            'id': str(uuid.uuid4()),
-            'taskId': task_id,
-            'task': task,
-            'intent': intent,
-            'steps': plan_steps,
-            'similar_tasks_referenced': [{'id': st['id'], 'similarity': st['similarity']} for st in similar_tasks],
-            'task_instructions_used': [ti.get('document_id', '') for ti in task_instructions],
-            'domain_facts_used': [df.get('id', '') for df in domain_facts],
-            'created_at': timestamp,
-            'status': 'planned'
-        }
-        cosmos_plans_container.upsert_item(plan_doc)
-        logger.info(f"Plan stored in CosmosDB for task: {task_id}")
-        
-        # Build response
-        response = {
-            'task_id': task_id,
-            'task': task,
-            'intent': intent,
-            'analysis': {
-                'similar_tasks_found': len(similar_tasks),
-                'similar_tasks': [
-                    {
-                        'task': st['task'],
-                        'intent': st['intent'],
-                        'similarity_score': round(st['similarity'], 3)
-                    }
-                    for st in similar_tasks
-                ],
-                'task_instructions_found': len(task_instructions),
-                'task_instructions': [
-                    {
-                        'title': ti.get('title', ''),
-                        'category': ti.get('category', ''),
-                        'intent': ti.get('intent', ''),
-                        'description': ti.get('description', ''),
-                        'relevance_score': round(ti.get('score', 0), 3),
-                        'estimated_effort': ti.get('estimated_effort', ''),
-                        'reference_steps_count': len(ti.get('steps', []))
-                    }
-                    for ti in task_instructions
-                ],
-                'domain_facts_found': len(domain_facts),
-                'domain_facts': [
-                    {
-                        'id': df.get('id', ''),
-                        'domain': df.get('domain', ''),
-                        'fact_type': df.get('fact_type', ''),
-                        'statement': df.get('statement', '')[:200] + '...' if len(df.get('statement', '')) > 200 else df.get('statement', ''),
-                        'confidence': round(df.get('confidence', 0), 3),
-                        'relevance_score': round(df.get('relevance_score', 0), 3),
-                    }
-                    for df in domain_facts
-                ]
-            },
-            'plan': {
-                'steps': plan_steps,
-                'total_steps': len(plan_steps)
-            },
-            'metadata': {
-                'created_at': timestamp,
-                'embedding_dimensions': len(task_embedding),
-                'stored_in_cosmos': True,
-                'long_term_memory_used': len(task_instructions) > 0,
-                'facts_memory_used': len(domain_facts) > 0,
-                'agents_approval_required': agents_approval_required,
-                'approval_result': approval_result
-            }
-        }
-        
-        return json.dumps(response, indent=2)
-    
-    except Exception as e:
-        logger.error(f"Error in next_best_action: {e}")
-        return json.dumps({"error": str(e)})
+            contract = await engine.resume_approval(approval_id=approval_id, **context)
+        public = contract.to_dict()
+        if approval_id is not None and (
+            contract.decision == "approved" and contract.agent_validation == "passed"
+            and contract.notification_status == "sent"
+        ):
+            expires = datetime.fromisoformat(contract.expires_at.replace("Z", "+00:00"))
+            if expires.tzinfo is not None and datetime.now(timezone.utc) < expires:
+                return None, public
+        decision = contract.decision if contract.decision in {"pending", "rejected", "timeout", "error"} else "error"
+        return {
+            "task": task, "status": f"approval_{decision}",
+            "approval_id": contract.approval_id, "approval_contract": public,
+            "message": "No recommendation generated. Resume this exact task with its approval_id after a verified human approval.",
+        }, None
+    except ApprovalError as error:
+        return {"status": "approval_error", "error": str(error), "error_code": error.status_code}, None
+    except Exception:
+        # Unexpected provider errors may contain signed URLs or credentials.
+        logger.error("Approval checkpoint unavailable; request blocked")
+        return {"status": "approval_error", "error": "Approval could not be verified; request blocked."}, None
 
 
 @ai_function
@@ -2661,7 +2444,7 @@ def create_mcp_agent():
         return None
     
     try:
-        agent_credential = DefaultAzureCredential()
+        agent_credential = _runtime_credential()
         client = AzureAIAgentClient(
             endpoint=FOUNDRY_PROJECT_ENDPOINT,
             credential=agent_credential,
@@ -2758,9 +2541,16 @@ TOOLS = [
                 "task": {
                     "type": "string",
                     "description": "The task description in natural language (English sentence) to analyze and plan"
+                },
+                "approval_id": {
+                    "type": "string",
+                    "description": "Resume a previously requested approval with the identical task; never substitutes for a verified human decision.",
+                    "minLength": 36,
+                    "maxLength": 36
                 }
             },
-            "required": ["task"]
+            "required": ["task"],
+            "additionalProperties": False
         }
     ),
     MCPTool(
@@ -3561,7 +3351,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
             try:
                 from openai import AzureOpenAI
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 # Get a token for Azure Cognitive Services
                 token = credential.get_token("https://cognitiveservices.azure.com/.default")
                 
@@ -3602,12 +3392,14 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 )
         
         elif tool_name == "next_best_action":
+            if not isinstance(arguments, dict) or set(arguments) - {"task", "approval_id"}:
+                return MCPToolResult(content=[{"type": "text", "text": json.dumps({
+                    "status": "approval_error", "error": "Only task and approval_id arguments are accepted."
+                })}])
             task = arguments.get("task")
-            if not task:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": "No task provided"}],
-                    isError=True
-                )
+            blocked, approval_result = await _next_best_action_approval(task, arguments.get("approval_id"))
+            if blocked is not None:
+                return MCPToolResult(content=[{"type": "text", "text": json.dumps(blocked)}])
             
             if not FOUNDRY_PROJECT_ENDPOINT:
                 return MCPToolResult(
@@ -3711,6 +3503,8 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     'domain_facts_count': len(domain_facts),
                     'long_term_memory_used': len(task_instructions) > 0,
                     'facts_memory_used': len(domain_facts) > 0,
+                    'approval_id': approval_result['approval_id'] if approval_result else None,
+                    'approval_request_hash': approval_result['request_hash'] if approval_result else None,
                 }
                 cosmos_tasks_container.upsert_item(task_doc)
                 logger.info(f"Task stored in CosmosDB with id: {task_id}")
@@ -3726,7 +3520,9 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     'task_instructions_used': [{'name': ti.get('name', 'unknown')} for ti in task_instructions] if task_instructions else [],
                     'domain_facts_used': [{'statement': df['statement'][:100]} for df in domain_facts] if domain_facts else [],
                     'created_at': timestamp,
-                    'status': 'planned'
+                    'status': 'planned',
+                    'approval_id': approval_result['approval_id'] if approval_result else None,
+                    'approval_request_hash': approval_result['request_hash'] if approval_result else None,
                 }
                 cosmos_plans_container.upsert_item(plan_doc)
                 logger.info(f"Plan stored in CosmosDB for task: {task_id}")
@@ -3734,6 +3530,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 # Build response
                 response = {
                     'task_id': task_id,
+                    'approval_id': approval_result['approval_id'] if approval_result else None,
                     'task': task,
                     'intent': intent,
                     'analysis': {
@@ -3767,6 +3564,8 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                         'stored_in_cosmos': True,
                         'long_term_memory_used': len(task_instructions) > 0,
                         'facts_memory_used': len(domain_facts) > 0,
+                        'agents_approval_required': approval_result is not None,
+                        'approval_result': approval_result,
                     }
                 }
                 
@@ -4519,7 +4318,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 }
                 
                 # Initialize evaluator with managed identity credential
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 # Use is_reasoning_model=True for gpt-5.x evaluator model that supports max_completion_tokens
                 evaluator = IntentResolutionEvaluator(model_config=model_config, credential=credential, is_reasoning_model=True)
                 
@@ -4588,7 +4387,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     "api_version": "2024-10-21",
                 }
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 # Use is_reasoning_model=True for gpt-5.x evaluator model that supports max_completion_tokens
                 evaluator = ToolCallAccuracyEvaluator(model_config=model_config, credential=credential, is_reasoning_model=True)
                 
@@ -4652,7 +4451,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     "api_version": "2024-10-21",
                 }
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 # Use is_reasoning_model=True for gpt-5.x evaluator model that supports max_completion_tokens
                 evaluator = TaskAdherenceEvaluator(model_config=model_config, credential=credential, is_reasoning_model=True)
                 
@@ -4718,7 +4517,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     "api_version": "2024-10-21",
                 }
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 evaluator = GroundednessEvaluator(model_config=model_config, credential=credential, is_reasoning_model=True)
                 
                 result = evaluator(query=query, response=response, context=context)
@@ -4773,7 +4572,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     "api_version": "2024-10-21",
                 }
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 evaluator = RelevanceEvaluator(model_config=model_config, credential=credential, is_reasoning_model=True)
                 
                 result = evaluator(query=query, response=response)
@@ -4846,7 +4645,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     "api_version": "2024-10-21",
                 }
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 results = {
                     "query": query[:200] + "..." if len(query) > 200 else query,
                     "response_preview": response[:200] + "..." if len(response) > 200 else response,
@@ -5010,7 +4809,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     "api_version": "2024-10-21",
                 }
                 
-                credential = DefaultAzureCredential()
+                credential = _runtime_credential()
                 
                 # Initialize evaluators once
                 # Use is_reasoning_model=True for gpt-5.x evaluator model that supports max_completion_tokens
@@ -5413,6 +5212,18 @@ async def startup_event():
         for provider, is_healthy in health.items():
             status = "healthy" if is_healthy else "unhealthy"
             logger.info(f"Memory provider '{provider}': {status}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close process-owned Agent ID sessions and clear their token caches."""
+    global _runtime_agent_credential, _runtime_agent_async_credential
+    if _runtime_agent_async_credential is not None:
+        await _runtime_agent_async_credential.close()
+        _runtime_agent_async_credential = None
+    if _runtime_agent_credential is not None:
+        await asyncio.to_thread(_runtime_agent_credential.close)
+        _runtime_agent_credential = None
 
 
 @app.post("/agent/chat")

@@ -111,6 +111,29 @@ def test_factory_keeps_bootstrap_mi_id(configured):
     assert os.environ["AZURE_CLIENT_ID"] == MI
 
 
+def test_async_adapter_offloads_token_and_close():
+    sync = Mock()
+    sync.get_token.return_value = AccessToken("agent-token", 5000)
+
+    async def exercise():
+        async_credential = identity.AsyncAgentIdentityCredential(sync)
+        assert await async_credential.get_token(SCOPE) == AccessToken("agent-token", 5000)
+        await async_credential.close()
+
+    import asyncio
+    asyncio.run(exercise())
+    sync.get_token.assert_called_once_with(SCOPE)
+    sync.close.assert_called_once_with()
+
+
+def test_async_factory_requires_enabled_agent_identity(configured, monkeypatch):
+    monkeypatch.setattr(identity, "AsyncAgentIdentityCredential", Mock())
+    assert identity.get_async_agent_credential() is identity.AsyncAgentIdentityCredential.return_value
+    monkeypatch.setenv("AGENT_IDENTITY_ENABLED", "false")
+    with pytest.raises(ValueError, match="false"):
+        identity.get_async_agent_credential()
+
+
 def test_workload_identity_is_selected_without_default_fallback(configured, monkeypatch):
     monkeypatch.setenv("AZURE_FEDERATED_TOKEN_FILE", "projected-token")
     with identity.get_agent_credential():

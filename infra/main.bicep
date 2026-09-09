@@ -93,6 +93,12 @@ param agentIdentityDisplayName string = ''
 @description('Principal ID of sponsor user for agent identity (admin user)')
 param agentSponsorPrincipalId string = ''
 
+@description('Existing Agent Identity Blueprint client/app ID to adopt after the staged identity bootstrap')
+param existingAgentIdentityBlueprintAppId string = ''
+
+@description('Existing Agent Identity object ID to adopt; empty creates or discovers the identity under the blueprint')
+param existingAgentIdentityId string = ''
+
 @description('Principal ID of developer user for local development Cosmos DB access (optional)')
 param developerPrincipalId string = ''
 
@@ -112,7 +118,19 @@ param teamsChannelId string = ''
 param teamsGroupId string = ''
 
 @description('Approval timeout in hours')
+@minValue(1)
+@maxValue(24)
 param approvalTimeoutHours int = 2
+
+@description('Existing callback application ID URI (api://<client-GUID>), required when approvals are enabled without Agent Identity. The application must already exist in this tenant; no permissions are granted here.')
+@maxLength(42)
+param existingApprovalCallbackAppUri string = ''
+
+@description('Explicit comma-separated approver Entra user object IDs. Never inferred from the agent sponsor. Empty leaves the workflow disabled and runtime configuration fails closed.')
+param approvalApproverIds string = ''
+
+@description('Explicit Teams human approver tenant, if different from the hosting subscription tenant. Does not relax callback JWT tenant validation or grant cross-tenant consent.')
+param approvalApproverTenantId string = ''
 
 // =========================================
 // Azure Managed Grafana Configuration
@@ -277,11 +295,12 @@ module agentIdentityBlueprint './core/identity/agentIdentityBlueprint.bicep' = i
     tags: tags
     blueprintDisplayName: agentBlueprintName
     blueprintUniqueName: 'nba-blueprint-${resourceToken}'
-    federatedIdentityClientId: mcpUserAssignedIdentity.outputs.identityName
+    managedIdentityResourceId: mcpUserAssignedIdentity.outputs.identityId
     federatedIdentityPrincipalId: mcpUserAssignedIdentity.outputs.identityPrincipalId
     sponsorPrincipalIds: !empty(agentSponsorPrincipalId) ? [agentSponsorPrincipalId] : []
     ownerPrincipalIds: !empty(agentSponsorPrincipalId) ? [agentSponsorPrincipalId] : []
     agentScopeValue: 'next_best_action'
+    existingBlueprintAppId: existingAgentIdentityBlueprintAppId
   }
 }
 
@@ -296,6 +315,7 @@ module nextBestActionAgentIdentity './core/identity/agentIdentity.bicep' = if (a
     blueprintAppId: agentIdentityBlueprint!.outputs.blueprintAppId
     managedIdentityResourceId: mcpUserAssignedIdentity.outputs.identityId
     sponsorPrincipalIds: !empty(agentSponsorPrincipalId) ? [agentSponsorPrincipalId] : []
+    existingAgentIdentityId: existingAgentIdentityId
   }
 }
 
@@ -439,8 +459,8 @@ module agentFederatedCredential './core/identity/aksFederatedCredential.bicep' =
     aksClusterName: aksCluster.outputs.aksClusterName
     serviceAccountNamespace: 'mcp-agents'
     serviceAccountName: 'mcp-agent-sa'
-    identityClientId: nextBestActionAgentIdentity!.outputs.agentIdentityAppId
-    identityPrincipalId: nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId
+    blueprintAppId: agentIdentityBlueprint!.outputs.blueprintAppId
+    blueprintObjectId: agentIdentityBlueprint!.outputs.blueprintObjectId
     federatedCredentialName: 'aks-mcp-agent-fed'
     configurationIdentityResourceId: mcpUserAssignedIdentity.outputs.identityId
   }
@@ -1017,6 +1037,7 @@ module agentRoleAssignments './app/agent-RoleAssignments.bicep' = if (agentIdent
     agentPrincipalId: nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId
     cosmosAccountName: cosmosAccount.outputs.name
     searchServiceName: searchEnabled ? searchService.outputs.name : ''
+    searchEnabled: searchEnabled
     storageAccountName: storage.outputs.name
     foundryAccountName: foundry.outputs.foundryAccountName
   }
@@ -1036,7 +1057,16 @@ module appInsightsRoleAssignmentAgent './core/monitor/appinsights-access.bicep' 
 // =========================================
 // Agents Approval Logic App
 // =========================================
-// Deploys Azure Logic App for Teams-based approval workflow with CosmosDB audit logging
+// Derive routing from the gateway, NOT the callback module (which needs the
+// workflow's system principal). The dependency direction is gateway -> workflow -> callback API.
+var approvalCallbackUrl = '${apimService.outputs.gatewayUrl}/agent-approvals/callback'
+var approvalCallbackAudience = !empty(trim(existingApprovalCallbackAppUri))
+  ? toLower(trim(existingApprovalCallbackAppUri))
+  : (agentIdentityEnabled ? 'api://${agentIdentityBlueprint!.outputs.blueprintAppId}' : '')
+// Keep malformed/empty comma-list entries visible to validation; never widen the allowlist.
+var approvalApproverIdList = empty(trim(approvalApproverIds)) ? [] : map(split(approvalApproverIds, ','), id => toLower(trim(id)))
+
+// The workflow transports Teams decisions; Python owns approval/audit writes.
 module agentsApprovalLogicApp './app/agents-approval-logicapp.bicep' = if (approvalLogicAppEnabled) {
   name: 'agentsApprovalLogicApp'
   scope: rg
@@ -1045,12 +1075,31 @@ module agentsApprovalLogicApp './app/agents-approval-logicapp.bicep' = if (appro
     location: location
     tags: tags
     cosmosDbAccountName: cosmosAccount.outputs.name
-    cosmosDbDatabaseName: cosmosDatabaseName
+    cosmosDbDatabaseName: cosmosDatabase.outputs.name
     cosmosDbContainerName: 'approvals'
     teamsChannelId: teamsChannelId
     teamsGroupId: teamsGroupId
     approvalTimeoutHours: approvalTimeoutHours
-    userAssignedIdentityId: mcpUserAssignedIdentity.outputs.identityId
+    callbackUrl: approvalCallbackUrl
+    callbackAudience: approvalCallbackAudience
+    approverIds: approvalApproverIdList
+    approverTenantId: empty(approvalApproverTenantId) ? tenant().tenantId : approvalApproverTenantId
+  }
+  // The child declares the database as existing and creates its approvals container.
+  dependsOn: [
+    cosmosDatabase
+  ]
+}
+
+module apimApprovalCallback './app/apim-approval-callback.bicep' = if (approvalLogicAppEnabled) {
+  name: 'apimApprovalCallback'
+  scope: rg
+  params: {
+    apimServiceName: apimService.outputs.name
+    backendUrl: 'http://10.0.4.4'
+    tenantId: tenant().tenantId
+    callbackAudience: approvalCallbackAudience
+    logicAppPrincipalId: agentsApprovalLogicApp!.outputs.logicAppPrincipalId
   }
 }
 
@@ -1140,6 +1189,7 @@ module purviewScanCosmosRole './app/cosmos-RoleAssignment.bicep' = if (purviewEn
 output APPLICATIONINSIGHTS_CONNECTION_STRING string = monitoring.outputs.applicationInsightsConnectionString
 output AZURE_LOCATION string = location
 output AZURE_TENANT_ID string = tenant().tenantId
+output DEPLOYMENT_ENVIRONMENT string = environmentName
 output AKS_CLUSTER_NAME string = aksCluster.outputs.aksClusterName
 output CONTAINER_REGISTRY string = containerRegistry.outputs.containerRegistryLoginServer
 output AZURE_STORAGE_ACCOUNT_URL string = storage.outputs.primaryEndpoints.blob
@@ -1198,6 +1248,7 @@ output FABRIC_API_ENDPOINT string = fabricEnabled ? 'https://api.fabric.microsof
 // =========================================
 output AGENT_IDENTITY_ENABLED bool = agentIdentityEnabled
 output AGENT_IDENTITY_BLUEPRINT_APP_ID string = agentIdentityEnabled ? agentIdentityBlueprint!.outputs.blueprintAppId : ''
+output AGENT_IDENTITY_BLUEPRINT_OBJECT_ID string = agentIdentityEnabled ? agentIdentityBlueprint!.outputs.blueprintObjectId : ''
 output AGENT_IDENTITY_APP_ID string = agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentIdentityAppId : ''
 output AGENT_IDENTITY_PRINCIPAL_ID string = agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId : ''
 output AGENT_IDENTITY_DISPLAY_NAME string = agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentDisplayName : ''
@@ -1205,9 +1256,23 @@ output AGENT_IDENTITY_DISPLAY_NAME string = agentIdentityEnabled ? nextBestActio
 // =========================================
 // Agents Approval Logic App outputs
 // =========================================
+// Non-secret configuration only. Retrieve the SAS trigger URL in memory after
+// provisioning and send it directly to Kubernetes Secret stdin, never to azd outputs.
 output APPROVAL_LOGIC_APP_ENABLED bool = approvalLogicAppEnabled
-output APPROVAL_LOGIC_APP_TRIGGER_URL string = approvalLogicAppEnabled ? agentsApprovalLogicApp!.outputs.logicAppTriggerUrl : ''
-output APPROVAL_LOGIC_APP_NAME string = approvalLogicAppEnabled ? agentsApprovalLogicApp!.outputs.logicAppName : ''
+// Group these fields so the complete parent stays below ARM's 64-output limit.
+// configure_approval_runtime.py accepts this object (or its azd JSON encoding),
+// as well as the legacy individual settings used by scoped deployments.
+output APPROVAL_RUNTIME_CONFIG object = {
+  APPROVAL_LOGIC_APP_NAME: approvalLogicAppEnabled ? agentsApprovalLogicApp!.outputs.logicAppName : ''
+  APPROVAL_LOGIC_APP_RESOURCE_ID: approvalLogicAppEnabled ? agentsApprovalLogicApp!.outputs.logicAppId : ''
+  APPROVAL_CALLBACK_URL: approvalLogicAppEnabled ? approvalCallbackUrl : ''
+  APPROVAL_CALLBACK_AUDIENCE: approvalLogicAppEnabled ? approvalCallbackAudience : ''
+  APPROVAL_CALLBACK_PRINCIPAL_ID: approvalLogicAppEnabled ? agentsApprovalLogicApp!.outputs.logicAppPrincipalId : ''
+  COSMOSDB_APPROVALS_CONTAINER: approvalLogicAppEnabled ? agentsApprovalLogicApp!.outputs.approvalsContainerName : ''
+  APPROVAL_APPROVER_IDS: join(approvalApproverIdList, ',')
+  APPROVAL_APPROVER_TENANT_ID: empty(approvalApproverTenantId) ? tenant().tenantId : toLower(trim(approvalApproverTenantId))
+  APPROVAL_TIMEOUT_HOURS: approvalTimeoutHours
+}
 
 // =========================================
 // Azure Managed Grafana outputs

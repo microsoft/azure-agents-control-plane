@@ -18,6 +18,7 @@ Dependencies azure-identity, azure-core and requests already exist in the app.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -248,4 +249,33 @@ def get_agent_credential() -> TokenCredential:
         return DefaultAzureCredential()
     if enabled in ("true", "1"):
         return AgentIdentityCredential()
+    raise ValueError("AGENT_IDENTITY_ENABLED must be true/false or 1/0")
+
+
+class AsyncAgentIdentityCredential:
+    """Async adapter for SDKs that require an asynchronous token credential."""
+
+    def __init__(self, credential: AgentIdentityCredential | None = None) -> None:
+        self._credential = credential or AgentIdentityCredential()
+
+    async def get_token(self, *scopes: str, **kwargs: Any) -> AccessToken:
+        return await asyncio.to_thread(self._credential.get_token, *scopes, **kwargs)
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._credential.close)
+
+    async def __aenter__(self) -> AsyncAgentIdentityCredential:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self.close()
+
+
+def get_async_agent_credential() -> AsyncAgentIdentityCredential:
+    """Return an async Agent ID credential only when Agent ID is enabled."""
+    enabled = os.getenv("AGENT_IDENTITY_ENABLED", "false").strip().lower()
+    if enabled in ("true", "1"):
+        return AsyncAgentIdentityCredential()
+    if enabled in ("false", "0"):
+        raise ValueError("Async Agent Identity credential requested while AGENT_IDENTITY_ENABLED is false")
     raise ValueError("AGENT_IDENTITY_ENABLED must be true/false or 1/0")

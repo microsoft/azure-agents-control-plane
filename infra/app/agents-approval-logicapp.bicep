@@ -46,21 +46,20 @@ param callbackUrl string = ''
 @maxLength(42)
 param callbackAudience string = ''
 
-@description('Allowed approver Entra user object IDs (GUIDs), in this subscription tenant. Request approvers may narrow but never widen this list. Empty disables the workflow.')
+@description('Allowed approver Entra user object IDs (GUIDs), in approverTenantId. Request approvers may narrow but never widen this list. Empty disables the workflow.')
 @maxLength(100)
 param approverIds string[] = []
+
+@description('Explicit tenant of the Teams human approvers. The Logic App managed-identity callback remains in the subscription tenant. Changing this never grants cross-tenant consent or bypasses connector policies.')
+@minLength(36)
+@maxLength(36)
+param approverTenantId string = subscription().tenantId
 
 // Stage 1 creates the system identity, connection and container without routing.
 // Authorize the Teams OAuth connection as a user, wire APIM with the principal
 // output, then provide routing. The workflow also validates configuration before
 // any outbound call, including if an operator manually enables an incomplete app.
-var workflowConfigured = !empty(trim(teamsChannelId))
-  && !empty(trim(teamsGroupId))
-  && !empty(approverIds)
-  && startsWith(callbackUrl, 'https://')
-  && endsWith(callbackUrl, '/agent-approvals/callback')
-  && startsWith(callbackAudience, 'api://')
-  && length(callbackAudience) == 42
+var workflowConfigured = !empty(trim(teamsChannelId)) && !empty(trim(teamsGroupId)) && !empty(approverIds) && startsWith(callbackUrl, 'https://') && endsWith(callbackUrl, '/agent-approvals/callback') && startsWith(callbackAudience, 'api://') && length(callbackAudience) == 42
 
 resource cosmosDbAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' existing = {
   name: cosmosDbAccountName
@@ -123,7 +122,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
         value: map(approverIds, id => toLower(trim(id)))
       }
       approverTenantId: {
-        value: toLower(subscription().tenantId)
+        value: toLower(trim(approverTenantId))
       }
     }
   }

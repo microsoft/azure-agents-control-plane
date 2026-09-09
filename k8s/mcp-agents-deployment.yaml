@@ -6,29 +6,29 @@ metadata:
     azure.workload.identity/use: "true"
 ---
 # =========================================
-# ServiceAccount for Entra Agent Identity (Primary - AI Agent Workloads)
+# Alternate bootstrap ServiceAccount (pods use mcp-agents-sa below)
 # =========================================
-# This service account uses the Entra Agent Identity for AI agent operations.
-# Provides better governance, audit trails, and purpose-built identity for AI agents.
+# Workload identity starts as the MCP UAMI, never the child Agent Identity.
+# Agent/blueprint IDs are separate inputs to the application's token exchange.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: mcp-agent-sa
   namespace: mcp-agents
   annotations:
-    # Entra Agent Identity App ID (client ID)
-    azure.workload.identity/client-id: "${AGENT_IDENTITY_APP_ID}"
+    # Bootstrap User Assigned Managed Identity Client ID
+    azure.workload.identity/client-id: "${MCP_SERVER_IDENTITY_CLIENT_ID}"
     azure.workload.identity/tenant-id: "${AZURE_TENANT_ID}"
   labels:
     azure.workload.identity/use: "true"
     app: mcp-agents
-    identity-type: entra-agent-identity
+    identity-type: managed-identity-bootstrap
 ---
 # =========================================
-# Legacy ServiceAccount (Retained for Deployment Scripts)
+# Runtime bootstrap ServiceAccount
 # =========================================
 # This service account uses the User Assigned Managed Identity (id-mcp-*).
-# Retained for deployment scripts that create Agent Identity Blueprints.
+# The hooks retain its ARM workload-identity federated credential.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -37,10 +37,11 @@ metadata:
   annotations:
     # User Assigned Managed Identity Client ID (id-mcp-*)
     azure.workload.identity/client-id: "${MCP_SERVER_IDENTITY_CLIENT_ID}"
+    azure.workload.identity/tenant-id: "${AZURE_TENANT_ID}"
   labels:
     azure.workload.identity/use: "true"
     app: mcp-agents
-    identity-type: managed-identity-legacy
+    identity-type: managed-identity-bootstrap
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -63,7 +64,7 @@ spec:
         agent: next-best-action
       annotations:
         # Entra Agent Identity metadata
-        entra.agent-id/enabled: "true"
+        entra.agent-id/enabled: "${AGENT_IDENTITY_ENABLED}"
         entra.agent-id/blueprint-app-id: "${AGENT_IDENTITY_BLUEPRINT_APP_ID}"
     spec:
       # Use mcp-agents-sa which has working federated credentials
@@ -76,21 +77,45 @@ spec:
         - containerPort: 8000
           name: http
           protocol: TCP
+        # Tenant, cluster/environment and callback policy come from the ConfigMap.
+        # Missing approval configuration must fail closed for deployment requests,
+        # but must not prevent unrelated application functions from starting.
+        envFrom:
+        - configMapRef:
+            name: mcp-approval-config
+            optional: true
+        - secretRef:
+            name: mcp-approval-secrets
+            optional: true
         env:
         # =========================================
         # Entra Agent Identity Configuration
         # =========================================
         - name: AGENT_IDENTITY_ENABLED
-          value: "true"
+          value: "${AGENT_IDENTITY_ENABLED}"
         - name: AZURE_CLIENT_ID
+          value: "${MCP_SERVER_IDENTITY_CLIENT_ID}"
+        - name: AGENT_IDENTITY_APP_ID
           value: "${AGENT_IDENTITY_APP_ID}"
         - name: AGENT_IDENTITY_BLUEPRINT_APP_ID
           value: "${AGENT_IDENTITY_BLUEPRINT_APP_ID}"
         - name: AGENT_IDENTITY_DISPLAY_NAME
           value: "${AGENT_IDENTITY_DISPLAY_NAME}"
-        # Legacy identity reference (for deployment scripts only)
+        # Bootstrap identity, distinct from both Agent Identity IDs
         - name: MCP_SERVER_IDENTITY_CLIENT_ID
           value: "${MCP_SERVER_IDENTITY_CLIENT_ID}"
+        # =========================================
+        # Trusted deployment context (not supplied by model/tool arguments)
+        # Cluster/environment are injected once, via mcp-approval-config above.
+        # =========================================
+        - name: K8S_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: IMAGE_TAG
+          value: "${IMAGE_TAG}"
+        - name: COMMIT_SHA
+          value: "${COMMIT_SHA}"
         # =========================================
         # Azure Storage Configuration
         # =========================================

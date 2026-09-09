@@ -232,6 +232,20 @@ def get_callback_auth_settings() -> CallbackAuthSettings:
     return CallbackAuthSettings(tenant, f"api://{audience_id}", principal)
 
 
+def get_approver_tenant_id() -> str:
+    """Pin the Teams human tenant independently of the callback/hosting tenant.
+
+    No identity is inferred from callback input. An explicit empty/invalid
+    setting fails closed; only absence retains the single-tenant default.
+    """
+    try:
+        return _guid(os.getenv(
+            "APPROVAL_APPROVER_TENANT_ID", os.getenv("AZURE_TENANT_ID", ""),
+        ).strip(), "APPROVAL_APPROVER_TENANT_ID")
+    except ApprovalValidationError:
+        raise ApprovalConfigurationError("Approval human tenant configuration is missing or invalid.") from None
+
+
 @dataclass
 class ApprovalContract:
     approval_id: str
@@ -366,10 +380,7 @@ class ApprovalWorkflowEngine:
 
     def _validate_document(self, doc: Any, approval_id: str, environment: str) -> dict[str, Any]:
         """Reject legacy, corrupt, or incomplete state rather than trusting a flag."""
-        try:
-            tenant = _guid(os.getenv("AZURE_TENANT_ID", "").strip(), "AZURE_TENANT_ID")
-        except ApprovalValidationError:
-            raise ApprovalConfigurationError("AZURE_TENANT_ID is missing or invalid.") from None
+        tenant = get_approver_tenant_id()
         try:
             if (
                 not isinstance(doc, dict) or doc.get("id") != approval_id
@@ -523,14 +534,15 @@ class ApprovalWorkflowEngine:
         if recording it also fails, a storage error is raised instead.
         """
         context = _request_context(task, requested_by, environment, cluster, namespace, image_tags, commit_sha, pipeline_url, rollback_url)
-        settings = get_callback_auth_settings()
+        get_callback_auth_settings()
+        approver_tenant = get_approver_tenant_id()
         try:
             raw_approvers = os.getenv("APPROVAL_APPROVER_IDS", "").split(",")
             if not 1 <= len(raw_approvers) <= 100:
                 raise ValueError
             approvers = sorted({_guid(value.strip(), "APPROVAL_APPROVER_IDS") for value in raw_approvers})
             timeout = float(os.getenv("APPROVAL_TIMEOUT_HOURS", "2"))
-            if not math.isfinite(timeout) or not 0 < timeout <= 168:
+            if not math.isfinite(timeout) or not 0 < timeout <= 24:
                 raise ValueError
         except (ValueError, ApprovalValidationError):
             raise ApprovalConfigurationError("Approval approvers or timeout configuration is missing or invalid.") from None
@@ -551,7 +563,7 @@ class ApprovalWorkflowEngine:
         contract = ApprovalContract(
             approval_id=str(uuid4()), **context, request_hash=_digest(context),
             request_timestamp=_timestamp(now), expires_at=_timestamp(now + timedelta(hours=timeout)),
-            approvers=approvers, approval_tenant_id=settings.tenant_id,
+            approvers=approvers, approval_tenant_id=approver_tenant,
         )
         await self._create({
             **contract.to_dict(), "id": contract.approval_id,
@@ -562,8 +574,8 @@ class ApprovalWorkflowEngine:
             "request_timestamp": contract.request_timestamp, "expires_at": contract.expires_at,
             "approvers": list(approvers),
         }
-        if callback_url:
-            payload["callback_url"] = callback_url
+        # The callback route is fixed in the workflow deployment. Never allow
+        # a trigger payload to choose where the managed-identity token is sent.
         sent = False
         try:
             await (self._transport or configured_transport).send(payload)

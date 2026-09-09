@@ -7,6 +7,9 @@ azure-ai-evaluation>=1.14.0
 aiohttp
 pydantic>=2.9.0
 
+# Verify the Logic App callback JWT using tenant-pinned signing keys.
+PyJWT[crypto]>=2.10.1,<3
+
 # Microsoft Agent Framework
 # Pin version to avoid breaking changes
 agent-framework-azure-ai==1.0.0b260107

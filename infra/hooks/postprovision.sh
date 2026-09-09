@@ -39,6 +39,73 @@ case "$MCP_AGENT_RUNTIME" in
     exit 1
     ;;
 esac
+TENANT_ID=$(printf '%s' "${AZURE_TENANT_ID:-}" | tr -d '"')
+AGENT_IDENTITY_FLAG=$(printf '%s' "${AGENT_IDENTITY_ENABLED:-false}" | tr -d '"' | tr '[:upper:]' '[:lower:]')
+AGENT_REGISTRY_FLAG=$(printf '%s' "${AGENT_REGISTRY_ENABLED:-false}" | tr -d '"' | tr '[:upper:]' '[:lower:]')
+APPROVAL_ENABLED=$(printf '%s' "${APPROVAL_LOGIC_APP_ENABLED:-false}" | tr -d '"' | tr '[:upper:]' '[:lower:]')
+for flag in "$AGENT_IDENTITY_FLAG" "$AGENT_REGISTRY_FLAG" "$APPROVAL_ENABLED"; do
+  case "$flag" in
+    true|false) ;;
+    *) echo 'AGENT_IDENTITY_ENABLED, AGENT_REGISTRY_ENABLED and APPROVAL_LOGIC_APP_ENABLED must be true or false.'; exit 1 ;;
+  esac
+done
+if [ "$AGENT_REGISTRY_FLAG" = 'true' ] && [ "$AGENT_IDENTITY_FLAG" != 'true' ]; then
+  echo 'Agent Registry publication requires AGENT_IDENTITY_ENABLED=true.'
+  exit 1
+fi
+AGENT_APP_ID=$(printf '%s' "${AGENT_IDENTITY_APP_ID:-}" | tr -d '"')
+AGENT_BLUEPRINT_APP_ID=$(printf '%s' "${AGENT_IDENTITY_BLUEPRINT_APP_ID:-}" | tr -d '"')
+AGENT_BLUEPRINT_OBJECT_ID=$(printf '%s' "${AGENT_IDENTITY_BLUEPRINT_OBJECT_ID:-}" | tr -d '"')
+if [ "$AGENT_IDENTITY_FLAG" = 'true' ] && { [ -z "$AGENT_APP_ID" ] || [ -z "$AGENT_BLUEPRINT_APP_ID" ]; }; then
+  echo 'Enabled Agent Identity requires its actual app and blueprint IDs; the bootstrap UAMI is not a substitute.'
+  exit 1
+fi
+if [ "$AGENT_REGISTRY_FLAG" = 'true' ] && [ -z "$AGENT_BLUEPRINT_OBJECT_ID" ]; then
+  echo 'Agent Registry publication requires AGENT_IDENTITY_BLUEPRINT_OBJECT_ID.'
+  exit 1
+fi
+for id in "$AGENT_APP_ID" "$AGENT_BLUEPRINT_APP_ID" "$AGENT_BLUEPRINT_OBJECT_ID"; do
+  if [[ -n "$id" && ! "$id" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    echo 'Invalid Agent Identity app or blueprint ID.'
+    exit 1
+  fi
+done
+AGENT_REGISTRY_API_VALUE=$(printf '%s' "${AGENT_REGISTRY_API:-agent365}" | tr -d '"' | tr '[:upper:]' '[:lower:]')
+case "$AGENT_REGISTRY_API_VALUE" in
+  agent365|entra-beta) ;;
+  *) echo 'AGENT_REGISTRY_API must be agent365 or entra-beta.'; exit 1 ;;
+esac
+AGENT_REGISTRY_OWNER_IDS_VALUE=$(printf '%s' "${AGENT_REGISTRY_OWNER_IDS:-}" | tr -d '"')
+IFS=',' read -r -a AGENT_REGISTRY_OWNERS <<< "$AGENT_REGISTRY_OWNER_IDS_VALUE"
+if [ "$AGENT_REGISTRY_FLAG" = 'true' ] && [ -z "$AGENT_REGISTRY_OWNER_IDS_VALUE" ]; then
+  echo 'Agent Registry publication requires AGENT_REGISTRY_OWNER_IDS.'
+  exit 1
+fi
+for id in "${AGENT_REGISTRY_OWNERS[@]}"; do
+  id=$(printf '%s' "$id" | xargs)
+  if [[ -n "$id" && ! "$id" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]]; then
+    echo 'AGENT_REGISTRY_OWNER_IDS must contain comma-separated GUIDs.'
+    exit 1
+  fi
+done
+AGENT_ENDPOINT=$(printf '%s' "${MCP_BASE_URL:-}" | tr -d '"')
+AGENT_DISPLAY_NAME=$(printf '%s' "${AGENT_IDENTITY_DISPLAY_NAME:-}" | tr -d '"')
+DEPLOYMENT_ENVIRONMENT_VALUE="${DEPLOYMENT_ENVIRONMENT:-${AZURE_ENV_NAME:-}}"
+COMMIT_VALUE="${COMMIT_SHA:-}"
+if [[ -n "$COMMIT_VALUE" && ! "$COMMIT_VALUE" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+  echo 'COMMIT_SHA must be empty or a hexadecimal commit ID.'
+  exit 1
+fi
+if [ "$APPROVAL_ENABLED" = 'true' ] || [ "$AGENT_REGISTRY_FLAG" = 'true' ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    DEPLOYMENT_PYTHON=python3
+  elif command -v python >/dev/null 2>&1; then
+    DEPLOYMENT_PYTHON=python
+  else
+    echo 'Approval and registry deployment helpers require Python 3.10+ on PATH; configure it separately. No interpreter is installed by this step.'
+    exit 1
+  fi
+fi
 
 echo "  AKS Cluster: $AKS_NAME"
 echo "  Resource Group: $RG_NAME"
@@ -86,8 +153,15 @@ echo "📄 Configuring Kubernetes manifests..."
 # Read and configure deployment template
 sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
   -e "s|\${IMAGE_TAG}|$IMAGE_TAG|g" \
+  -e "s|\${COMMIT_SHA}|$COMMIT_VALUE|g" \
     -e "s|\${AZURE_STORAGE_ACCOUNT_URL}|$STORAGE_URL|g" \
     -e "s|\${AZURE_CLIENT_ID}|$MCP_IDENTITY_CLIENT_ID|g" \
+    -e "s|\${AZURE_TENANT_ID}|$TENANT_ID|g" \
+    -e "s|\${MCP_SERVER_IDENTITY_CLIENT_ID}|$MCP_IDENTITY_CLIENT_ID|g" \
+    -e "s|\${AGENT_IDENTITY_ENABLED}|$AGENT_IDENTITY_FLAG|g" \
+    -e "s|\${AGENT_IDENTITY_APP_ID}|$AGENT_APP_ID|g" \
+    -e "s|\${AGENT_IDENTITY_BLUEPRINT_APP_ID}|$AGENT_BLUEPRINT_APP_ID|g" \
+    -e "s|\${AGENT_IDENTITY_DISPLAY_NAME}|$AGENT_DISPLAY_NAME|g" \
     -e "s|\${FOUNDRY_PROJECT_ENDPOINT}|$FOUNDRY_ENDPOINT|g" \
     -e "s|\${FOUNDRY_MODEL_DEPLOYMENT_NAME}|$FOUNDRY_MODEL|g" \
     -e "s|\${EMBEDDING_MODEL_DEPLOYMENT_NAME}|$EMBEDDING_MODEL|g" \
@@ -99,6 +173,7 @@ sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
     -e "s|\${AZURE_SEARCH_INDEX_NAME}|$SEARCH_INDEX|g" \
     -e "s|\${AZURE_SEARCH_KNOWLEDGE_BASE_NAME}|task-instructions-kb|g" \
     -e "s|\${FABRIC_API_ENDPOINT}||g" \
+    -e "s|\${ONTOLOGY_CONTAINER_NAME}|${ONTOLOGY_CONTAINER_NAME:-ontologies}|g" \
     ./k8s/mcp-agents-deployment.yaml > ./k8s/mcp-agents-deployment-configured.yaml
 echo "  ✅ Configured mcp-agents-deployment-configured.yaml"
 
@@ -140,6 +215,19 @@ export IMAGE_TAG
 # Deploy to Kubernetes
 echo ""
 echo "🚀 Deploying to Kubernetes..."
+# Inject approval runtime only after the namespace exists and before any rollout.
+if [ "$APPROVAL_ENABLED" = 'true' ]; then
+  printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"mcp-agents"}}' | kubectl apply -f -
+  # The helper reads grouped/legacy non-secret outputs as JSON, not shell code.
+  # It alone retrieves and streams the signed URL to Kubernetes Secret stdin.
+  "$DEPLOYMENT_PYTHON" ./scripts/configure_approval_runtime.py --apply --from-azd \
+    --subscription-id="$(printf '%s' "$AZURE_SUBSCRIPTION_ID" | tr -d '"')" \
+    --resource-group="$RG_NAME" \
+    --namespace=mcp-agents \
+    --tenant-id="$TENANT_ID" \
+    --environment="$DEPLOYMENT_ENVIRONMENT_VALUE" \
+    --cluster-name="$AKS_NAME"
+fi
 kubectl apply -f ./k8s/mcp-agents-deployment-configured.yaml
 kubectl apply -f ./k8s/mcp-agents-loadbalancer-configured.yaml
 kubectl rollout restart deployment/mcp-agents -n mcp-agents
@@ -148,6 +236,29 @@ kubectl rollout restart deployment/mcp-agents -n mcp-agents
 echo ""
 echo "⏳ Waiting for deployment to be ready..."
 kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
+
+if [ "$AGENT_REGISTRY_FLAG" = 'true' ]; then
+  if [ -z "$AGENT_ENDPOINT" ] || [ -z "$AGENT_DISPLAY_NAME" ] || [ -z "$DEPLOYMENT_ENVIRONMENT_VALUE" ]; then
+    echo 'Agent Registry publication requires MCP_BASE_URL, AGENT_IDENTITY_DISPLAY_NAME and AZURE_ENV_NAME deployment values.'
+    exit 1
+  fi
+  echo ""
+  echo "📇 Publishing agent to the Agent 365 registry..."
+  registry_args=(
+    ./scripts/publish_agent_registry.py --publish "--api=$AGENT_REGISTRY_API_VALUE"
+    "--endpoint=$AGENT_ENDPOINT" "--agent-identity-id=$AGENT_APP_ID"
+    "--blueprint-object-id=$AGENT_BLUEPRINT_OBJECT_ID"
+    "--display-name=$AGENT_DISPLAY_NAME" "--tenant-id=$TENANT_ID"
+  )
+  for owner_id in "${AGENT_REGISTRY_OWNERS[@]}"; do
+    owner_id=$(printf '%s' "$owner_id" | xargs)
+    [ -n "$owner_id" ] && registry_args+=("--owner-id=$owner_id")
+  done
+  export AGENT_REGISTRY_ENABLED=true
+  export AZURE_ENV_NAME="$DEPLOYMENT_ENVIRONMENT_VALUE"
+  "$DEPLOYMENT_PYTHON" "${registry_args[@]}"
+  echo "✅ Agent 365 registry publication complete"
+fi
 
 # Wait for LoadBalancer to get its private IP
 echo ""

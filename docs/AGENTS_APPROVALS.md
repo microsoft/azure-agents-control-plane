@@ -1,5 +1,14 @@
 # Microsoft Agent 365 / Entra Agent Registry
 
+> **Verified implementation (2026-09-09):** The Python `next_best_action`
+> deployment/CI-CD approval flow passed a live Teams approval, authenticated
+> callback, durable Cosmos validation, and same-request resume test on AKS.
+> This page below contains historical design/demo examples, including removed
+> APIs; use the [current test report and runbook](AGENTS_APPROVAL_FLOW_VALIDATION.md)
+> and [exported activity diagram](AGENTS_APPROVAL_FLOW.mermaid) instead.
+> Approval gates recommendation generation for deployment requests, not every
+> tool or an automatically executed deployment.
+
 ## Agent Registration and Agents Approval System
 
 This folder contains the artifacts for Microsoft Agent 365 registration and the agent approval workflow system with Microsoft Teams human-in-the-loop integration.

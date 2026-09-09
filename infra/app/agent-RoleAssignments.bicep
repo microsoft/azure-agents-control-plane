@@ -11,6 +11,9 @@ param cosmosAccountName string
 @description('Azure AI Search service name')
 param searchServiceName string
 
+@description('Whether Azure AI Search is deployed and should receive Agent Identity role assignments')
+param searchEnabled bool = true
+
 @description('Storage account name')
 param storageAccountName string
 
@@ -63,12 +66,12 @@ resource cosmosRoleAssignmentAgent 'Microsoft.DocumentDB/databaseAccounts/sqlRol
 // Azure AI Search Role Assignments
 // =========================================
 
-resource searchService 'Microsoft.Search/searchServices@2024-06-01-preview' existing = {
+resource searchService 'Microsoft.Search/searchServices@2024-06-01-preview' existing = if (searchEnabled) {
   name: searchServiceName
 }
 
 // Search Index Data Contributor - read/write data in indexes
-resource searchIndexDataContributorAgent 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource searchIndexDataContributorAgent 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (searchEnabled) {
   name: guid(searchService.id, agentPrincipalId, SearchIndexDataContributor, deploymentSuffix)
   scope: searchService
   properties: {
@@ -79,7 +82,7 @@ resource searchIndexDataContributorAgent 'Microsoft.Authorization/roleAssignment
 }
 
 // Search Service Contributor - manage indexes and knowledge bases
-resource searchServiceContributorAgent 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+resource searchServiceContributorAgent 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (searchEnabled) {
   name: guid(searchService.id, agentPrincipalId, SearchServiceContributor, deploymentSuffix)
   scope: searchService
   properties: {
@@ -154,8 +157,8 @@ resource openAIContributorAgent 'Microsoft.Authorization/roleAssignments@2022-04
 // =========================================
 
 output cosmosRoleAssignmentId string = cosmosRoleAssignmentAgent.id
-output searchIndexRoleAssignmentId string = searchIndexDataContributorAgent.id
-output searchServiceRoleAssignmentId string = searchServiceContributorAgent.id
+output searchIndexRoleAssignmentId string = searchEnabled ? searchIndexDataContributorAgent!.id : ''
+output searchServiceRoleAssignmentId string = searchEnabled ? searchServiceContributorAgent!.id : ''
 output storageBlobRoleAssignmentId string = storageBlobDataOwnerAgent.id
 output storageQueueRoleAssignmentId string = storageQueueDataContributorAgent.id
 output foundryOpenAIUserRoleAssignmentId string = openAIUserAgent.id

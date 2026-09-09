@@ -91,7 +91,7 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         self.assertEqual(set(re.findall(r"(?m)^param (\w+) ", self.logic_module)), {
             "logicAppName", "location", "tags", "cosmosDbAccountName",
             "cosmosDbDatabaseName", "cosmosDbContainerName", "teamsChannelId",
-            "teamsGroupId", "approvalTimeoutHours", "callbackUrl", "callbackAudience", "approverIds",
+            "teamsGroupId", "approvalTimeoutHours", "callbackUrl", "callbackAudience", "approverIds", "approverTenantId",
         })
         self.assertEqual(set(re.findall(r"(?m)^output (\w+) ", self.logic_module)), {
             "logicAppTriggerUrl", "logicAppId", "logicAppName", "logicAppPrincipalId",
@@ -110,7 +110,7 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         supplied = self.logic_module.split("    parameters: {", 1)[1].split("\n    }", 1)[0]
         bound = {name.strip("'") for name in re.findall(r"(?m)^      ('\$connections'|\w+): \{", supplied)}
         self.assertEqual(bound, set(self.workflow["parameters"]))
-        self.assertIn("value: toLower(subscription().tenantId)", supplied)
+        self.assertIn("value: toLower(trim(approverTenantId))", supplied)
         self.assertIn("value: map(approverIds, id => toLower(trim(id)))", supplied)
         self.assertEqual(self.workflow["outputs"], {})
 
@@ -182,6 +182,7 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         expected = {
             "approval_id", "request_hash", "task", "environment", "requested_by", "cluster",
             "namespace", "image_tags", "commit_sha", "request_timestamp", "expires_at", "approvers",
+            "pipeline_url", "rollback_url",
         }
         self.assertEqual(set(schema["required"]), expected)
         self.assertEqual(set(schema["properties"]), expected)
@@ -190,31 +191,41 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["approvers"]["minItems"], 1)
         for key in ("request_timestamp", "expires_at"):
             self.assertEqual(schema["properties"][key]["format"], "date-time")
-        pattern = schema["properties"]["request_hash"]["pattern"]
-        self.assertIsNotNone(re.fullmatch(pattern, "a" * 64))
-        for invalid in ("", "a" * 63, "z" * 64):
-            self.assertIsNone(re.fullmatch(pattern, invalid))
+        # Azure rejects regex keywords in BOTH validated Request triggers and
+        # ParseJson actions. Python owns full GUID/hash format validation.
+        self.assertNotIn('"pattern"', json.dumps(schema))
+        self.assertNotIn('"patternProperties"', json.dumps(schema))
+        self.assertEqual(schema["properties"]["request_hash"]["minLength"], 64)
+        self.assertEqual(schema["properties"]["request_hash"]["maxLength"], 64)
+        identifiers = self.actions["Validate_Request_Identifiers"]
+        self.assertEqual(identifiers["type"], "ParseJson")
+        self.assertEqual(identifiers["runAfter"], {})
+        self.assertEqual(self.actions["Request_Is_Expired"]["runAfter"], {"Validate_Request_Identifiers": ["Succeeded"]})
+        properties = identifiers["inputs"]["schema"]["properties"]
+        self.assertEqual(set(identifiers["inputs"]["content"]), {"approval_id", "request_hash", "approvers"})
+        for prop, size in ((properties["approval_id"], 36), (properties["approvers"]["items"], 36), (properties["request_hash"], 64)):
+            self.assertEqual((prop["type"], prop["minLength"], prop["maxLength"]), ("string", size, size))
 
-    def test_configuration_patterns_reject_insecure_urls_and_non_guids(self) -> None:
-        properties = self.actions["Validate_Deployment_Configuration"]["inputs"]["schema"]["properties"]
-        pattern = properties["callbackUrl"]["pattern"]
-        valid_url = "https://approval-gateway.azure-api.net/agent-approvals/callback"
-        self.assertIsNotNone(re.fullmatch(pattern, valid_url))
-        self.assertIsNotNone(re.fullmatch(pattern, "https://approval.example:443/agent-approvals/callback"))
-        for invalid in (
-            "", valid_url.replace("https:", "http:"), valid_url + "?sig=secret",
-            valid_url + "#fragment", valid_url + "/other", valid_url.replace("/callback", "/other"),
-            valid_url.replace("https://", "https://user:password@"),
-        ):
-            with self.subTest(url=invalid):
-                self.assertIsNone(re.fullmatch(pattern, invalid))
-        guid_schemas = [properties["teamsGroupId"], properties["approverTenantId"], properties["approverIds"]["items"]]
-        for schema in guid_schemas:
-            self.assertIsNotNone(re.fullmatch(schema["pattern"], GUID))
-            for invalid in ("", "user@example.com", "system", "x" * 36):
-                self.assertIsNone(re.fullmatch(schema["pattern"], invalid))
-        self.assertIsNotNone(re.fullmatch(properties["callbackAudience"]["pattern"], f"api://{GUID}"))
-        self.assertIsNone(re.fullmatch(properties["callbackAudience"]["pattern"], GUID))
+    def test_supported_schemas_and_exact_https_routing_guard(self) -> None:
+        schemas = [self.workflow["triggers"]["When_an_HTTP_request_is_received"]["inputs"]["schema"]]
+        schemas.extend(action["inputs"]["schema"] for action in self.actions.values() if action["type"] == "ParseJson")
+        for schema in schemas:
+            self.assertNotIn('"pattern"', json.dumps(schema))
+            self.assertNotIn('"patternProperties"', json.dumps(schema))
+        guard = self.actions["Validate_Deployment_Configuration"]["inputs"]
+        properties = guard["schema"]["properties"]
+        self.assertEqual(guard["content"]["callbackUrlIsSafe"],
+            "@and(equals(uriScheme(parameters('callbackUrl')), 'https'), not(empty(uriHost(parameters('callbackUrl')))), or(equals(parameters('callbackUrl'), concat('https://', uriHost(parameters('callbackUrl')), '/agent-approvals/callback')), equals(parameters('callbackUrl'), concat('https://', uriHost(parameters('callbackUrl')), ':443/agent-approvals/callback'))))")
+        # Whole-URL equality against a reconstructed HTTPS host/path prohibits
+        # credentials, queries, fragments, alternate paths and non-443 ports.
+        for field in ("callbackUrlIsSafe", "channelIsSupported", "audienceIsResourceUri"):
+            self.assertEqual(properties[field], {"type": "boolean", "enum": [True]})
+            self.assertIn(field, guard["schema"]["required"])
+        self.assertIn("startsWith(parameters('teamsChannelId'), '19:')", guard["content"]["channelIsSupported"])
+        self.assertEqual(guard["content"]["audienceIsResourceUri"], "@startsWith(parameters('callbackAudience'), 'api://')")
+        for field in ("teamsGroupId", "approverTenantId"):
+            self.assertEqual(properties[field], {"type": "string", "minLength": 36, "maxLength": 36})
+        self.assertEqual(properties["callbackAudience"], {"type": "string", "minLength": 42, "maxLength": 42})
 
     def test_workflow_graph_has_unique_names_valid_sibling_edges_and_no_cycles(self) -> None:
         self.assertEqual(len(self.actions), sum(len(group) for group in self.groups))
@@ -294,7 +305,7 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         self.assertEqual(self.workflow["metadata"]["teamsOperationId"], "PostCardAndWaitForResponse")
         teams = self.actions["Wait_for_Teams_Response"]
         self.assertEqual(teams["type"], "ApiConnectionWebhook")
-        self.assertEqual(teams["inputs"]["path"], "/flowbot/actions/flowcontinuation/poster/Flow%20bot/location/Channel")
+        self.assertEqual(teams["inputs"]["path"], "/v1.0/teams/conversation/gatherinput/poster/Flow%20bot/location/Channel/$subscriptions")
         self.assertEqual(teams["inputs"]["host"]["connection"]["name"], "@parameters('$connections')['teams']['connectionId']")
         body = teams["inputs"]["body"]
         self.assertEqual(body["notificationUrl"], "@listCallbackUrl()")
@@ -302,6 +313,8 @@ class ApprovalInfrastructureTests(unittest.TestCase):
             "groupId": "@parameters('teamsGroupId')", "channelId": "@parameters('teamsChannelId')",
         })
         self.assertEqual(body["body"]["messageBody"], "@string(outputs('Build_Adaptive_Card'))")
+        self.assertEqual(set(body), {"notificationUrl", "body"})
+        self.assertEqual(set(body["body"]), {"recipient", "messageBody", "updateMessage"})
         self.assertEqual(teams["inputs"]["retryPolicy"], {"type": "none"})
         self.assertNotIn("/v2/approvals/create", json.dumps(self.workflow))
         self.assertEqual(sum("listCallbackUrl()" in text for text in _strings(self.workflow)), 1)
@@ -323,7 +336,7 @@ class ApprovalInfrastructureTests(unittest.TestCase):
             self.assertIn("body('Wait_for_Teams_Response')?['responder']", expression)
             for forbidden in ("['data']", "triggerBody", "displayName", "email", "requested_by"):
                 self.assertNotIn(forbidden, expression)
-            self.assertIn("pattern", parsed["schema"]["properties"][key])
+            self.assertEqual(parsed["schema"]["properties"][key], {"type": "string", "minLength": 36, "maxLength": 36})
         self.assertIn("['objectId']", parsed["content"]["approved_by"])
         self.assertIn("['id']", parsed["content"]["approved_by"])
         self.assertIn("['tenantId']", parsed["content"]["approver_tenant_id"])

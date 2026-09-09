@@ -5,8 +5,9 @@
     "description": "Teams approval transport only. Python is the sole authority for request binding, authorization, expiry, idempotency, agent validation and Cosmos audit persistence.",
     "teamsOperationId": "PostCardAndWaitForResponse",
     "teamsConnectorReference": "https://learn.microsoft.com/en-us/connectors/teams/#post-adaptive-card-and-wait-for-a-response",
-    "teamsContractVerification": "The connector documents dynamic input/output schemas. Before enabling, verify the Channel operation in the target region's Microsoft.Web/locations/managedApis/teams metadata or a designer export. Expected response: responder.objectId (or responder.id), responder.tenantId, data.decision and data.comment. Missing or changed identity fields fail closed.",
-    "operationalConstraints": "Commercial-cloud Flow bot, authorized Teams OAuth connection, Workflows app allowed and a supported non-private channel. The first channel response completes the card; restrict channel membership to approvers. Python expiry remains the fallback after cancellation or exhausted callback retries."
+    "teamsContractVerification": "PostCardAndWaitForResponse path and nested body verified against eastus2 managedApis/teams?api-version=2016-06-01&export=true on 2026-09-09. The host connection supplies connectionId. Response fields are dynamic: responder.objectId (or responder.id), responder.tenantId, data.decision and data.comment. Missing or changed identity fields fail closed; verify when changing region or connector version.",
+    "operationalConstraints": "Commercial-cloud Flow bot, authorized Teams OAuth connection, Workflows app allowed and a supported non-private channel. The first channel response completes the card; restrict channel membership to approvers. Python expiry remains the fallback after cancellation or exhausted callback retries.",
+    "schemaValidation": "Request triggers and ParseJson actions do not support pattern or patternProperties. Use supported type, length, enum and exact routing/membership checks here. Python independently enforces UUID, hash, tenant and approver formats before persisting or accepting decisions."
   },
   "parameters": {
     "$connections": {
@@ -31,19 +32,21 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "approval_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "request_hash": { "type": "string", "pattern": "^[a-fA-F0-9]{64}$" },
-            "task": { "type": "string", "minLength": 1, "maxLength": 4000 },
-            "environment": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "approval_id": { "type": "string", "minLength": 36, "maxLength": 36 },
+            "request_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
+            "task": { "type": "string", "minLength": 1, "maxLength": 8192 },
+            "environment": { "type": "string", "minLength": 1, "maxLength": 128 },
             "requested_by": { "type": "string", "minLength": 1, "maxLength": 256 },
             "cluster": { "type": "string", "minLength": 1, "maxLength": 256 },
-            "namespace": { "type": "string", "maxLength": 256 },
+            "namespace": { "type": "string", "minLength": 1, "maxLength": 253 },
             "image_tags": {
               "type": "array",
-              "maxItems": 20,
-              "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+              "maxItems": 100,
+              "items": { "type": "string", "minLength": 1, "maxLength": 512 }
             },
-            "commit_sha": { "type": "string", "maxLength": 64 },
+            "commit_sha": { "type": ["string", "null"], "maxLength": 128 },
+            "pipeline_url": { "type": ["string", "null"], "maxLength": 2048 },
+            "rollback_url": { "type": ["string", "null"], "maxLength": 2048 },
             "request_timestamp": { "type": "string", "format": "date-time" },
             "expires_at": { "type": "string", "format": "date-time" },
             "approvers": {
@@ -53,13 +56,14 @@
               "uniqueItems": true,
               "items": {
                 "type": "string",
-                "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$"
+                "minLength": 36,
+                "maxLength": 36
               }
             }
           },
           "required": [
             "approval_id", "request_hash", "task", "environment", "requested_by",
-            "cluster", "namespace", "image_tags", "commit_sha",
+            "cluster", "namespace", "image_tags", "commit_sha", "pipeline_url", "rollback_url",
             "request_timestamp", "expires_at", "approvers"
           ]
         }
@@ -102,26 +106,32 @@
           "callbackUrl": "@parameters('callbackUrl')",
           "callbackAudience": "@parameters('callbackAudience')",
           "approverIds": "@parameters('approverIds')",
-          "approverTenantId": "@parameters('approverTenantId')"
+          "approverTenantId": "@parameters('approverTenantId')",
+          "callbackUrlIsSafe": "@and(equals(uriScheme(parameters('callbackUrl')), 'https'), not(empty(uriHost(parameters('callbackUrl')))), or(equals(parameters('callbackUrl'), concat('https://', uriHost(parameters('callbackUrl')), '/agent-approvals/callback')), equals(parameters('callbackUrl'), concat('https://', uriHost(parameters('callbackUrl')), ':443/agent-approvals/callback'))))",
+          "channelIsSupported": "@and(startsWith(parameters('teamsChannelId'), '19:'), or(endsWith(parameters('teamsChannelId'), '@thread.tacv2'), endsWith(parameters('teamsChannelId'), '@thread.skype')))",
+          "audienceIsResourceUri": "@startsWith(parameters('callbackAudience'), 'api://')"
         },
         "schema": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "teamsChannelId": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^19:[^\\s/]+@thread\\.(tacv2|skype)$" },
-            "teamsGroupId": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+            "teamsChannelId": { "type": "string", "minLength": 16, "maxLength": 256 },
+            "teamsGroupId": { "type": "string", "minLength": 36, "maxLength": 36 },
             "approvalTimeoutHours": { "type": "integer", "minimum": 1, "maximum": 24 },
-            "callbackUrl": { "type": "string", "maxLength": 2048, "pattern": "^https://[a-zA-Z0-9][a-zA-Z0-9.-]*(?::443)?/agent-approvals/callback$" },
-            "callbackAudience": { "type": "string", "pattern": "^api://[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+            "callbackUrl": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "callbackAudience": { "type": "string", "minLength": 42, "maxLength": 42 },
             "approverIds": {
               "type": "array",
               "minItems": 1,
               "maxItems": 100,
-              "items": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" }
+              "items": { "type": "string", "minLength": 36, "maxLength": 36 }
             },
-            "approverTenantId": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" }
+            "approverTenantId": { "type": "string", "minLength": 36, "maxLength": 36 },
+            "callbackUrlIsSafe": { "type": "boolean", "enum": [true] },
+            "channelIsSupported": { "type": "boolean", "enum": [true] },
+            "audienceIsResourceUri": { "type": "boolean", "enum": [true] }
           },
-          "required": ["teamsChannelId", "teamsGroupId", "approvalTimeoutHours", "callbackUrl", "callbackAudience", "approverIds", "approverTenantId"]
+          "required": ["teamsChannelId", "teamsGroupId", "approvalTimeoutHours", "callbackUrl", "callbackAudience", "approverIds", "approverTenantId", "callbackUrlIsSafe", "channelIsSupported", "audienceIsResourceUri"]
         }
       },
       "runtimeConfiguration": {
@@ -132,9 +142,36 @@
       "type": "Scope",
       "runAfter": { "Validate_Deployment_Configuration": ["Succeeded"] },
       "actions": {
+        "Validate_Request_Identifiers": {
+          "type": "ParseJson",
+          "runAfter": {},
+          "inputs": {
+            "content": {
+              "approval_id": "@triggerBody()?['approval_id']",
+              "request_hash": "@triggerBody()?['request_hash']",
+              "approvers": "@triggerBody()?['approvers']"
+            },
+            "schema": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "approval_id": { "type": "string", "minLength": 36, "maxLength": 36 },
+                "request_hash": { "type": "string", "minLength": 64, "maxLength": 64 },
+                "approvers": {
+                  "type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true,
+                  "items": { "type": "string", "minLength": 36, "maxLength": 36 }
+                }
+              },
+              "required": ["approval_id", "request_hash", "approvers"]
+            }
+          },
+          "runtimeConfiguration": {
+            "secureData": { "properties": ["inputs"] }
+          }
+        },
         "Request_Is_Expired": {
           "type": "Compose",
-          "runAfter": {},
+          "runAfter": { "Validate_Request_Identifiers": ["Succeeded"] },
           "inputs": "@lessOrEquals(ticks(triggerBody()?['expires_at']), ticks(utcNow()))",
           "runtimeConfiguration": {
             "secureData": { "properties": ["inputs"] }
@@ -183,7 +220,7 @@
                   { "title": "Cluster", "value": "@triggerBody()?['cluster']" },
                   { "title": "Namespace", "value": "@triggerBody()?['namespace']" },
                   { "title": "Images", "value": "@join(triggerBody()?['image_tags'], ', ')" },
-                  { "title": "Commit SHA", "value": "@triggerBody()?['commit_sha']" },
+                  { "title": "Commit SHA", "value": "@coalesce(triggerBody()?['commit_sha'], '')" },
                   { "title": "Requested by", "value": "@triggerBody()?['requested_by']" },
                   { "title": "Requested at", "value": "@triggerBody()?['request_timestamp']" },
                   { "title": "Expires at", "value": "@triggerBody()?['expires_at']" }
@@ -208,7 +245,7 @@
             "host": {
               "connection": { "name": "@parameters('$connections')['teams']['connectionId']" }
             },
-            "path": "/flowbot/actions/flowcontinuation/poster/Flow%20bot/location/Channel",
+            "path": "/v1.0/teams/conversation/gatherinput/poster/Flow%20bot/location/Channel/$subscriptions",
             "body": {
               "notificationUrl": "@listCallbackUrl()",
               "body": {
@@ -252,8 +289,8 @@
               "additionalProperties": false,
               "properties": {
                 "decision": { "type": "string", "enum": ["approved", "rejected"] },
-                "approved_by": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
-                "approver_tenant_id": { "type": "string", "pattern": "^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$" },
+                "approved_by": { "type": "string", "minLength": 36, "maxLength": 36 },
+                "approver_tenant_id": { "type": "string", "minLength": 36, "maxLength": 36 },
                 "comment": { "type": "string", "maxLength": 2000 }
               },
               "required": ["decision", "approved_by", "approver_tenant_id", "comment"]

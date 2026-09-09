@@ -12,6 +12,16 @@ Write-Host "🔧 Post-provision setup..." -ForegroundColor Cyan
 Write-Host "`n📝 Loading environment values..." -ForegroundColor Cyan
 $envValues = azd env get-values | ConvertFrom-StringData
 
+function Get-DeploymentValue([string]$Name) {
+  # Match the existing property lookup: pipeline conversion can return several
+  # hashtables, and PowerShell's member enumeration handles either shape.
+  $value = $envValues.$Name
+  if ($null -ne $value) {
+    return ([string]$value).Trim().Trim('"')
+  }
+  return ''
+}
+
 $aksName = $envValues.AKS_CLUSTER_NAME.Trim('"')
 $rgName = $envValues.AZURE_RESOURCE_GROUP_NAME.Trim('"')
 $subscriptionId = $envValues.AZURE_SUBSCRIPTION_ID.Trim('"')
@@ -33,6 +43,62 @@ if ($mcpAgentRuntime -notin @('python', 'typescript')) {
   exit 1
 }
 $imageTag = if ($mcpAgentRuntime -eq 'typescript') { 'typescript' } else { 'latest' }
+$tenantId = Get-DeploymentValue 'AZURE_TENANT_ID'
+$agentIdentityEnabled = (Get-DeploymentValue 'AGENT_IDENTITY_ENABLED').ToLowerInvariant()
+if (-not $agentIdentityEnabled) { $agentIdentityEnabled = 'false' }
+$agentRegistryEnabled = (Get-DeploymentValue 'AGENT_REGISTRY_ENABLED').ToLowerInvariant()
+if (-not $agentRegistryEnabled) { $agentRegistryEnabled = 'false' }
+$approvalLogicAppEnabled = (Get-DeploymentValue 'APPROVAL_LOGIC_APP_ENABLED').ToLowerInvariant()
+if (-not $approvalLogicAppEnabled) { $approvalLogicAppEnabled = 'false' }
+if ($agentIdentityEnabled -notin @('true', 'false') -or $agentRegistryEnabled -notin @('true', 'false') -or $approvalLogicAppEnabled -notin @('true', 'false')) {
+  throw 'AGENT_IDENTITY_ENABLED, AGENT_REGISTRY_ENABLED and APPROVAL_LOGIC_APP_ENABLED must be true or false.'
+}
+if ($agentRegistryEnabled -eq 'true' -and $agentIdentityEnabled -ne 'true') {
+  throw 'Agent Registry publication requires AGENT_IDENTITY_ENABLED=true.'
+}
+$agentIdentityAppId = Get-DeploymentValue 'AGENT_IDENTITY_APP_ID'
+$agentBlueprintAppId = Get-DeploymentValue 'AGENT_IDENTITY_BLUEPRINT_APP_ID'
+$agentBlueprintObjectId = Get-DeploymentValue 'AGENT_IDENTITY_BLUEPRINT_OBJECT_ID'
+if ($agentIdentityEnabled -eq 'true' -and (-not $agentIdentityAppId -or -not $agentBlueprintAppId)) {
+  throw 'Enabled Agent Identity requires its actual app and blueprint IDs; the bootstrap UAMI is not a substitute.'
+}
+if ($agentRegistryEnabled -eq 'true' -and -not $agentBlueprintObjectId) {
+  throw 'Agent Registry publication requires AGENT_IDENTITY_BLUEPRINT_OBJECT_ID.'
+}
+foreach ($id in @($agentIdentityAppId, $agentBlueprintAppId, $agentBlueprintObjectId)) {
+  if ($id -and $id -notmatch '^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
+    throw 'Invalid Agent Identity app or blueprint ID.'
+  }
+}
+$agentRegistryApi = (Get-DeploymentValue 'AGENT_REGISTRY_API').ToLowerInvariant()
+if (-not $agentRegistryApi) { $agentRegistryApi = 'agent365' }
+if ($agentRegistryApi -notin @('agent365', 'entra-beta')) {
+  throw 'AGENT_REGISTRY_API must be agent365 or entra-beta.'
+}
+$agentRegistryOwnerIds = @((Get-DeploymentValue 'AGENT_REGISTRY_OWNER_IDS') -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($agentRegistryEnabled -eq 'true' -and $agentRegistryOwnerIds.Count -eq 0) {
+  throw 'Agent Registry publication requires AGENT_REGISTRY_OWNER_IDS.'
+}
+foreach ($id in $agentRegistryOwnerIds) {
+  if ($id -notmatch '^[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') {
+    throw 'AGENT_REGISTRY_OWNER_IDS must contain comma-separated GUIDs.'
+  }
+}
+$agentEndpointUrl = Get-DeploymentValue 'MCP_BASE_URL'
+$agentIdentityDisplayName = Get-DeploymentValue 'AGENT_IDENTITY_DISPLAY_NAME'
+$deploymentEnvironment = Get-DeploymentValue 'DEPLOYMENT_ENVIRONMENT'
+if (-not $deploymentEnvironment) { $deploymentEnvironment = Get-DeploymentValue 'AZURE_ENV_NAME' }
+$commitSha = Get-DeploymentValue 'COMMIT_SHA'
+if (-not $commitSha) { $commitSha = [string]$env:COMMIT_SHA }
+if ($commitSha -and $commitSha -notmatch '^[0-9a-fA-F]{7,64}$') {
+  throw 'COMMIT_SHA must be empty or a hexadecimal commit ID.'
+}
+if ($approvalLogicAppEnabled -eq 'true' -or $agentRegistryEnabled -eq 'true') {
+  $deploymentPython = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $deploymentPython) {
+    throw 'Approval and registry deployment helpers require Python 3.10+ as python on PATH; configure it separately. No interpreter is installed by this step.'
+  }
+}
 # Fabric configuration
 $fabricEnabled = 'false'
 $fabricCapacityName = $envValues.FABRIC_CAPACITY_NAME.Trim('"')
@@ -91,17 +157,18 @@ Write-Host "`n📄 Configuring Kubernetes manifests..." -ForegroundColor Cyan
 
 # Read and configure deployment template
 $deploymentTemplate = Get-Content -Path "./k8s/mcp-agents-deployment.yaml" -Raw
-$tenantId = $envValues.AZURE_TENANT_ID.Trim('"')
 $configuredDeployment = $deploymentTemplate `
   -replace '\$\{CONTAINER_REGISTRY\}', $containerRegistry `
   -replace '\$\{IMAGE_TAG\}', $imageTag `
+  -replace '\$\{COMMIT_SHA\}', $commitSha `
   -replace '\$\{AZURE_STORAGE_ACCOUNT_URL\}', $storageUrl `
   -replace '\$\{AZURE_CLIENT_ID\}', $mcpIdentityClientId `
   -replace '\$\{AZURE_TENANT_ID\}', $tenantId `
   -replace '\$\{MCP_SERVER_IDENTITY_CLIENT_ID\}', $mcpIdentityClientId `
-  -replace '\$\{AGENT_IDENTITY_APP_ID\}', $mcpIdentityClientId `
-  -replace '\$\{AGENT_IDENTITY_BLUEPRINT_APP_ID\}', '' `
-  -replace '\$\{AGENT_IDENTITY_DISPLAY_NAME\}', 'MCP Agent' `
+  -replace '\$\{AGENT_IDENTITY_ENABLED\}', $agentIdentityEnabled `
+  -replace '\$\{AGENT_IDENTITY_APP_ID\}', $agentIdentityAppId `
+  -replace '\$\{AGENT_IDENTITY_BLUEPRINT_APP_ID\}', $agentBlueprintAppId `
+  -replace '\$\{AGENT_IDENTITY_DISPLAY_NAME\}', $agentIdentityDisplayName `
   -replace '\$\{FOUNDRY_PROJECT_ENDPOINT\}', $foundryProjectEndpoint `
   -replace '\$\{FOUNDRY_MODEL_DEPLOYMENT_NAME\}', $foundryModelDeploymentName `
   -replace '\$\{EMBEDDING_MODEL_DEPLOYMENT_NAME\}', $embeddingModelDeploymentName `
@@ -169,6 +236,21 @@ if ($LASTEXITCODE -ne 0) { throw "Container image build failed" }
 
 # Deploy to Kubernetes
 Write-Host "`n🚀 Deploying to Kubernetes..." -ForegroundColor Cyan
+# Inject approval runtime only after the namespace exists and before any rollout.
+if ($approvalLogicAppEnabled -eq 'true') {
+  '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"mcp-agents"}}' | kubectl apply -f -
+  if ($LASTEXITCODE -ne 0) { throw 'Failed to ensure the approval namespace exists.' }
+  # The helper reads grouped or legacy non-secret outputs as JSON. It alone
+  # handles listCallbackUrl and streams the signed URL to Kubernetes Secret stdin.
+  & $deploymentPython.Source "./scripts/configure_approval_runtime.py" --apply --from-azd `
+    "--subscription-id=$subscriptionId" `
+    "--resource-group=$rgName" `
+    "--namespace=mcp-agents" `
+    "--tenant-id=$tenantId" `
+    "--environment=$deploymentEnvironment" `
+    "--cluster-name=$aksName"
+  if ($LASTEXITCODE -ne 0) { throw 'Approval runtime configuration failed; rollout was not started.' }
+}
 kubectl apply -f ./k8s/mcp-agents-deployment-configured.yaml
 if ($LASTEXITCODE -ne 0) { throw "Failed to apply the MCP deployment" }
 kubectl apply -f ./k8s/mcp-agents-loadbalancer-configured.yaml
@@ -180,6 +262,25 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to restart the MCP deployment" }
 Write-Host "`n⏳ Waiting for deployment to be ready..." -ForegroundColor Cyan
 kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
 if ($LASTEXITCODE -ne 0) { throw "MCP deployment rollout failed" }
+
+if ($agentRegistryEnabled -eq 'true') {
+  if (-not $agentEndpointUrl -or -not $agentIdentityDisplayName -or -not $deploymentEnvironment) {
+    throw 'Agent Registry publication requires MCP_BASE_URL, AGENT_IDENTITY_DISPLAY_NAME and AZURE_ENV_NAME deployment values.'
+  }
+  Write-Host "`n📇 Publishing agent to the Agent 365 registry..." -ForegroundColor Cyan
+  $registryArguments = @(
+    './scripts/publish_agent_registry.py', '--publish', "--api=$agentRegistryApi",
+    "--endpoint=$agentEndpointUrl", "--agent-identity-id=$agentIdentityAppId",
+    "--blueprint-object-id=$agentBlueprintObjectId",
+    "--display-name=$agentIdentityDisplayName", "--tenant-id=$tenantId"
+  )
+  foreach ($ownerId in $agentRegistryOwnerIds) { $registryArguments += "--owner-id=$ownerId" }
+  $env:AGENT_REGISTRY_ENABLED = 'true'
+  $env:AZURE_ENV_NAME = $deploymentEnvironment
+  & $deploymentPython.Source @registryArguments
+  if ($LASTEXITCODE -ne 0) { throw 'Agent 365 registry publication failed.' }
+  Write-Host "✅ Agent 365 registry publication complete" -ForegroundColor Green
+}
 
 # Wait for LoadBalancer to get external IP
 Write-Host "`n⏳ Waiting for LoadBalancer IP assignment..." -ForegroundColor Cyan

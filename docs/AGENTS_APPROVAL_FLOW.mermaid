@@ -1,0 +1,51 @@
+%% Activity diagram for the implemented Python approval flow.
+%% Live approved round trip verified 2026-09-09; see AGENTS_APPROVAL_FLOW_VALIDATION.md.
+flowchart TD
+    Start([MCP or framework next_best_action]) --> Inputs["Validate task and approval_id; mandatory approval support"]
+    Inputs -- Invalid or unavailable --> Block["Fail closed: no plan or task/plan writes"]
+    Inputs -- Valid --> HasID{"Existing approval_id?"}
+    HasID -- Yes --> Resume["Reload Cosmos using exact task and server-owned context"]
+    HasID -- No --> Policy{"Deployment or CI/CD wording?"}
+    Policy -- No --> General["Generate nondeployment recommendation"]
+    Policy -- Yes --> Config["Validate callback, approver and storage configuration"]
+    Config -- Invalid --> Block
+    Config -- Valid --> Persist["Persist pending UUID, context hash, expiry and human allowlist snapshot"]
+    Persist -- Failure --> Block
+    Persist -- Durable --> Dispatch["POST once to the signed Logic App trigger"]
+    Dispatch --> Ack{"HTTP 202 acknowledged?"}
+    Ack -- No --> DispatchError["Persist error and failed validation"]
+    DispatchError --> Block
+    Ack -- Yes --> Pending["Confirm notification; return approval_pending and no plan"]
+    Ack -- Workflow continues --> Routing{"Fixed routing and configuration valid?"}
+    Routing -- No --> NoOutbound["Terminate without outbound calls; Python expires pending request"]
+    NoOutbound --> Block
+    Routing -- Yes --> Context{"Request shape, chronology, expiry and eligible approvers valid?"}
+    Context -- No --> SystemError["Build error or timeout callback; never assert human approval"]
+    Context -- Yes --> Card["Post Adaptive Card and wait in restricted Teams channel"]
+    Card -- Human submits --> Envelope["Read decision and connector-supplied user and tenant"]
+    Card -- Timeout or transport failure --> SystemError
+    Envelope --> Human{"Allowlisted user and pinned human tenant?"}
+    Human -- No --> SystemError
+    Human -- Yes --> Decision["Normalize approve or reject; bind request hash and workflow run"]
+    Decision --> Callback["POST fixed APIM callback using Logic App managed-identity JWT"]
+    SystemError --> Callback
+    Callback --> JWT["APIM and Python verify signature, hosting tenant, audience and system principal"]
+    JWT -- Invalid --> Block
+    JWT -- Authenticated --> Validate["Python verifies stored hash, human snapshot, expiry and terminal rules"]
+    Validate -- Invalid --> Block
+    Validate -- Valid --> CAS["Cosmos ETag update; identical callback redelivery is idempotent"]
+    CAS -- Storage failure or conflicting decision --> Block
+    CAS -- Durable --> Stored["Approved/passed, rejected/passed, timeout/failed or error/failed"]
+    Stored --> AckCallback["HTTP 200 after persistence; no automatic planning"]
+    Pending -. Explicit caller resume .-> Resume
+    AckCallback -. Explicit caller resume .-> Resume
+    Resume -- Missing, altered or corrupt context --> Block
+    Resume -- Verified --> Authorized{"Approved AND passed AND unexpired AND notification confirmed?"}
+    Authorized -- No --> Block
+    Authorized -- Yes --> Plan["Generate and store recommendation with approval correlation"]
+    Plan --> End([End: recommendation only; nothing deployed by the test])
+    General --> End
+    Block --> End
+    RequestNote["Approval binds the request before planning, not an unseen generated plan"] -.-> Card
+    TenantNote["Hosting callback tenant and Teams human tenant are separately pinned"] -.-> JWT
+    TenantNote -.-> Human
