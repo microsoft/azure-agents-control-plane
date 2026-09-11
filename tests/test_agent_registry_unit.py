@@ -86,7 +86,7 @@ class RegistryStore:
         assert parsed.scheme == "https" and parsed.netloc == "graph.microsoft.com"
         path = unquote(parsed.path)
         body = deepcopy(options.get("json"))
-        self.calls.append((method, url, body, options["headers"]))
+        self.calls.append((method, url, deepcopy(body), options["headers"]))
         override = self.overrides.get((method, path, parsed.query), [])
         if override:
             value = override.pop(0)
@@ -217,6 +217,16 @@ def test_current_rerun_finds_saved_id_and_is_noop(tmp_path):
     assert result["agentRegistrationId"] == REGISTRATION
     assert not store.writes
     assert all(urlsplit(url).path != registry.REGISTRATION_PATH for _, url, _, _ in store.calls)
+
+
+@pytest.mark.parametrize("change", [{"agentIdentityId": OWNER}, {"sourceAgentId": "another-source"}, {"isBlocked": True}])
+def test_readonly_existing_binding_gate_rejects_drift(change):
+    graph, store = client()
+    instance, card = inputs()
+    store.records[REGISTRATION] = {"id": REGISTRATION, **instance, "agentCard": card, **change}
+    with pytest.raises(registry.RegistryError):
+        registry.AgentRegistryPublisher(graph).verify_existing_binding(REGISTRATION, instance, card)
+    assert not store.writes
 
 
 def test_current_update_preserves_unknown_metadata_owners_and_skills(tmp_path):
@@ -721,8 +731,8 @@ def test_authentication_error_suppresses_credential_details():
 
 
 def test_read_only_and_secret_governance_fields_absent_from_reference_templates():
-    instance = json.loads((ROOT / "agent365/manifests/agent_instance.json").read_text())
-    card = json.loads((ROOT / "agent365/manifests/agent_card_manifest.json").read_text())
+    instance = json.loads((ROOT / "agent-approvals/manifests/agent_instance.json").read_text())
+    card = json.loads((ROOT / "agent-approvals/manifests/agent_card_manifest.json").read_text())
     assert set(instance) <= registry._INSTANCE_FIELDS
     assert set(card) <= registry._CARD_FIELDS
     combined = json.dumps([instance, card])

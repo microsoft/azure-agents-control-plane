@@ -95,6 +95,7 @@ from agent365_approval import (
 )
 from approval_api import router as approval_router
 from agent_identity import get_agent_credential, get_async_agent_credential
+from agent_observability import telemetry
 
 AGENT365_APPROVAL_AVAILABLE = True
 
@@ -135,9 +136,9 @@ logger = logging.getLogger(__name__)
 if not EVALUATION_AVAILABLE:
     logger.warning("azure-ai-evaluation not available - evaluation tools will be disabled")
 
-# Log Agent 365 approval availability
+# The historical module name does not make this an Agent 365 approval API.
 if AGENT365_APPROVAL_AVAILABLE:
-    logger.info("Agent 365 approval workflow available - Agents tasks will require human-in-the-loop approval")
+    logger.info("Next Best Action Logic App/Teams approval checkpoint available for deployment-related recommendations")
 else:
     logger.error("Approval support unavailable - next_best_action requests are blocked")
 
@@ -421,7 +422,7 @@ def analyze_intent(task: str) -> str:
         # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         
-        response = client.chat.completions.create(
+        response = telemetry.chat_completion(client,
             model=model_deployment,
             messages=[
                 {
@@ -479,7 +480,7 @@ def generate_plan(task: str, similar_tasks: List[Dict[str, Any]]) -> List[Dict[s
         # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         
-        response = client.chat.completions.create(
+        response = telemetry.chat_completion(client,
             model=model_deployment,
             messages=[
                 {
@@ -604,7 +605,7 @@ def generate_plan_with_instructions(
         # Resolve the model deployment (behavior optimized in-process by the Learning SDK)
         model_deployment = get_model_deployment()
         
-        response = client.chat.completions.create(
+        response = telemetry.chat_completion(client,
             model=model_deployment,
             messages=[
                 {
@@ -1073,7 +1074,7 @@ def ask_foundry_tool(question: str) -> str:
         model_deployment = get_model_deployment()
         logger.info(f"ask_foundry using model: {model_deployment}")
         
-        response = client.chat.completions.create(
+        response = telemetry.chat_completion(client,
             model=model_deployment,
             messages=[{"role": "user", "content": question}]
         )
@@ -1094,7 +1095,11 @@ async def next_best_action_tool(task: str, approval_id: Optional[str] = None) ->
     decision, call again with the exact task and its approval_id. No deployments
     are executed by this tool; approval binds the request, not a future plan.
     """
-    result = await _execute_tool_impl("next_best_action", {"task": task, "approval_id": approval_id})
+    with telemetry.invocation("internal") as invocation, telemetry.tool("next_best_action") as observation:
+        result = await _execute_tool_impl("next_best_action", {"task": task, "approval_id": approval_id})
+        if result.isError:
+            invocation.failed()
+            observation.failed()
     return result.content[0]["text"]
 
 
@@ -1139,18 +1144,22 @@ async def _next_best_action_approval(task: str, approval_id: Optional[str] = Non
         ):
             expires = datetime.fromisoformat(contract.expires_at.replace("Z", "+00:00"))
             if expires.tzinfo is not None and datetime.now(timezone.utc) < expires:
+                telemetry.approval_state("approved")
                 return None, public
         decision = contract.decision if contract.decision in {"pending", "rejected", "timeout", "error"} else "error"
+        telemetry.approval_state(decision)
         return {
             "task": task, "status": f"approval_{decision}",
             "approval_id": contract.approval_id, "approval_contract": public,
             "message": "No recommendation generated. Resume this exact task with its approval_id after a verified human approval.",
         }, None
     except ApprovalError as error:
+        telemetry.approval_state("error")
         return {"status": "approval_error", "error": str(error), "error_code": error.status_code}, None
     except Exception:
         # Unexpected provider errors may contain signed URLs or credentials.
         logger.error("Approval checkpoint unavailable; request blocked")
+        telemetry.approval_state("error")
         return {"status": "approval_error", "error": "Approval could not be verified; request blocked."}, None
 
 
@@ -3199,15 +3208,23 @@ async def execute_tool(tool_name: str, arguments: Dict[str, Any]) -> MCPToolResu
     result = None
     error_message = None
     
-    try:
-        result = await _execute_tool_impl(tool_name, arguments)
-    except Exception as e:
-        logger.error(f"Error executing tool {tool_name}: {e}")
-        error_message = str(e)
-        result = MCPToolResult(
-            content=[{"type": "text", "text": f"Error: {str(e)}"}],
-            isError=True
-        )
+    # Unknown/user-controlled names are never exported as telemetry attributes.
+    observed_name = tool_name if any(tool.name == tool_name for tool in TOOLS) else "unknown"
+    with telemetry.invocation("mcp") as invocation, telemetry.tool(observed_name) as observation:
+        try:
+            result = await _execute_tool_impl(tool_name, arguments)
+            if result.isError:
+                invocation.failed()
+                observation.failed()
+        except Exception as e:
+            logger.error("MCP tool execution failed")
+            invocation.failed()
+            observation.failed()
+            error_message = str(e)
+            result = MCPToolResult(
+                content=[{"type": "text", "text": f"Error: {str(e)}"}],
+                isError=True
+            )
     
     # Capture episode with the Azure Agents Learning SDK if enabled
     if episode_capture and episode_capture.is_enabled():
@@ -3369,7 +3386,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     api_version="2024-02-15-preview"
                 )
                 
-                response = client.chat.completions.create(
+                response = telemetry.chat_completion(client,
                     model=model_deployment,
                     messages=[{"role": "user", "content": question}]
                 )
@@ -5081,7 +5098,7 @@ async def mcp_message_endpoint(request: Request):
     """
     try:
         body = await request.json()
-        logger.info(f"Received MCP message: {json.dumps(body)[:200]}")
+        logger.info("Received MCP message")
         
         jsonrpc_version = body.get("jsonrpc")
         method = body.get("method")
@@ -5193,6 +5210,10 @@ async def root():
 async def startup_event():
     """Initialize the AI agent and memory providers on startup."""
     global mcp_ai_agent
+
+    # No directory writes. Telemetry may use Agent ID independently of the
+    # Azure data-plane credential; off/console never acquires a token.
+    await asyncio.to_thread(telemetry.configure)
     
     # Initialize AI Agent
     mcp_ai_agent = create_mcp_agent()
@@ -5218,6 +5239,7 @@ async def startup_event():
 async def shutdown_event():
     """Close process-owned Agent ID sessions and clear their token caches."""
     global _runtime_agent_credential, _runtime_agent_async_credential
+    await asyncio.to_thread(telemetry.shutdown)
     if _runtime_agent_async_credential is not None:
         await _runtime_agent_async_credential.close()
         _runtime_agent_async_credential = None
@@ -5266,7 +5288,8 @@ async def agent_chat(request: Request):
         messages.append({"role": "user", "content": user_message})
         
         # Run the agent
-        response = await mcp_ai_agent.run(messages)
+        with telemetry.invocation("web"):
+            response = await mcp_ai_agent.run(messages)
         
         # Extract assistant response
         assistant_responses = []
@@ -5322,12 +5345,13 @@ async def agent_chat_stream(request: Request):
         
         async def generate_stream():
             try:
-                async for event in mcp_ai_agent.run_stream(messages):
-                    if hasattr(event, 'data') and hasattr(event.data, 'contents'):
-                        for content in event.data.contents:
-                            if hasattr(content, 'text'):
-                                yield f"data: {json.dumps({'text': content.text})}\n\n"
-                yield f"data: {json.dumps({'done': True})}\n\n"
+                with telemetry.invocation("web"):
+                    async for event in mcp_ai_agent.run_stream(messages):
+                        if hasattr(event, 'data') and hasattr(event.data, 'contents'):
+                            for content in event.data.contents:
+                                if hasattr(content, 'text'):
+                                    yield f"data: {json.dumps({'text': content.text})}\n\n"
+                    yield f"data: {json.dumps({'done': True})}\n\n"
             except Exception as e:
                 logger.error(f"Streaming error: {e}")
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"

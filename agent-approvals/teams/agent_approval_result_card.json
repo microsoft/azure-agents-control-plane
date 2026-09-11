@@ -1,0 +1,12 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.4",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Agent Approvals: response received for Next Best Action. The Python approval engine must still verify and record the decision. Resume the original next_best_action request with its approval_id after validation. No deployment or plan execution has been authorized.",
+      "wrap": true
+    }
+  ]
+}

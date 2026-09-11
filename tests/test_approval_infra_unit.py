@@ -15,10 +15,12 @@ from typing import Any, ClassVar
 import unittest
 import xml.etree.ElementTree as ET
 
+from scripts.approval_assets import load_approval_workflow
+
 
 ROOT = Path(__file__).resolve().parents[1]
 LOGIC_MODULE = ROOT / "infra/app/agents-approval-logicapp.bicep"
-WORKFLOW = ROOT / "agent365/workflows/agent_approval_logic_app.json"
+WORKFLOW = ROOT / "agent-approvals/workflows/agent_approval_logic_app.json"
 APIM_MODULE = ROOT / "infra/app/apim-approval-callback.bicep"
 APIM_POLICY = ROOT / "infra/app/apim-approval-callback.policy.xml"
 GUID = "11111111-2222-3333-4444-555555555555"
@@ -83,7 +85,9 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         cls.apim_module = APIM_MODULE.read_text(encoding="utf-8")
         cls.policy_text = APIM_POLICY.read_text(encoding="utf-8")
         cls.policy = ET.fromstring(cls.policy_text)
-        cls.workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+        for artifact in (WORKFLOW, ROOT / "agent-approvals/teams/agent_approval_card.json", ROOT / "agent-approvals/teams/agent_approval_result_card.json"):
+            json.loads(artifact.read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
+        cls.workflow = load_approval_workflow()
         cls.groups = list(_action_groups(cls.workflow["actions"]))
         cls.actions = {name: action for group in cls.groups for name, action in group.items()}
 
@@ -103,10 +107,14 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         self.assertEqual(re.findall(r"(?m)^output (\w+) ", self.apim_module), ["callbackUrl"])
 
     def test_bicep_loads_one_canonical_definition_and_binds_all_parameters(self) -> None:
-        paths = re.findall(r"definition:\s*loadJsonContent\('([^']+)'\)", self.logic_module)
+        paths = re.findall(r"var workflowDefinition = loadJsonContent\('([^']+)'\)", self.logic_module)
         self.assertEqual(len(paths), 1)
         self.assertEqual((LOGIC_MODULE.parent / paths[0]).resolve(), WORKFLOW.resolve())
         self.assertNotRegex(self.logic_module, r"definition:\s*\{")
+        self.assertIn("definition: composedDefinition", self.logic_module)
+        self.assertIn("var composedDefinition = union(workflowDefinition,", self.logic_module)
+        self.assertIn("inputs: approvalCard", self.logic_module)
+        self.assertIn("updateMessage: responseCard.body[0].text", self.logic_module)
         supplied = self.logic_module.split("    parameters: {", 1)[1].split("\n    }", 1)[0]
         bound = {name.strip("'") for name in re.findall(r"(?m)^      ('\$connections'|\w+): \{", supplied)}
         self.assertEqual(bound, set(self.workflow["parameters"]))
@@ -321,6 +329,14 @@ class ApprovalInfrastructureTests(unittest.TestCase):
 
     def test_card_collects_only_decision_and_comment_not_identity(self) -> None:
         card = self.actions["Build_Adaptive_Card"]["inputs"]
+        self.assertEqual(card, json.loads((ROOT / "agent-approvals/teams/agent_approval_card.json").read_text(encoding="utf-8")))
+        self.assertEqual(self.workflow["metadata"]["useCase"], "next_best_action")
+        self.assertEqual(self.workflow["metadata"]["approvalScope"], "recommendation_generation")
+        self.assertEqual(card["body"][0]["text"], "Agent Approvals")
+        text = json.dumps(card)
+        self.assertIn("next_best_action", text)
+        self.assertIn("does not deploy resources", text)
+        self.assertNotIn("Action.Execute", text)
         self.assertEqual(card["type"], "AdaptiveCard")
         self.assertEqual([action["data"] for action in card["actions"]], [{"decision": "approved"}, {"decision": "rejected"}])
         self.assertTrue(all(action["type"] == "Action.Submit" for action in card["actions"]))
@@ -340,6 +356,22 @@ class ApprovalInfrastructureTests(unittest.TestCase):
         self.assertIn("['objectId']", parsed["content"]["approved_by"])
         self.assertIn("['id']", parsed["content"]["approved_by"])
         self.assertIn("['tenantId']", parsed["content"]["approver_tenant_id"])
+
+    def test_acknowledgement_comes_from_tracked_teams_source_and_is_not_approval(self) -> None:
+        source = json.loads((ROOT / "agent-approvals/teams/agent_approval_result_card.json").read_text(encoding="utf-8"))
+        text = self.actions["Wait_for_Teams_Response"]["inputs"]["body"]["body"]["updateMessage"]
+        self.assertEqual(text, source["body"][0]["text"])
+        self.assertIn("must still verify and record", text)
+        self.assertIn("next_best_action", text)
+        self.assertIn("No deployment or plan execution has been authorized", text)
+
+    def test_composer_does_not_mutate_request_or_callback_contracts(self) -> None:
+        scaffold = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        composed = load_approval_workflow()
+        actions = composed["actions"]["Collect_Decision"]["actions"]
+        actions["Build_Adaptive_Card"]["inputs"] = {}
+        actions["Wait_for_Teams_Response"]["inputs"]["body"]["body"]["updateMessage"] = ""
+        self.assertEqual(composed, scaffold)
 
     def test_normalization_and_exact_allowlists_fail_closed(self) -> None:
         raw = self.actions["Normalize_Submitted_Decision"]["inputs"]

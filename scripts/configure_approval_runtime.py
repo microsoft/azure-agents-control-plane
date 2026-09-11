@@ -187,7 +187,14 @@ def load_configuration(args: argparse.Namespace) -> dict[str, str]:
 
     values = {}
     if args.from_azd:
-        raw = _json_object(_run(["azd", "env", "get-values", "--output", "json"]))
+        command = ["azd", "env", "get-values", "--output", "json"]
+        if args.azd_environment:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.azd_environment):
+                raise ConfigurationError("Invalid azd environment name.")
+            command += ["--environment", args.azd_environment]
+        raw = _json_object(_run(command))
+        if args.azd_environment and raw.get("AZURE_ENV_NAME") != args.azd_environment:
+            raise ConfigurationError("azd returned a different environment.")
         values.update(select(raw))
     values.update(select(dict(os.environ)))
     values.update({name: getattr(args, name) for name in REQUIRED_KEYS if getattr(args, name) is not None})
@@ -272,10 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check-only", action="store_true", help="Validate configuration only; do not fetch the webhook or mutate resources.")
     mode.add_argument("--apply", action="store_true", help="Fetch the webhook in memory and apply the Secret and ConfigMap.")
     parser.add_argument("--from-azd", action="store_true", help="Read lower-priority azd environment values as JSON in memory.")
+    parser.add_argument("--azd-environment", help="Pin --from-azd to this named environment, independent of the runtime environment label.")
     for option, name in OPTION_ENV.items():
         parser.add_argument(f"--{option}", dest=name, help=f"Non-secret setting; defaults to {name}.")
     args = parser.parse_args(argv)
     try:
+        if args.azd_environment and not args.from_azd:
+            raise ConfigurationError("--azd-environment requires --from-azd.")
         values = load_configuration(args)
         if args.check_only:
             validate_configuration(values)

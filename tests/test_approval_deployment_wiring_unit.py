@@ -126,7 +126,7 @@ class DeploymentSourceContractTests(unittest.TestCase):
             self.assertIn(expected, callback)
 
     def test_explicit_approvers_audience_and_existing_identity_switches(self) -> None:
-        self.assertIn("var approvalCallbackAudience = !empty(trim(existingApprovalCallbackAppUri))\n  ? toLower(trim(existingApprovalCallbackAppUri))\n  : (agentIdentityEnabled ? 'api://${agentIdentityBlueprint!.outputs.blueprintAppId}' : '')", self.main)
+        self.assertIn("var approvalCallbackAudience = !empty(trim(existingApprovalCallbackAppUri))\n  ? toLower(trim(existingApprovalCallbackAppUri))\n  : (agentIdentityEnabled ? 'api://${resolvedBlueprintAppId}' : '')", self.main)
         self.assertIn("param approvalApproverIds string = ''", self.main)
         self.assertIn("map(split(approvalApproverIds, ','), id => toLower(trim(id)))", self.main)
         self.assertIn("approverIds: approvalApproverIdList", module_block(self.main, "agentsApprovalLogicApp"))
@@ -141,12 +141,14 @@ class DeploymentSourceContractTests(unittest.TestCase):
             "teamsChannelId": "${TEAMS_CHANNEL_ID=}",
             "teamsGroupId": "${TEAMS_GROUP_ID=}",
             "agentIdentityEnabled": "${AGENT_IDENTITY_ENABLED=false}",
+            "agentIdentityProvisioningMode": "${AGENT_IDENTITY_PROVISIONING_MODE=adopt}",
+            "existingAgentIdentityBlueprintObjectId": "${AGENT_IDENTITY_BLUEPRINT_OBJECT_ID=}",
             "agentSponsorPrincipalId": "${AGENT_SPONSOR_PRINCIPAL_ID=}",
             "existingAgentIdentityBlueprintAppId": "${EXISTING_AGENT_IDENTITY_BLUEPRINT_APP_ID=}",
             "existingAgentIdentityId": "${EXISTING_AGENT_IDENTITY_ID=}",
         }.items():
             self.assertEqual(self.parameters[parameter]["value"], value)
-        self.assertIn("param agentIdentityEnabled bool = true", self.main)
+        self.assertIn("param agentIdentityEnabled bool = false", self.main)
         self.assertIn("param approvalLogicAppEnabled bool = false", self.main)
 
     def test_safe_outputs_never_promote_the_signed_trigger(self) -> None:
@@ -241,11 +243,11 @@ class DeploymentSourceContractTests(unittest.TestCase):
     def test_registry_publication_is_opt_in_linked_and_after_rollout(self) -> None:
         for source in (self.ps, self.sh):
             self.assertIn("AGENT_REGISTRY_ENABLED", source)
-            self.assertIn("scripts/publish_agent_registry.py", source)
-            self.assertIn("--blueprint-object-id=", source)
-            self.assertIn("--agent-identity-id=", source)
-            self.assertIn("--owner-id=", source)
-            self.assertLess(source.index("kubectl rollout status"), source.index("scripts/publish_agent_registry.py"))
+            self.assertIn("scripts/deployment_gate.py", source)
+            self.assertIn("--publish-registry", source)
+            self.assertIn("AGENT_IDENTITY_BLUEPRINT_OBJECT_ID", source)
+            self.assertIn("AGENT_REGISTRY_OWNER_IDS", source)
+            self.assertLess(source.index("kubectl rollout status"), source.index("--publish-registry"))
             self.assertNotIn("LOGIC_APP_APPROVAL_WEBHOOK", source)
 
     def test_injector_does_not_write_files_or_change_identity_and_permissions(self) -> None:
@@ -431,6 +433,17 @@ class RuntimeInjectionTests(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertNotIn(SENTINEL, output)
                 self.commands.assert_not_called()
+
+    def test_from_azd_pins_named_environment_and_rejects_mismatch(self) -> None:
+        self.commands.side_effect = [self.response(json.dumps({**valid_configuration(), "AZURE_ENV_NAME": "test"}))]
+        code, output = self.invoke("--check-only", "--from-azd", "--azd-environment=test")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.commands.call_args.args[0][-2:], ["--environment", "test"])
+        self.commands.reset_mock()
+        self.commands.side_effect = [self.response(json.dumps({"AZURE_ENV_NAME": "other"}))]
+        code, output = self.invoke("--check-only", "--from-azd", "--azd-environment=test")
+        self.assertEqual(code, 2)
+        self.assertIn("different environment", output)
 
     def test_apply_transports_secret_only_in_stdin_and_never_echoes_command_output(self) -> None:
         runtime.os.environ["LOGIC_APP_APPROVAL_WEBHOOK"] = SENTINEL

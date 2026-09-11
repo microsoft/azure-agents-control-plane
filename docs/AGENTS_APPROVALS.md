@@ -9,6 +9,11 @@
 > Approval gates recommendation generation for deployment requests, not every
 > tool or an automatically executed deployment.
 
+> **Current naming:** approval assets are in [../agent-approvals/README.md](../agent-approvals/README.md).
+> This is the custom **Agent Approvals** Logic App/Teams transport for
+> `next_best_action`, not a native Agent 365 approval service. The historical
+> examples below must not be used as an Agent 365 approval-provider contract.
+
 ## Agent Registration and Agents Approval System
 
 This folder contains the artifacts for Microsoft Agent 365 registration and the agent approval workflow system with Microsoft Teams human-in-the-loop integration.
@@ -21,11 +26,11 @@ This folder contains the artifacts for Microsoft Agent 365 registration and the 
 
 | Path | Description |
 |------|-------------|
-| [manifests/agent_card_manifest.json](manifests/agent_card_manifest.json) | Agent card manifest for Entra Agent Registry |
-| [manifests/agent_instance.json](manifests/agent_instance.json) | Agent instance definition with security profile |
-| [teams/agent_approval_card.json](teams/agent_approval_card.json) | Teams Adaptive Card for approval requests |
-| [teams/agent_approval_result_card.json](teams/agent_approval_result_card.json) | Teams Adaptive Card for approval results |
-| [workflows/agent_approval_logic_app.json](workflows/agent_approval_logic_app.json) | Azure Logic App fallback workflow |
+| [../agent-approvals/manifests/agent_card_manifest.json](../agent-approvals/manifests/agent_card_manifest.json) | Optional Agent 365 registry metadata (not approval policy) |
+| [../agent-approvals/manifests/agent_instance.json](../agent-approvals/manifests/agent_instance.json) | Optional registration identity/owner metadata |
+| [../agent-approvals/teams/agent_approval_card.json](../agent-approvals/teams/agent_approval_card.json) | Canonical Next Best Action approval request card |
+| [../agent-approvals/teams/agent_approval_result_card.json](../agent-approvals/teams/agent_approval_result_card.json) | Response-received acknowledgement text; not approval confirmation |
+| [../agent-approvals/workflows/agent_approval_logic_app.json](../agent-approvals/workflows/agent_approval_logic_app.json) | Logic App transport; Python validates and persists the decision |
 
 ---
 
@@ -85,7 +90,7 @@ Microsoft Agent 365 is currently in **Frontier preview**. Organizations must be 
 
 ### Agent Instance Definition
 
-Location: [agent365/manifests/agent_instance.json](manifests/agent_instance.json)
+Location: [../agent-approvals/manifests/agent_instance.json](../agent-approvals/manifests/agent_instance.json)
 
 Key configuration:
 - **Owner**: Defined via environment variables
@@ -204,7 +209,7 @@ completed = await engine.wait_for_approval(contract.approval_id)
 
 ### Adaptive Card for Approval Request
 
-Location: [agent365/teams/agents_approval_card.json](teams/agents_approval_card.json)
+Location: [../agent-approvals/teams/agent_approval_card.json](../agent-approvals/teams/agent_approval_card.json)
 
 The approval card includes:
 
@@ -233,7 +238,7 @@ The approval card includes:
 
 ### Approval Result Card
 
-Location: [agent365/teams/approval_result_card.json](teams/approval_result_card.json)
+Location: [../agent-approvals/teams/agent_approval_result_card.json](../agent-approvals/teams/agent_approval_result_card.json)
 
 Displays final decision with:
 - Decision status (approved/rejected with styling)
@@ -305,7 +310,7 @@ When Agent 365 is not available, the system falls back to:
 
 ### 1. Azure Logic Apps Workflow
 
-Location: [agent365/workflows/agents_approval_logic_app.json](workflows/agents_approval_logic_app.json)
+Location: [../agent-approvals/workflows/agent_approval_logic_app.json](../agent-approvals/workflows/agent_approval_logic_app.json)
 
 The Logic App:
 - Receives approval requests via HTTP trigger
@@ -419,7 +424,7 @@ az cosmosdb sql container create \
 az logic workflow create \
   --resource-group $RESOURCE_GROUP \
   --name agents-approval-workflow \
-  --definition @agent365/workflows/agents_approval_logic_app.json
+  --definition @agent-approvals/workflows/agent_approval_logic_app.json
 ```
 
 ### Step 3: Configure Environment Variables

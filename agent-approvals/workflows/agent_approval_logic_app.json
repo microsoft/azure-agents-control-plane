@@ -1,8 +1,11 @@
 {
   "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-  "contentVersion": "2.0.0.0",
+  "contentVersion": "2.1.0.0",
   "metadata": {
-    "description": "Teams approval transport only. Python is the sole authority for request binding, authorization, expiry, idempotency, agent validation and Cosmos audit persistence.",
+    "description": "Agent Approvals: Logic App/Teams transport for the Next Best Action MCP tool's deployment-related recommendation checkpoint. Approval permits recommendation generation only, not plan execution. Python is the sole authority for request binding, authorization, expiry, idempotency, agent validation and Cosmos audit persistence.",
+    "useCase": "next_best_action",
+    "approvalScope": "recommendation_generation",
+    "cardSources": "Bicep and scripts/approval_assets.py compose the tracked teams/agent_approval_card.json and teams/agent_approval_result_card.json. Do not deploy this scaffold directly.",
     "teamsOperationId": "PostCardAndWaitForResponse",
     "teamsConnectorReference": "https://learn.microsoft.com/en-us/connectors/teams/#post-adaptive-card-and-wait-for-a-response",
     "teamsContractVerification": "PostCardAndWaitForResponse path and nested body verified against eastus2 managedApis/teams?api-version=2016-06-01&export=true on 2026-09-09. The host connection supplies connectionId. Response fields are dynamic: responder.objectId (or responder.id), responder.tenantId, data.decision and data.comment. Missing or changed identity fields fail closed; verify when changing region or connector version.",
@@ -203,37 +206,7 @@
         "Build_Adaptive_Card": {
           "type": "Compose",
           "runAfter": { "Validate_Request_Context": ["Succeeded"] },
-          "inputs": {
-            "type": "AdaptiveCard",
-            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-            "version": "1.4",
-            "msteams": { "width": "Full" },
-            "body": [
-              { "type": "TextBlock", "text": "Deployment approval requested", "weight": "Bolder", "size": "Large", "wrap": true },
-              { "type": "TextBlock", "text": "@triggerBody()?['task']", "wrap": true },
-              {
-                "type": "FactSet",
-                "facts": [
-                  { "title": "Approval ID", "value": "@triggerBody()?['approval_id']" },
-                  { "title": "Request hash", "value": "@triggerBody()?['request_hash']" },
-                  { "title": "Environment", "value": "@triggerBody()?['environment']" },
-                  { "title": "Cluster", "value": "@triggerBody()?['cluster']" },
-                  { "title": "Namespace", "value": "@triggerBody()?['namespace']" },
-                  { "title": "Images", "value": "@join(triggerBody()?['image_tags'], ', ')" },
-                  { "title": "Commit SHA", "value": "@coalesce(triggerBody()?['commit_sha'], '')" },
-                  { "title": "Requested by", "value": "@triggerBody()?['requested_by']" },
-                  { "title": "Requested at", "value": "@triggerBody()?['request_timestamp']" },
-                  { "title": "Expires at", "value": "@triggerBody()?['expires_at']" }
-                ]
-              },
-              { "type": "TextBlock", "text": "Only configured approvers may decide. Submitting this card does not authorize deployment: the Python engine verifies the request and records the outcome.", "wrap": true },
-              { "type": "Input.Text", "id": "comment", "label": "Approval notes or rejection reason", "isMultiline": true, "maxLength": 2000 }
-            ],
-            "actions": [
-              { "type": "Action.Submit", "title": "Approve", "style": "positive", "data": { "decision": "approved" } },
-              { "type": "Action.Submit", "title": "Reject", "style": "destructive", "data": { "decision": "rejected" } }
-            ]
-          },
+          "inputs": {},
           "runtimeConfiguration": {
             "secureData": { "properties": ["inputs"] }
           }
@@ -254,7 +227,7 @@
                   "channelId": "@parameters('teamsChannelId')"
                 },
                 "messageBody": "@string(outputs('Build_Adaptive_Card'))",
-                "updateMessage": "Response received. The Python approval engine must still verify and record the outcome."
+                "updateMessage": ""
               }
             },
             "retryPolicy": { "type": "none" }

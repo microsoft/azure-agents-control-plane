@@ -35,11 +35,20 @@
     "agentIdentityEnabled": {
       "value": "${AGENT_IDENTITY_ENABLED=false}"
     },
+    "agentIdentityProvisioningMode": {
+      "value": "${AGENT_IDENTITY_PROVISIONING_MODE=adopt}"
+    },
+    "agentIdentityDisplayName": {
+      "value": "${AGENT_IDENTITY_DISPLAY_NAME=}"
+    },
     "agentSponsorPrincipalId": {
       "value": "${AGENT_SPONSOR_PRINCIPAL_ID=}"
     },
     "existingAgentIdentityBlueprintAppId": {
       "value": "${EXISTING_AGENT_IDENTITY_BLUEPRINT_APP_ID=}"
+    },
+    "existingAgentIdentityBlueprintObjectId": {
+      "value": "${AGENT_IDENTITY_BLUEPRINT_OBJECT_ID=}"
     },
     "existingAgentIdentityId": {
       "value": "${EXISTING_AGENT_IDENTITY_ID=}"

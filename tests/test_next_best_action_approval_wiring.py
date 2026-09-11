@@ -33,11 +33,12 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from src import agent365_approval as approvals
+from src.agent_observability import AgentTelemetry
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "src/next_best_action_agent.py"
-WORKFLOW = ROOT / "agent365/workflows/agent_approval_logic_app.json"
+WORKFLOW = ROOT / "agent-approvals/workflows/agent_approval_logic_app.json"
 LEGACY_TASK = "Set up a Agents pipeline for deploying microservices to Kubernetes"
 DEPLOY_TASK = "Deploy the API to Kubernetes"
 APPROVAL_ID = "33333333-3333-3333-3333-333333333333"
@@ -94,6 +95,7 @@ def harness() -> Any:
         "Any": Any, "Dict": Dict, "List": List, "Optional": Optional,
         "json": json, "os": os, "uuid": uuid, "datetime": datetime, "timezone": timezone,
         "asyncio": asyncio, "time": time, "logger": Mock(),
+        "telemetry": AgentTelemetry(),
         "FOUNDRY_PROJECT_ENDPOINT": "https://foundry.example/offline",
         "cosmos_tasks_container": Mock(), "cosmos_plans_container": Mock(),
         "get_embedding": Mock(return_value=[1.0, 0.0]),

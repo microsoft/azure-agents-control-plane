@@ -10,6 +10,10 @@ pydantic>=2.9.0
 # Verify the Logic App callback JWT using tenant-pinned signing keys.
 PyJWT[crypto]>=2.10.1,<3
 
+# Official Agent 365 tracing; manual metadata-only spans preserve framework pins.
+# Do not install the [agent-framework] extra (it upgrades the framework).
+microsoft-opentelemetry==1.3.9
+
 # Microsoft Agent Framework
 # Pin version to avoid breaking changes
 agent-framework-azure-ai==1.0.0b260107

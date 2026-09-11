@@ -82,7 +82,11 @@ param fabricWorkspaceId string = ''
 // Entra Agent Identity Configuration
 // =========================================
 @description('Enable Entra Agent Identity for the Next Best Action agent (preview feature)')
-param agentIdentityEnabled bool = true
+param agentIdentityEnabled bool = false
+
+@allowed(['adopt', 'managed'])
+@description('adopt uses Agent 365-provisioned IDs without directory writes. managed explicitly enables the advanced UAMI directory-provisioning workflow.')
+param agentIdentityProvisioningMode string = 'adopt'
 
 @description('Display name for the Agent Identity Blueprint')
 param agentBlueprintDisplayName string = ''
@@ -90,13 +94,16 @@ param agentBlueprintDisplayName string = ''
 @description('Display name for the Next Best Action Agent Identity')
 param agentIdentityDisplayName string = ''
 
-@description('Principal ID of sponsor user for agent identity (admin user)')
+@description('Object ID of the accountable sponsor user (does not need to be an administrator)')
 param agentSponsorPrincipalId string = ''
 
 @description('Existing Agent Identity Blueprint client/app ID to adopt after the staged identity bootstrap')
 param existingAgentIdentityBlueprintAppId string = ''
 
-@description('Existing Agent Identity object ID to adopt; empty creates or discovers the identity under the blueprint')
+@description('Application OBJECT ID of the adopted blueprint, not its service-principal ID')
+param existingAgentIdentityBlueprintObjectId string = ''
+
+@description('Existing Agent ID to adopt. Only explicit managed provisioning can create or discover a missing identity.')
 param existingAgentIdentityId string = ''
 
 @description('Principal ID of developer user for local development Cosmos DB access (optional)')
@@ -284,10 +291,14 @@ module mcpUserAssignedIdentity './core/identity/userAssignedIdentity.bicep' = {
 // Agent Identity Blueprint names
 var agentBlueprintName = !empty(agentBlueprintDisplayName) ? agentBlueprintDisplayName : 'NextBestAction-Blueprint-${resourceToken}'
 var agentName = !empty(agentIdentityDisplayName) ? agentIdentityDisplayName : 'NextBestAction-Agent-${resourceToken}'
+var manageAgentIdentity = agentIdentityEnabled && agentIdentityProvisioningMode == 'managed'
+var resolvedBlueprintAppId = manageAgentIdentity ? agentIdentityBlueprint!.outputs.blueprintAppId : existingAgentIdentityBlueprintAppId
+var resolvedBlueprintObjectId = manageAgentIdentity ? agentIdentityBlueprint!.outputs.blueprintObjectId : existingAgentIdentityBlueprintObjectId
+var resolvedAgentId = manageAgentIdentity ? nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId : existingAgentIdentityId
 
 // Agent Identity Blueprint - the template for creating agent identities
-// This uses the MCP managed identity to authenticate and create the blueprint via Microsoft Graph API
-module agentIdentityBlueprint './core/identity/agentIdentityBlueprint.bicep' = if (agentIdentityEnabled) {
+// Advanced opt-in only. The normal Agent 365 path owns its directory lifecycle.
+module agentIdentityBlueprint './core/identity/agentIdentityBlueprint.bicep' = if (manageAgentIdentity) {
   name: 'agentIdentityBlueprint'
   scope: rg
   params: {
@@ -305,7 +316,7 @@ module agentIdentityBlueprint './core/identity/agentIdentityBlueprint.bicep' = i
 }
 
 // Agent Identity - the actual identity used by the Next Best Action agent
-module nextBestActionAgentIdentity './core/identity/agentIdentity.bicep' = if (agentIdentityEnabled) {
+module nextBestActionAgentIdentity './core/identity/agentIdentity.bicep' = if (manageAgentIdentity) {
   name: 'nextBestActionAgentIdentity'
   scope: rg
   params: {
@@ -450,7 +461,7 @@ module acrPrivateEndpoint 'app/acr-PrivateEndpoint.bicep' = if (vnetEnabled) {
 // =========================================
 
 // Configure federated credential for the Agent Identity Blueprint to allow AKS pods to authenticate
-module agentFederatedCredential './core/identity/aksFederatedCredential.bicep' = if (agentIdentityEnabled) {
+module agentFederatedCredential './core/identity/aksFederatedCredential.bicep' = if (manageAgentIdentity) {
   name: 'agentFederatedCredential'
   scope: rg
   params: {
@@ -904,7 +915,7 @@ module fabricDataAgents 'app/fabric-data-agents.bicep' = if (fabricEnabled && fa
   name: 'fabricDataAgents'
   scope: rg
   params: {
-    agentPrincipalId: agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId : mcpUserAssignedIdentity.outputs.identityPrincipalId
+    agentPrincipalId: agentIdentityEnabled ? resolvedAgentId : mcpUserAssignedIdentity.outputs.identityPrincipalId
     fabricCapacityId: fabricCapacity!.outputs.id
     fabricCapacityName: fabricResourceName
     fabricWorkspaceId: fabricWorkspaceId
@@ -1034,7 +1045,7 @@ module agentRoleAssignments './app/agent-RoleAssignments.bicep' = if (agentIdent
   name: 'agentRoleAssignments'
   scope: rg
   params: {
-    agentPrincipalId: nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId
+    agentPrincipalId: resolvedAgentId
     cosmosAccountName: cosmosAccount.outputs.name
     searchServiceName: searchEnabled ? searchService.outputs.name : ''
     searchEnabled: searchEnabled
@@ -1050,7 +1061,7 @@ module appInsightsRoleAssignmentAgent './core/monitor/appinsights-access.bicep' 
   params: {
     appInsightsName: monitoring.outputs.applicationInsightsName
     roleDefinitionID: monitoringRoleDefinitionId
-    principalID: nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId
+    principalID: resolvedAgentId
   }
 }
 
@@ -1062,7 +1073,7 @@ module appInsightsRoleAssignmentAgent './core/monitor/appinsights-access.bicep' 
 var approvalCallbackUrl = '${apimService.outputs.gatewayUrl}/agent-approvals/callback'
 var approvalCallbackAudience = !empty(trim(existingApprovalCallbackAppUri))
   ? toLower(trim(existingApprovalCallbackAppUri))
-  : (agentIdentityEnabled ? 'api://${agentIdentityBlueprint!.outputs.blueprintAppId}' : '')
+  : (agentIdentityEnabled ? 'api://${resolvedBlueprintAppId}' : '')
 // Keep malformed/empty comma-list entries visible to validation; never widen the allowlist.
 var approvalApproverIdList = empty(trim(approvalApproverIds)) ? [] : map(split(approvalApproverIds, ','), id => toLower(trim(id)))
 
@@ -1167,7 +1178,7 @@ module purviewAgentRole './app/purview-RoleAssignment.bicep' = if (purviewEnable
   params: {
     purviewAccountName: purviewResourceName
     roleDefinitionID: PurviewDataReader
-    principalID: nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId
+    principalID: resolvedAgentId
     principalType: 'ServicePrincipal'
   }
 }
@@ -1247,11 +1258,13 @@ output FABRIC_API_ENDPOINT string = fabricEnabled ? 'https://api.fabric.microsof
 // Entra Agent Identity outputs
 // =========================================
 output AGENT_IDENTITY_ENABLED bool = agentIdentityEnabled
-output AGENT_IDENTITY_BLUEPRINT_APP_ID string = agentIdentityEnabled ? agentIdentityBlueprint!.outputs.blueprintAppId : ''
-output AGENT_IDENTITY_BLUEPRINT_OBJECT_ID string = agentIdentityEnabled ? agentIdentityBlueprint!.outputs.blueprintObjectId : ''
-output AGENT_IDENTITY_APP_ID string = agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentIdentityAppId : ''
-output AGENT_IDENTITY_PRINCIPAL_ID string = agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentIdentityPrincipalId : ''
-output AGENT_IDENTITY_DISPLAY_NAME string = agentIdentityEnabled ? nextBestActionAgentIdentity!.outputs.agentDisplayName : ''
+// Preserve adopted identities for registry/telemetry even while Azure clients
+// remain on the working UAMI. The enabled flag controls resource credentials only.
+output AGENT_IDENTITY_BLUEPRINT_APP_ID string = resolvedBlueprintAppId
+output AGENT_IDENTITY_BLUEPRINT_OBJECT_ID string = resolvedBlueprintObjectId
+output AGENT_IDENTITY_APP_ID string = resolvedAgentId
+output AGENT_IDENTITY_PRINCIPAL_ID string = resolvedAgentId
+output AGENT_IDENTITY_DISPLAY_NAME string = !empty(resolvedAgentId) ? (manageAgentIdentity ? nextBestActionAgentIdentity!.outputs.agentDisplayName : agentName) : ''
 
 // =========================================
 // Agents Approval Logic App outputs

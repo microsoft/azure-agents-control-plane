@@ -41,6 +41,9 @@ var StorageQueueDataContributor = '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
 // Azure AI / Cognitive Services roles
 var CognitiveServicesOpenAIUser = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
 var CognitiveServicesOpenAIContributor = 'a001fd3d-188f-4b5d-821b-7da978bf7442'
+// Same role as the MCP UAMI in main.bicep; required for Foundry Agent Service
+// and evaluation calls after their credential switches to the child Agent ID.
+var AzureAIDeveloper = '64702f94-c441-49e6-a78b-ef80e0188fee'
 
 // Note: Monitoring roles and Fabric roles are handled separately in main.bicep
 
@@ -156,6 +159,16 @@ resource openAIContributorAgent 'Microsoft.Authorization/roleAssignments@2022-04
 // Outputs
 // =========================================
 
+resource foundryAIDeveloperAgent 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(foundryAccount.id, agentPrincipalId, AzureAIDeveloper, deploymentSuffix)
+  scope: foundryAccount
+  properties: {
+    roleDefinitionId: resourceId('Microsoft.Authorization/roleDefinitions', AzureAIDeveloper)
+    principalId: agentPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 output cosmosRoleAssignmentId string = cosmosRoleAssignmentAgent.id
 output searchIndexRoleAssignmentId string = searchEnabled ? searchIndexDataContributorAgent!.id : ''
 output searchServiceRoleAssignmentId string = searchEnabled ? searchServiceContributorAgent!.id : ''
@@ -163,3 +176,4 @@ output storageBlobRoleAssignmentId string = storageBlobDataOwnerAgent.id
 output storageQueueRoleAssignmentId string = storageQueueDataContributorAgent.id
 output foundryOpenAIUserRoleAssignmentId string = openAIUserAgent.id
 output foundryOpenAIContributorRoleAssignmentId string = openAIContributorAgent.id
+output foundryAIDeveloperRoleAssignmentId string = foundryAIDeveloperAgent.id

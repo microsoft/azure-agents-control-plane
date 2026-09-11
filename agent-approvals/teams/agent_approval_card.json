@@ -1,0 +1,35 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.4",
+  "msteams": { "width": "Full" },
+  "body": [
+    { "type": "TextBlock", "text": "Agent Approvals", "weight": "Bolder", "size": "Large", "wrap": true },
+    { "type": "TextBlock", "text": "Next Best Action — recommendation approval", "weight": "Bolder", "wrap": true },
+    { "type": "TextBlock", "text": "Approve generating a Next Best Action recommendation for this exact deployment-related request. This does not deploy resources or authorize execution of the resulting plan.", "wrap": true },
+    { "type": "TextBlock", "text": "@triggerBody()?['task']", "wrap": true },
+    {
+      "type": "FactSet",
+      "facts": [
+        { "title": "Use case", "value": "Next Best Action" },
+        { "title": "MCP tool", "value": "next_best_action" },
+        { "title": "Approval ID", "value": "@triggerBody()?['approval_id']" },
+        { "title": "Request hash", "value": "@triggerBody()?['request_hash']" },
+        { "title": "Environment", "value": "@triggerBody()?['environment']" },
+        { "title": "Cluster", "value": "@triggerBody()?['cluster']" },
+        { "title": "Namespace", "value": "@triggerBody()?['namespace']" },
+        { "title": "Images", "value": "@join(triggerBody()?['image_tags'], ', ')" },
+        { "title": "Commit SHA", "value": "@coalesce(triggerBody()?['commit_sha'], '')" },
+        { "title": "Requested by", "value": "@triggerBody()?['requested_by']" },
+        { "title": "Requested at", "value": "@triggerBody()?['request_timestamp']" },
+        { "title": "Expires at", "value": "@triggerBody()?['expires_at']" }
+      ]
+    },
+    { "type": "TextBlock", "text": "Only configured approvers may decide. The Python approval engine must verify the signed callback, request context and expiry before next_best_action can resume. Submitting this card alone does not authorize a recommendation.", "wrap": true },
+    { "type": "Input.Text", "id": "comment", "label": "Approval notes or rejection reason", "isMultiline": true, "maxLength": 2000 }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Approve recommendation", "style": "positive", "data": { "decision": "approved" } },
+    { "type": "Action.Submit", "title": "Reject", "style": "destructive", "data": { "decision": "rejected" } }
+  ]
+}

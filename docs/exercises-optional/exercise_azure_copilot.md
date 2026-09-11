@@ -135,7 +135,7 @@ kubectl rollout restart deployment/mcp-agents -n mcp-agents
 
 Create a skill manifest that describes your agent's capabilities to Azure Copilot.
 
-Create `agent365/manifests/copilot_skill_manifest.json`:
+Create an optional Copilot skill manifest under the renamed agent-approvals manifests directory:
 
 ```json
 {

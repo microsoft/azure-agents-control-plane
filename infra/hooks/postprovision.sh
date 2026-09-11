@@ -8,7 +8,22 @@ echo "🔧 Post-provision setup..."
 # Get environment values from azd
 echo ""
 echo "📝 Loading environment values..."
-eval $(azd env get-values | sed 's/^/export /')
+if [ -z "${DEPLOYMENT_PYTHON:-}" ]; then
+  if [ -x .venv/bin/python ]; then DEPLOYMENT_PYTHON=.venv/bin/python
+  elif command -v python3 >/dev/null 2>&1; then DEPLOYMENT_PYTHON=python3
+  else DEPLOYMENT_PYTHON=python; fi
+fi
+export DEPLOYMENT_PYTHON
+environment_options=(--from-azd)
+if [ -n "${AZURE_ENV_NAME:-}" ]; then environment_options+=("--environment=$AZURE_ENV_NAME"); fi
+# Import allowlisted KEY=value records as data, never eval source configuration.
+deployment_records=$("$DEPLOYMENT_PYTHON" ./scripts/deployment_gate.py --export-env "${environment_options[@]}")
+while IFS='=' read -r key value; do
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || { echo 'Invalid deployment setting record.'; exit 1; }
+  if [ -n "$value" ]; then export "$key=$value"; else unset "$key"; fi
+done <<< "$deployment_records"
+unset deployment_records
+"$DEPLOYMENT_PYTHON" ./scripts/deployment_gate.py --check
 
 az account set --subscription "$(echo "$AZURE_SUBSCRIPTION_ID" | tr -d '"')"
 
@@ -29,10 +44,10 @@ SEARCH_INDEX=$(echo $AZURE_SEARCH_INDEX_NAME | tr -d '"')
 MCP_AGENT_RUNTIME=$(echo "${MCP_AGENT_RUNTIME:-python}" | tr -d '"' | tr '[:upper:]' '[:lower:]')
 case "$MCP_AGENT_RUNTIME" in
   python)
-    IMAGE_TAG="latest"
+    IMAGE_TAG="${IMAGE_TAG:-latest}"
     ;;
   typescript)
-    IMAGE_TAG="typescript"
+    IMAGE_TAG="${IMAGE_TAG:-typescript}"
     ;;
   *)
     echo "Unsupported MCP_AGENT_RUNTIME '$MCP_AGENT_RUNTIME'. Use 'python' or 'typescript'."
@@ -49,14 +64,10 @@ for flag in "$AGENT_IDENTITY_FLAG" "$AGENT_REGISTRY_FLAG" "$APPROVAL_ENABLED"; d
     *) echo 'AGENT_IDENTITY_ENABLED, AGENT_REGISTRY_ENABLED and APPROVAL_LOGIC_APP_ENABLED must be true or false.'; exit 1 ;;
   esac
 done
-if [ "$AGENT_REGISTRY_FLAG" = 'true' ] && [ "$AGENT_IDENTITY_FLAG" != 'true' ]; then
-  echo 'Agent Registry publication requires AGENT_IDENTITY_ENABLED=true.'
-  exit 1
-fi
 AGENT_APP_ID=$(printf '%s' "${AGENT_IDENTITY_APP_ID:-}" | tr -d '"')
 AGENT_BLUEPRINT_APP_ID=$(printf '%s' "${AGENT_IDENTITY_BLUEPRINT_APP_ID:-}" | tr -d '"')
 AGENT_BLUEPRINT_OBJECT_ID=$(printf '%s' "${AGENT_IDENTITY_BLUEPRINT_OBJECT_ID:-}" | tr -d '"')
-if [ "$AGENT_IDENTITY_FLAG" = 'true' ] && { [ -z "$AGENT_APP_ID" ] || [ -z "$AGENT_BLUEPRINT_APP_ID" ]; }; then
+if { [ "$AGENT_IDENTITY_FLAG" = 'true' ] || [ "$AGENT_REGISTRY_FLAG" = 'true' ] || [ "${AGENT_OBSERVABILITY_MODE:-off}" = 'agent365' ]; } && { [ -z "$AGENT_APP_ID" ] || [ -z "$AGENT_BLUEPRINT_APP_ID" ]; }; then
   echo 'Enabled Agent Identity requires its actual app and blueprint IDs; the bootstrap UAMI is not a substitute.'
   exit 1
 fi
@@ -96,16 +107,7 @@ if [[ -n "$COMMIT_VALUE" && ! "$COMMIT_VALUE" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
   echo 'COMMIT_SHA must be empty or a hexadecimal commit ID.'
   exit 1
 fi
-if [ "$APPROVAL_ENABLED" = 'true' ] || [ "$AGENT_REGISTRY_FLAG" = 'true' ]; then
-  if command -v python3 >/dev/null 2>&1; then
-    DEPLOYMENT_PYTHON=python3
-  elif command -v python >/dev/null 2>&1; then
-    DEPLOYMENT_PYTHON=python
-  else
-    echo 'Approval and registry deployment helpers require Python 3.10+ on PATH; configure it separately. No interpreter is installed by this step.'
-    exit 1
-  fi
-fi
+# Approval, identity and registry helpers require Python 3.10+; selected above.
 
 echo "  AKS Cluster: $AKS_NAME"
 echo "  Resource Group: $RG_NAME"
@@ -159,6 +161,7 @@ sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
     -e "s|\${AZURE_TENANT_ID}|$TENANT_ID|g" \
     -e "s|\${MCP_SERVER_IDENTITY_CLIENT_ID}|$MCP_IDENTITY_CLIENT_ID|g" \
     -e "s|\${AGENT_IDENTITY_ENABLED}|$AGENT_IDENTITY_FLAG|g" \
+    -e "s|\${AGENT_OBSERVABILITY_MODE}|${AGENT_OBSERVABILITY_MODE:-off}|g" \
     -e "s|\${AGENT_IDENTITY_APP_ID}|$AGENT_APP_ID|g" \
     -e "s|\${AGENT_IDENTITY_BLUEPRINT_APP_ID}|$AGENT_BLUEPRINT_APP_ID|g" \
     -e "s|\${AGENT_IDENTITY_DISPLAY_NAME}|$AGENT_DISPLAY_NAME|g" \
@@ -210,17 +213,32 @@ echo "🐳 Building and pushing container image..."
 export CONTAINER_REGISTRY="$CONTAINER_REG"
 export MCP_AGENT_RUNTIME
 export IMAGE_TAG
-./scripts/build-and-push.sh
+export IMAGE_NAME=mcp-agents
+build_output=$(./scripts/build-and-push.sh)
+immutable_image=$(printf '%s' "$build_output" | "$DEPLOYMENT_PYTHON" -c '
+import json, os, re, sys
+result = json.load(sys.stdin)
+digest = result.get("digest", "")
+expected = os.environ["CONTAINER_REGISTRY"] + "/mcp-agents@" + digest
+if result.get("status") != "built" or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or result.get("immutableImage") != expected:
+  sys.exit("Build did not return a verified immutable image; rollout was not started.")
+print(expected)
+')
+sed -i "s|image: $CONTAINER_REG/mcp-agents:$IMAGE_TAG|image: $immutable_image|" ./k8s/mcp-agents-deployment-configured.yaml
+unset build_output
 
 # Deploy to Kubernetes
 echo ""
 echo "🚀 Deploying to Kubernetes..."
+# Revalidate rather than trusting a stale pre-build permission result.
+"$DEPLOYMENT_PYTHON" ./scripts/deployment_gate.py --check
 # Inject approval runtime only after the namespace exists and before any rollout.
 if [ "$APPROVAL_ENABLED" = 'true' ]; then
   printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"mcp-agents"}}' | kubectl apply -f -
   # The helper reads grouped/legacy non-secret outputs as JSON, not shell code.
   # It alone retrieves and streams the signed URL to Kubernetes Secret stdin.
   "$DEPLOYMENT_PYTHON" ./scripts/configure_approval_runtime.py --apply --from-azd \
+    --azd-environment="$AZURE_ENV_NAME" \
     --subscription-id="$(printf '%s' "$AZURE_SUBSCRIPTION_ID" | tr -d '"')" \
     --resource-group="$RG_NAME" \
     --namespace=mcp-agents \
@@ -238,25 +256,10 @@ echo "⏳ Waiting for deployment to be ready..."
 kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
 
 if [ "$AGENT_REGISTRY_FLAG" = 'true' ]; then
-  if [ -z "$AGENT_ENDPOINT" ] || [ -z "$AGENT_DISPLAY_NAME" ] || [ -z "$DEPLOYMENT_ENVIRONMENT_VALUE" ]; then
-    echo 'Agent Registry publication requires MCP_BASE_URL, AGENT_IDENTITY_DISPLAY_NAME and AZURE_ENV_NAME deployment values.'
-    exit 1
-  fi
   echo ""
   echo "📇 Publishing agent to the Agent 365 registry..."
-  registry_args=(
-    ./scripts/publish_agent_registry.py --publish "--api=$AGENT_REGISTRY_API_VALUE"
-    "--endpoint=$AGENT_ENDPOINT" "--agent-identity-id=$AGENT_APP_ID"
-    "--blueprint-object-id=$AGENT_BLUEPRINT_OBJECT_ID"
-    "--display-name=$AGENT_DISPLAY_NAME" "--tenant-id=$TENANT_ID"
-  )
-  for owner_id in "${AGENT_REGISTRY_OWNERS[@]}"; do
-    owner_id=$(printf '%s' "$owner_id" | xargs)
-    [ -n "$owner_id" ] && registry_args+=("--owner-id=$owner_id")
-  done
-  export AGENT_REGISTRY_ENABLED=true
-  export AZURE_ENV_NAME="$DEPLOYMENT_ENVIRONMENT_VALUE"
-  "$DEPLOYMENT_PYTHON" "${registry_args[@]}"
+  # Preserve named environment, source key, manager and durable journal inputs.
+  "$DEPLOYMENT_PYTHON" ./scripts/deployment_gate.py --publish-registry
   echo "✅ Agent 365 registry publication complete"
 fi
 

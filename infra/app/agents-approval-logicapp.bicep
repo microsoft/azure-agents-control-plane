@@ -61,6 +61,32 @@ param approverTenantId string = subscription().tenantId
 // any outbound call, including if an operator manually enables an incomplete app.
 var workflowConfigured = !empty(trim(teamsChannelId)) && !empty(trim(teamsGroupId)) && !empty(approverIds) && startsWith(callbackUrl, 'https://') && endsWith(callbackUrl, '/agent-approvals/callback') && startsWith(callbackAudience, 'api://') && length(callbackAudience) == 42
 
+// Canonical Teams UX is checked in and used by the deployed workflow, not an
+// unrelated Action.Execute demo. union recursively preserves all other actions.
+var workflowDefinition = loadJsonContent('../../agent-approvals/workflows/agent_approval_logic_app.json')
+var approvalCard = loadJsonContent('../../agent-approvals/teams/agent_approval_card.json')
+var responseCard = loadJsonContent('../../agent-approvals/teams/agent_approval_result_card.json')
+var composedDefinition = union(workflowDefinition, {
+  actions: {
+    Collect_Decision: {
+      actions: {
+        Build_Adaptive_Card: {
+          inputs: approvalCard
+        }
+        Wait_for_Teams_Response: {
+          inputs: {
+            body: {
+              body: {
+                updateMessage: responseCard.body[0].text
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+})
+
 resource cosmosDbAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' existing = {
   name: cosmosDbAccountName
 }
@@ -92,7 +118,7 @@ resource logicApp 'Microsoft.Logic/workflows@2019-05-01' = {
   }
   properties: {
     state: workflowConfigured ? 'Enabled' : 'Disabled'
-    definition: loadJsonContent('../../agent365/workflows/agent_approval_logic_app.json')
+    definition: composedDefinition
     parameters: {
       '$connections': {
         value: {

@@ -311,7 +311,8 @@ def test_http_errors_are_secret_safe_without_fallback_or_retry(credential, stage
     bootstrap.get_token.assert_called_once_with(identity._EXCHANGE_SCOPE)
 
 
-@pytest.mark.parametrize("body", [b"not json", b"{}", b"[]", b'{"error":"secret"}', b"x" * (128 * 1024 + 1)])
+@pytest.mark.parametrize("body", [b"not json", b"{}", b"[]", b'{"error":"secret"}', b"x" * (128 * 1024 + 1)],
+                         ids=["invalid-json", "empty-object", "array", "error-object", "oversized"])
 def test_invalid_or_oversized_response(credential, body):
     value, _, session = credential
     session.post.side_effect = [response(body=body)]

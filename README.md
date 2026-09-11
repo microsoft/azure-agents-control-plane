@@ -7,7 +7,7 @@ The Azure Agents Control Plane governs the complete lifecycle of enterprise AI a
 - **Azure as Enterprise Control Plane** - Centralized governance with single or multi-cloud execution capability
 - **Specification-Driven Development** - SpecKit methodology ensures structured analysis, design, testing, reinforcement learning and evaluations
 - **API-First Agent Architecture** - All agent operations flow through Azure API Management with Model Context Protocol (MCP) defining capabilities
-- **Identity-First Security** - Every agent receives a Microsoft Entra ID Agent identity with least-privilege role based authorization control (RBAC)
+- **Identity-First Security** - Agents can adopt Microsoft Entra Agent IDs with least-privilege access; Azure managed identity remains the default until an explicit credential migration
 - **Continuous Evaluation & Improvement** - The Azure Agents Learning SDK enables in-process reinforcement learning
 
 The following two animations show the system architecture at runtime and buildtime.
@@ -120,20 +120,29 @@ template rather than maintaining a second copy of every Azure resource.
 See [infra/terraform/README.md](infra/terraform/README.md) for Bash commands,
 configuration, validation, and destroy behavior.
 
-### Two-Phase Deployment (with Agent Identity)
+### Agent 365 registration and observability (existing agents)
 
-For deployments requiring Entra Agent Identity:
+Use the [minimal Agent 365 onboarding guide](docs/AGENTS_AGENT365_ONBOARDING.md):
 
-```powershell
-# Phase 1: Core Infrastructure
-azd auth login
-azd env set AZURE_AGENT_IDENTITY_ENABLED false
-azd up --no-prompt
+1. Register once through the supported Agent 365 developer workflow, with a
+	verified human owner/sponsor and a real Entra Agent ID.
+2. Adopt those IDs. **No blueprint-management Graph roles are needed on the
+	AKS UAMI** for this path. Keep the existing Azure data-plane identity and
+	Logic App/Teams approvals; do not publish a duplicate registry record.
+3. Add metadata-only tracing: `AGENT_OBSERVABILITY_MODE=console` locally, then
+	`agent365` once S2S telemetry permission and tenant licensing are ready.
 
-# Phase 2: Enable Agent Identity
-azd env set AZURE_AGENT_IDENTITY_ENABLED true
-azd provision --no-prompt
-```
+`AGENT_IDENTITY_PROVISIONING_MODE=adopt` is the default. `AGENT_IDENTITY_ENABLED`
+controls the separate Azure credential migration; it is not a registration switch.
+`AGENT_REGISTRY_ENABLED` opts into this repository's separate Graph publisher,
+and stays false when the Agent 365 workflow owns registration. Tenant-authorized
+onboarding/consent is still required; no CLI bypasses Conditional Access.
+
+Custom directory automation is available only through the explicit `managed`
+mode in the [advanced scoped guide](docs/AGENTS_STAGED_IDENTITY_DEPLOYMENT.md).
+Empty IDs or failed preflight stop identity-enabled rollout; there is no fallback.
+Private ACR builds require an existing VNet-attached task pool or a connected
+Docker runner; build scripts never temporarily enable public registry access.
 
 ---
 
@@ -157,9 +166,10 @@ python tests/test_apim_mcp_connection.py --use-az-token
 | Document                                                                              | Description                                      |
 | ------------------------------------------------------------------------------------- | ------------------------------------------------ |
 | [AGENTS_ARCHITECTURE.md](docs/AGENTS_ARCHITECTURE.md)                                 | System architecture and component diagrams       |
-| [AGENTS_APPROVALS.md](docs/AGENTS_APPROVALS.md)                                       | Agent 365 approvals and human-in-the-loop (HITL) |
+| [agent-approvals/README.md](agent-approvals/README.md)                                | Next Best Action Logic App/Teams human approvals |
 | [AGENTS_DEPLOYMENT_NOTES.md](docs/AGENTS_DEPLOYMENT_NOTES.md)                         | Detailed deployment notes                        |
 | [AGENTS_IDENTITY_DESIGN.md](docs/AGENTS_IDENTITY_DESIGN.md)                           | Identity architecture design                     |
+| [docs/AGENTS_AGENT365_ONBOARDING.md](docs/AGENTS_AGENT365_ONBOARDING.md)                | Minimal registration, ownership and observability |
 | [AGENTS_AGENT_LEARNING_DESIGN.md](docs/AGENTS_AGENT_LEARNING_DESIGN.md)               | Reinforcement learning (Azure Agents Learning SDK) documentation |
 | [AGENTS_AGENT_LEARNING_TEST_RESULTS.md](docs/AGENTS_AGENT_LEARNING_TEST_RESULTS.md)   | Learning SDK test results                        |
 | [AGENTS_EVALUATIONS.md](docs/AGENTS_EVALUATIONS.md)                                   | Agent evaluation framework                       |

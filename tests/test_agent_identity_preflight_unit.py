@@ -139,6 +139,45 @@ def run(graph, **kwargs):
     return preflight.identity_preflight(graph, managed_identity_principal_id=MI, blueprint_app_id=BLUEPRINT, **kwargs)
 
 
+def run_adoption(graph):
+    return preflight.adopted_identity_preflight(graph, managed_identity_principal_id=MI, blueprint_app_id=BLUEPRINT, agent_identity_id=AGENT)
+
+
+def test_platform_adoption_needs_no_uami_or_blueprint_management_roles():
+    graph, directory = graph_client(caller_permissions={"User.Read"})
+    directory.grants = {}
+    directory.catalog = {}
+    directory.fics[0]["name"] = "configured-by-blueprint-owner"
+    directory.fics.append({"name": "unrelated-github-fic", "claimsMatchingExpression": {}})
+    report = run_adoption(graph)
+    assert report["status"] == "satisfied" and report["deploymentReady"] is True
+    assert report["readOnly"] is True and report["stage"] == "adopt"
+    assert not any("appRoleAssignments" in url or registry.GRAPH_APP_ID in url or MI in url for _, url in directory.calls)
+    assert all(c.get("managementPermissionsRequired") is False for c in report["checks"][:2])
+
+
+@pytest.mark.parametrize("problem", ["missing-child", "wrong-parent", "disabled-child", "disabled-blueprint", "missing-fic", "wrong-fic", "denied-read"])
+def test_platform_adoption_still_blocks_unverified_identity_or_trust(problem):
+    graph, directory = graph_client()
+    if problem == "missing-child":
+        directory.overrides[f"/v1.0/servicePrincipals/{AGENT}/microsoft.graph.agentIdentity"] = [Response({}, status=404)]
+    elif problem == "wrong-parent":
+        directory.agent["agentIdentityBlueprintId"] = CLIENT
+    elif problem == "disabled-child":
+        directory.agent["accountEnabled"] = False
+    elif problem == "disabled-blueprint":
+        directory.principals[0]["accountEnabled"] = False
+    elif problem == "missing-fic":
+        directory.fics = []
+    elif problem == "wrong-fic":
+        directory.fics[0]["subject"] = CLIENT
+    elif problem == "denied-read":
+        directory.overrides[BLUEPRINT_PATH] = [Response({"error": "SECRET"}, status=403)]
+    report = run_adoption(graph)
+    assert report["status"] == "blocked" and report["deploymentReady"] is False
+    assert "SECRET" not in json.dumps(report)
+
+
 def component(report, name):
     return next(c for c in report["checks"] if c["component"] == name)
 

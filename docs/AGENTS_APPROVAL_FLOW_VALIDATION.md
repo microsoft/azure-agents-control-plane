@@ -18,7 +18,7 @@ the human approval.
 | Deployed image digest | `sha256:4864f1ccc0af26c678290f5b02424855375112b667249f6570069e57a386b9bb` |
 | Workflow | `logic-approval-amotbcj3zss6m`, Enabled |
 | Teams OAuth connection | `logic-approval-amotbcj3zss6m-teams`, Connected after manual authorization in external Edge |
-| Human decision surface | Private **Agents365 Approvals** team, standard **Approvals** channel, Microsoft Workflows app installed |
+| Human decision surface | Private **Agent Approvals** team (named **Agents365 Approvals** during the September 9 test), standard **Approvals** channel, Microsoft Workflows app installed |
 | Public callback | `https://apim-lciya4wh6qefy.azure-api.net/agent-approvals/callback` |
 | Private callback | APIM rewrites to the authenticated Python `/approvals/callback` route |
 | Durable storage | Cosmos `mcpdb/approvals`, partition key `/environment` |
@@ -36,6 +36,38 @@ environment values, source, or generated manifests. Agent Identity remained
 disabled: this deployment uses the existing workload-identity bootstrap UAMI.
 
 ## Live evidence
+
+### September 11 branding and Next Best Action binding
+
+The following changes were applied and read back successfully on **2026-09-11**:
+
+- Renamed the existing private team from **Agents365 Approvals** to **Agent
+  Approvals** and clarified its description. The team ID
+  `52762f9e-4c8a-4b59-bd32-73c2e99e551c`, channel, membership and Microsoft
+  **Workflows** app were preserved. The authenticated user and existing group
+  owner were verified as `christava@microsoft.com`.
+- Updated only the existing Logic App's card/acknowledgement and descriptive
+  metadata. The deployed card explicitly names **Next Best Action**, the
+  `next_best_action` MCP tool and **recommendation generation only**.
+- Verified workflow version `08584124465522529698`, provisioning `Succeeded`,
+  state `Enabled`, unchanged parameters/routing and the same system identity.
+  Definition SHA-256:
+  `6de771c28430e16eb3367aee3bcf9d7d0c27ef215d11fd9952b71a236cee1487`.
+- The actual Teams code is now composed from the versioned files under
+  [../agent-approvals/teams/README.md](../agent-approvals/teams/README.md), not
+  the former unused `Action.Execute` samples. No custom Teams app package exists.
+- Offline validation after the rename: **736 tests and 269 subtests passed**, two
+  platform-specific skips. The approval module, parent and scoped templates
+  compile; the compiled Teams card matches the canonical source.
+- No permission grants, Teams OAuth reauthorization, Cosmos data migration,
+  workload image rollout, synthetic approval, or new human decision occurred
+  in this update.
+
+**This is transport/configuration verification, not a new end-to-end pass.** ARM
+reported the AKS cluster power state as **Stopped** on September 11; the local
+Kubernetes lookup failed with DNS/timeout errors. A running workload and a new
+human decision are still required for a fresh approval test. The evidence below
+describes the September 9 run, not the September 11 card.
 
 | Check | Observed result |
 | --- | --- |
@@ -180,7 +212,7 @@ never paste tokens, keys, or signed URLs in chat or command arguments.
 - [scripts/configure_approval_runtime.py](../scripts/configure_approval_runtime.py):
   validates settings, fetches the signed trigger in memory, and applies Secret
   and ConfigMap without exposing the webhook.
-- [Canonical workflow and Adaptive Card](../agent365/workflows/agent_approval_logic_app.json).
+- [Workflow definition](../agent-approvals/workflows/agent_approval_logic_app.json) and [canonical Teams card](../agent-approvals/teams/agent_approval_card.json).
 - [Exported Mermaid activity diagram](AGENTS_APPROVAL_FLOW.mermaid).
 
 If an existing connection has been authorized, update only the workflow when

@@ -101,6 +101,10 @@ spec:
           value: "${AGENT_IDENTITY_BLUEPRINT_APP_ID}"
         - name: AGENT_IDENTITY_DISPLAY_NAME
           value: "${AGENT_IDENTITY_DISPLAY_NAME}"
+        # off | console | agent365; telemetry identity is independent of the
+        # Azure data-plane AGENT_IDENTITY_ENABLED switch above.
+        - name: AGENT_OBSERVABILITY_MODE
+          value: "${AGENT_OBSERVABILITY_MODE}"
         # Bootstrap identity, distinct from both Agent Identity IDs
         - name: MCP_SERVER_IDENTITY_CLIENT_ID
           value: "${MCP_SERVER_IDENTITY_CLIENT_ID}"

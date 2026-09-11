@@ -89,8 +89,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--created-by-id", default=os.getenv("AGENT_REGISTRY_CREATED_BY_ID"))
     parser.add_argument("--source-created-at", default=os.getenv("AGENT_REGISTRY_SOURCE_CREATED_AT"))
     parser.add_argument("--source-modified-at", default=os.getenv("AGENT_REGISTRY_SOURCE_MODIFIED_AT"))
-    parser.add_argument("--instance-manifest", default=str(ROOT / "agent365/manifests/agent_instance.json"))
-    parser.add_argument("--card-manifest", default=str(ROOT / "agent365/manifests/agent_card_manifest.json"))
+    parser.add_argument("--instance-manifest", default=str(ROOT / "agent-approvals/manifests/agent_instance.json"))
+    parser.add_argument("--card-manifest", default=str(ROOT / "agent-approvals/manifests/agent_card_manifest.json"))
     return parser
 
 
@@ -119,14 +119,15 @@ def _template(path: str, values: dict[str, Any]) -> dict:
     return resolve(document)
 
 
-def publication_inputs(args) -> tuple[dict, dict, Path | None]:
-    environment = os.getenv("AZURE_ENV_NAME")
+def publication_inputs(args, *, environ=None) -> tuple[dict, dict, Path | None]:
+    environ = os.environ if environ is None else environ
+    environment = environ.get("AZURE_ENV_NAME")
     if environment and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", environment):
         raise RegistryError("invalid_configuration", "AZURE_ENV_NAME must be a safe environment name, not a path.")
     source_id = args.source_agent_id or (f"azure-agents-control-plane:{environment}:next-best-action" if environment else None)
     owner_values = args.owner_id
     if owner_values is None:
-        owner_env = os.getenv("AGENT_REGISTRY_OWNER_IDS") or os.getenv("AGENT_REGISTRY_OWNER_ID") or os.getenv("OWNER_USER_ID", "")
+        owner_env = environ.get("AGENT_REGISTRY_OWNER_IDS") or environ.get("AGENT_REGISTRY_OWNER_ID") or environ.get("OWNER_USER_ID", "")
         owner_values = [v.strip() for v in owner_env.split(",") if v.strip()]
     if not owner_values:
         raise RegistryError("invalid_configuration", "Supply --owner-id or AGENT_REGISTRY_OWNER_IDS with at least one user/service-principal object ID.")

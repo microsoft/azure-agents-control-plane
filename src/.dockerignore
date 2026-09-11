@@ -4,3 +4,4 @@ __pycache__
 *.py[cod]
 .env
 local.settings.json
+a365.generated.config.json

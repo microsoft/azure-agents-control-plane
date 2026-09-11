@@ -1,5 +1,9 @@
 """Read-only permission preflight for the repo's identity deployment scripts.
 
+This CLI checks ADVANCED managed provisioning permissions, not ordinary Agent
+365 onboarding. Normal deployment_gate.py defaults to adopted_identity_preflight,
+which verifies existing identities/trust with no management-grant inspection.
+
 Uses ONLY the existing deployment az login via AzureCliCredential. Reads actual
 Graph appRoleAssignments on the CONFIGURATION MI and BLUEPRINT PRINCIPAL. The
 operator's token scopes, MI appRoles, requiredResourceAccess, Azure RBAC roles,
@@ -208,7 +212,7 @@ def _active_principal(record: dict, expected_id: str | None = None):
         raise RegistryError("principal_unavailable", "Principal has a Microsoft administrative restriction; no automatic enable/unblock is allowed.")
 
 
-def _blueprint_context(graph: GraphClient, app_id: str, mi_id: str | None) -> dict:
+def _blueprint_context(graph: GraphClient, app_id: str, mi_id: str | None, *, any_matching_fic: bool = False) -> dict:
     application = graph.request("GET", f"/v1.0/applications(appId='{app_id}')/microsoft.graph.agentIdentityBlueprint?$select=id,appId,disabledByMicrosoftStatus")
     object_id = guid(application.get("id"), "Blueprint application object ID")
     if application.get("appId") != app_id:
@@ -224,20 +228,58 @@ def _blueprint_context(graph: GraphClient, app_id: str, mi_id: str | None) -> di
     fics = graph.collection(f"/beta/applications/{object_id}/microsoft.graph.agentIdentityBlueprint/federatedIdentityCredentials")
     if any(not isinstance(f.get("name"), str) for f in fics):
         raise RegistryError("inconclusive_directory", "FIC inspection returned limited information.")
-    named = [f for f in fics if f.get("name") == "mcp-agent-msi"]
-    if len(named) > 1:
+    named = fics if any_matching_fic else [f for f in fics if f.get("name") == "mcp-agent-msi"]
+    if not any_matching_fic and len(named) > 1:
         raise RegistryError("inconclusive_directory", "Multiple managed-identity FICs have the deployment's name.")
     caller = graph.caller()
     tenant = graph.tenant_id or (caller["tenantId"] if caller else None)
-    if named and (not isinstance(named[0].get("issuer"), str) or not isinstance(named[0].get("subject"), str) or not isinstance(named[0].get("audiences"), list)):
+    if not any_matching_fic and any(not isinstance(f.get("issuer"), str) or not isinstance(f.get("subject"), str) or not isinstance(f.get("audiences"), list) for f in named):
         raise RegistryError("inconclusive_directory", "FIC inspection returned incomplete trust properties.")
     if named and not tenant:
         raise RegistryError("inconclusive_directory", "Cannot determine tenant for FIC validation; supply --tenant-id.")
-    matches = bool(named and mi_id and named[0]["issuer"] == f"https://login.microsoftonline.com/{tenant}/v2.0" and named[0]["subject"] == mi_id and named[0]["audiences"] == ["api://AzureADTokenExchange"] and not named[0].get("claimsMatchingExpression"))
+    matches = bool(mi_id and any(f.get("issuer") == f"https://login.microsoftonline.com/{tenant}/v2.0" and f.get("subject") == mi_id and f.get("audiences") == ["api://AzureADTokenExchange"] and not f.get("claimsMatchingExpression") for f in named))
     return {
         "objectId": object_id, "principalId": guid(principals[0]["id"], "Blueprint principal ID") if principals else None,
         "ficExists": bool(named), "ficMatches": matches,
     }
+
+
+def adopted_identity_preflight(
+    graph: GraphClient, *, managed_identity_principal_id: str,
+    blueprint_app_id: str, agent_identity_id: str,
+) -> dict[str, Any]:
+    """Verify an already-provisioned identity, not the ability to create more.
+
+    The gate resolves the actual UAMI through ARM first. The deployment reader
+    needs typed Agent ID read access/ownership, not UAMI directory read. The UAMI
+    needs federation trust but NO Graph roles. The blueprint does not need child
+    lifecycle permissions merely to authenticate an existing child. No role
+    catalog, appRoleAssignments, consent, or directory writes are consulted.
+    """
+    mi = guid(managed_identity_principal_id, "Bootstrap UAMI object ID")
+    blueprint = guid(blueprint_app_id, "Blueprint client ID")
+    agent_id = guid(agent_identity_id, "Agent identity ID")
+    checks = []
+    try:
+        context = _blueprint_context(graph, blueprint, mi, any_matching_fic=True)
+        if not context["principalId"] or not context["ficMatches"]:
+            raise RegistryError("federation_unverified", "The adopted blueprint must have an enabled principal and trust this runtime UAMI. Ask its owner to configure federation; do not grant directory-management roles to the UAMI.")
+        agent = graph.request("GET", f"/v1.0/servicePrincipals/{agent_id}/microsoft.graph.agentIdentity?$select=id,appId,agentIdentityBlueprintId,accountEnabled,disabledByMicrosoftStatus")
+        _active_principal(agent, agent_id)
+        if agent.get("agentIdentityBlueprintId") != blueprint or (agent.get("appId") and agent["appId"] != agent_id):
+            raise RegistryError("identity_mismatch", "Adopted Agent ID belongs to a different blueprint or has an invalid app/object ID relationship.")
+        checks = [
+            {"component": "configurationManagedIdentity", "status": "satisfied", "principalId": mi, "federation": "matchesConfiguration", "managementPermissionsRequired": False},
+            {"component": "blueprintPrincipal", "status": "satisfied", "principalId": context["principalId"], "blueprintAppId": blueprint, "blueprintObjectId": context["objectId"], "managementPermissionsRequired": False},
+            {"component": "precreatedAgent", "status": "satisfied", "agentIdentityId": agent_id},
+        ]
+    except RegistryError as error:
+        return {"component": "adoptedAgentIdentity", "stage": "adopt", "readOnly": True,
+                "status": "blocked", "deploymentReady": False, "checks": checks,
+                "error": error.as_dict()}
+    return {"component": "adoptedAgentIdentity", "stage": "adopt", "readOnly": True,
+            "status": "satisfied", "deploymentReady": True, "checks": checks,
+            "limitations": ["Verifies existing identity/trust only, not token issuance, downstream Azure RBAC or telemetry consent."]}
 
 
 def _failure(component: str, error: RegistryError, required=True) -> dict:

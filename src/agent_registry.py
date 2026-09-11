@@ -730,6 +730,16 @@ class AgentRegistryPublisher:
         self._patch(CARD_PATH + "/" + quote(card_id, safe=""), desired, read, check)
         return card_id
 
+    def verify_existing_binding(self, value: str, instance: dict, card: dict) -> None:
+        """Read-only gate for adopting a saved registration before deployment.
+
+        Validate the same identity/source/manager and administrative restrictions
+        as publication; a GET or a valid journal alone does not establish them.
+        """
+        instance, card = validate_publication(instance, card)
+        desired = self._legacy_payload(instance, card)[0] if self.api == "entra-beta" else instance
+        self._check_identity(self._get(registry_id(value)), desired, adoption=True)
+
     def publish(
         self, instance: dict, card: dict, *, saved_id: str | None = None,
         journal_path: str | Path | None = None,

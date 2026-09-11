@@ -1,7 +1,12 @@
 > [!CAUTION]
 > These exercises have not been tested. There could be incorrect or missing instructions.
 
-# Optional Exercise: Build Human-in-the-Loop Agent with Agent 365 Approval
+# Optional Exercise: Human-in-the-Loop Agent Approvals
+
+> The current implementation uses Logic Apps and Teams Workflows, not an Agent
+> 365 approval API. Use [../../agent-approvals/README.md](../../agent-approvals/README.md)
+> for the Next Best Action contract. The illustrative execution examples below
+> are not the live recommendation-only authorization contract.
 
 **Duration:** 1 hour
 
@@ -62,14 +67,14 @@ async def execute_with_approval(action: str, params: dict) -> dict:
     return await execute_action(action, params)
 ```
 
-## Step 3: Configure Agent 365 Integration
+## Step 3: Configure Logic App/Teams Integration
 
-Review the Agent 365 approval workflow:
+Review the custom Next Best Action approval workflow:
 
 In VS Code Explorer, navigate to and open:
-- `agent365/workflows/agent_approval_logic_app.json`
-- `agent365/teams/agent_approval_card.json`
-- `agent365/teams/agent_approval_result_card.json`
+- [../../agent-approvals/workflows/agent_approval_logic_app.json](../../agent-approvals/workflows/agent_approval_logic_app.json)
+- [../../agent-approvals/teams/agent_approval_card.json](../../agent-approvals/teams/agent_approval_card.json)
+- [../../agent-approvals/teams/agent_approval_result_card.json](../../agent-approvals/teams/agent_approval_result_card.json)
 
 ## Step 4: Create Unit Tests
 
@@ -132,9 +137,9 @@ Invoke-RestMethod -Uri "http://localhost:8081/message" -Method Post -Body $body 
 
 ---
 
-## Step 8: Review Agent 365 Approvals
+## Step 8: Review Agent Approvals
 
-Agent 365 enables human oversight for critical agent decisions through approval workflows.
+The custom Logic App/Teams workflow provides human review; Python remains the authorization authority.
 
 ### Architecture Overview
 
@@ -146,7 +151,7 @@ Agent 365 enables human oversight for critical agent decisions through approval 
                               │
                               ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                    Agent 365 Approval Flow                            │
+│                  Logic App/Teams Approval Flow                        │
 │           Logic App → Teams Adaptive Card → Human Response            │
 └─────────────────────────────┬────────────────────────────────────────┘
                               │

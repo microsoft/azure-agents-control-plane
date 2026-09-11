@@ -10,14 +10,31 @@ Write-Host "🔧 Post-provision setup..." -ForegroundColor Cyan
 
 # Get environment values from azd
 Write-Host "`n📝 Loading environment values..." -ForegroundColor Cyan
-$envValues = azd env get-values | ConvertFrom-StringData
+$pythonPath = $env:DEPLOYMENT_PYTHON
+if (-not $pythonPath -and (Test-Path './.venv/Scripts/python.exe')) { $pythonPath = (Resolve-Path './.venv/Scripts/python.exe').Path }
+if (-not $pythonPath) { $pythonPath = 'python' }
+$deploymentPython = Get-Command $pythonPath -CommandType Application -ErrorAction Stop | Select-Object -First 1
+$environmentOptions = @('--from-azd')
+if ($env:AZURE_ENV_NAME) { $environmentOptions += "--environment=$($env:AZURE_ENV_NAME)" }
+# KEY=value is parsed as data, not PowerShell or .env escape syntax. Empty values
+# clear stale process settings so build, approval injection and publication agree.
+$records = & $deploymentPython.Source './scripts/deployment_gate.py' --export-env @environmentOptions
+if ($LASTEXITCODE -ne 0) { throw 'Cannot load deployment configuration.' }
+$envValues = @{}
+foreach ($record in $records) {
+  if ($record -notmatch '^([A-Z][A-Z0-9_]*)=(.*)$') { throw 'Invalid deployment setting record.' }
+  $envValues[$matches[1]] = $matches[2]
+  $processValue = if ($matches[2]) { $matches[2] } else { $null }
+  [Environment]::SetEnvironmentVariable($matches[1], $processValue, 'Process')
+}
+$env:DEPLOYMENT_PYTHON = $deploymentPython.Source
+& $deploymentPython.Source './scripts/deployment_gate.py' --check
+if ($LASTEXITCODE -ne 0) { throw 'Stage-one identity/registry gate failed; no build or rollout was started.' }
 
 function Get-DeploymentValue([string]$Name) {
-  # Match the existing property lookup: pipeline conversion can return several
-  # hashtables, and PowerShell's member enumeration handles either shape.
   $value = $envValues.$Name
   if ($null -ne $value) {
-    return ([string]$value).Trim().Trim('"')
+    return ([string]$value).Trim()
   }
   return ''
 }
@@ -42,10 +59,12 @@ if ($mcpAgentRuntime -notin @('python', 'typescript')) {
   Write-Host "Unsupported MCP_AGENT_RUNTIME '$mcpAgentRuntime'. Use 'python' or 'typescript'." -ForegroundColor Red
   exit 1
 }
-$imageTag = if ($mcpAgentRuntime -eq 'typescript') { 'typescript' } else { 'latest' }
+$imageTag = Get-DeploymentValue 'IMAGE_TAG'
+if (-not $imageTag) { $imageTag = if ($mcpAgentRuntime -eq 'typescript') { 'typescript' } else { 'latest' } }
 $tenantId = Get-DeploymentValue 'AZURE_TENANT_ID'
 $agentIdentityEnabled = (Get-DeploymentValue 'AGENT_IDENTITY_ENABLED').ToLowerInvariant()
 if (-not $agentIdentityEnabled) { $agentIdentityEnabled = 'false' }
+$agentObservabilityMode = Get-DeploymentValue 'AGENT_OBSERVABILITY_MODE'
 $agentRegistryEnabled = (Get-DeploymentValue 'AGENT_REGISTRY_ENABLED').ToLowerInvariant()
 if (-not $agentRegistryEnabled) { $agentRegistryEnabled = 'false' }
 $approvalLogicAppEnabled = (Get-DeploymentValue 'APPROVAL_LOGIC_APP_ENABLED').ToLowerInvariant()
@@ -53,13 +72,10 @@ if (-not $approvalLogicAppEnabled) { $approvalLogicAppEnabled = 'false' }
 if ($agentIdentityEnabled -notin @('true', 'false') -or $agentRegistryEnabled -notin @('true', 'false') -or $approvalLogicAppEnabled -notin @('true', 'false')) {
   throw 'AGENT_IDENTITY_ENABLED, AGENT_REGISTRY_ENABLED and APPROVAL_LOGIC_APP_ENABLED must be true or false.'
 }
-if ($agentRegistryEnabled -eq 'true' -and $agentIdentityEnabled -ne 'true') {
-  throw 'Agent Registry publication requires AGENT_IDENTITY_ENABLED=true.'
-}
 $agentIdentityAppId = Get-DeploymentValue 'AGENT_IDENTITY_APP_ID'
 $agentBlueprintAppId = Get-DeploymentValue 'AGENT_IDENTITY_BLUEPRINT_APP_ID'
 $agentBlueprintObjectId = Get-DeploymentValue 'AGENT_IDENTITY_BLUEPRINT_OBJECT_ID'
-if ($agentIdentityEnabled -eq 'true' -and (-not $agentIdentityAppId -or -not $agentBlueprintAppId)) {
+if (($agentIdentityEnabled -eq 'true' -or $agentRegistryEnabled -eq 'true' -or $agentObservabilityMode -eq 'agent365') -and (-not $agentIdentityAppId -or -not $agentBlueprintAppId)) {
   throw 'Enabled Agent Identity requires its actual app and blueprint IDs; the bootstrap UAMI is not a substitute.'
 }
 if ($agentRegistryEnabled -eq 'true' -and -not $agentBlueprintObjectId) {
@@ -93,12 +109,7 @@ if (-not $commitSha) { $commitSha = [string]$env:COMMIT_SHA }
 if ($commitSha -and $commitSha -notmatch '^[0-9a-fA-F]{7,64}$') {
   throw 'COMMIT_SHA must be empty or a hexadecimal commit ID.'
 }
-if ($approvalLogicAppEnabled -eq 'true' -or $agentRegistryEnabled -eq 'true') {
-  $deploymentPython = Get-Command python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $deploymentPython) {
-    throw 'Approval and registry deployment helpers require Python 3.10+ as python on PATH; configure it separately. No interpreter is installed by this step.'
-  }
-}
+# Approval, identity and registry helpers require Python 3.10+; selected above.
 # Fabric configuration
 $fabricEnabled = 'false'
 $fabricCapacityName = $envValues.FABRIC_CAPACITY_NAME.Trim('"')
@@ -166,6 +177,7 @@ $configuredDeployment = $deploymentTemplate `
   -replace '\$\{AZURE_TENANT_ID\}', $tenantId `
   -replace '\$\{MCP_SERVER_IDENTITY_CLIENT_ID\}', $mcpIdentityClientId `
   -replace '\$\{AGENT_IDENTITY_ENABLED\}', $agentIdentityEnabled `
+  -replace '\$\{AGENT_OBSERVABILITY_MODE\}', $agentObservabilityMode `
   -replace '\$\{AGENT_IDENTITY_APP_ID\}', $agentIdentityAppId `
   -replace '\$\{AGENT_IDENTITY_BLUEPRINT_APP_ID\}', $agentBlueprintAppId `
   -replace '\$\{AGENT_IDENTITY_DISPLAY_NAME\}', $agentIdentityDisplayName `
@@ -231,11 +243,21 @@ Write-Host "`n🐳 Building and pushing container image..." -ForegroundColor Cya
 $env:CONTAINER_REGISTRY = $containerRegistry
 $env:MCP_AGENT_RUNTIME = $mcpAgentRuntime
 $env:IMAGE_TAG = $imageTag
-& "./scripts/build-and-push.ps1"
+$env:IMAGE_NAME = 'mcp-agents'
+$buildOutput = & "./scripts/build-and-push.ps1"
 if ($LASTEXITCODE -ne 0) { throw "Container image build failed" }
+$built = $buildOutput | ConvertFrom-Json
+if ($built.status -ne 'built' -or $built.digest -notmatch '^sha256:[0-9a-f]{64}$' -or $built.immutableImage -ne "$containerRegistry/mcp-agents@$($built.digest)") {
+  throw 'Build did not return a verified immutable image; rollout was not started.'
+}
+$configuredDeployment = $configuredDeployment.Replace("$containerRegistry/mcp-agents:$imageTag", $built.immutableImage)
+$configuredDeployment | Out-File -FilePath './k8s/mcp-agents-deployment-configured.yaml' -Encoding utf8
 
 # Deploy to Kubernetes
 Write-Host "`n🚀 Deploying to Kubernetes..." -ForegroundColor Cyan
+# Do not treat a pre-build pass as a durable authorization receipt.
+& $deploymentPython.Source './scripts/deployment_gate.py' --check
+if ($LASTEXITCODE -ne 0) { throw 'Identity/registry gate changed; rollout was not started.' }
 # Inject approval runtime only after the namespace exists and before any rollout.
 if ($approvalLogicAppEnabled -eq 'true') {
   '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"mcp-agents"}}' | kubectl apply -f -
@@ -243,6 +265,7 @@ if ($approvalLogicAppEnabled -eq 'true') {
   # The helper reads grouped or legacy non-secret outputs as JSON. It alone
   # handles listCallbackUrl and streams the signed URL to Kubernetes Secret stdin.
   & $deploymentPython.Source "./scripts/configure_approval_runtime.py" --apply --from-azd `
+    "--azd-environment=$($env:AZURE_ENV_NAME)" `
     "--subscription-id=$subscriptionId" `
     "--resource-group=$rgName" `
     "--namespace=mcp-agents" `
@@ -264,20 +287,9 @@ kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
 if ($LASTEXITCODE -ne 0) { throw "MCP deployment rollout failed" }
 
 if ($agentRegistryEnabled -eq 'true') {
-  if (-not $agentEndpointUrl -or -not $agentIdentityDisplayName -or -not $deploymentEnvironment) {
-    throw 'Agent Registry publication requires MCP_BASE_URL, AGENT_IDENTITY_DISPLAY_NAME and AZURE_ENV_NAME deployment values.'
-  }
   Write-Host "`n📇 Publishing agent to the Agent 365 registry..." -ForegroundColor Cyan
-  $registryArguments = @(
-    './scripts/publish_agent_registry.py', '--publish', "--api=$agentRegistryApi",
-    "--endpoint=$agentEndpointUrl", "--agent-identity-id=$agentIdentityAppId",
-    "--blueprint-object-id=$agentBlueprintObjectId",
-    "--display-name=$agentIdentityDisplayName", "--tenant-id=$tenantId"
-  )
-  foreach ($ownerId in $agentRegistryOwnerIds) { $registryArguments += "--owner-id=$ownerId" }
-  $env:AGENT_REGISTRY_ENABLED = 'true'
-  $env:AZURE_ENV_NAME = $deploymentEnvironment
-  & $deploymentPython.Source @registryArguments
+  # Preserve named environment, source key, manager and durable journal inputs.
+  & $deploymentPython.Source './scripts/deployment_gate.py' --publish-registry
   if ($LASTEXITCODE -ne 0) { throw 'Agent 365 registry publication failed.' }
   Write-Host "✅ Agent 365 registry publication complete" -ForegroundColor Green
 }
