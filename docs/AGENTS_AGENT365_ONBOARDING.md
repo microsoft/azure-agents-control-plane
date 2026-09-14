@@ -33,6 +33,92 @@ This is simpler, **not permissionless**:
 - Azure subscription Owner is not an Entra directory role. Changing CLI tools,
   device-code flows, or registering ordinary metadata cannot bypass tenant policy.
 
+## Administrator-assisted installation
+
+Use the checked-in installer in a tenant where the required administrator can
+temporarily authorize the intended owner. It deliberately cannot bypass the
+restrictions in the current Non-Production tenant.
+
+Before running it:
+
+1. Provision the target `azd` environment through the point where its AKS UAMI
+   exists. The environment must contain the target subscription, tenant,
+   resource group and `MCP_SERVER_IDENTITY_CLIENT_ID`.
+2. In the **hosting tenant**, make `christava@microsoft.com` the signed-in Azure
+   CLI user and temporarily assign that user **Agent ID Developer** and **Global
+   Administrator**. The user also needs Azure **Contributor** on the hosting
+   subscription. Global Administrator is used by the official CLI for tenant
+   consent and the S2S application-role grant; it is not assigned to the agent.
+3. Assign at least one tenant user an eligible observability license. The
+   installer recognizes `Microsoft_Agent_365_Tier3` and `MICROSOFT_365_E7` by
+   default and verifies `consumedUnits > 0`; use
+   `-EligibleLicenseSkuPartNumber` if the tenant exposes an updated part number.
+4. Install Agent 365 CLI `1.1.221` or newer and the repository's Python
+   dependencies. Sign `az`, `azd`, and the Agent 365 CLI into the same tenant.
+
+```powershell
+dotnet tool install --global Microsoft.Agents.A365.DevTools.Cli --version 1.1.221
+python -m pip install -r src/requirements.txt
+az login --tenant <hosting-tenant-id>
+az account set --subscription <hosting-subscription-id>
+```
+
+Use `dotnet tool update --global Microsoft.Agents.A365.DevTools.Cli` when the
+tool is already installed. Do not pass passwords, tokens or client secrets to
+the installer.
+
+Preview the exact standard-agent/S2S flow without tenant writes:
+
+```powershell
+./scripts/install-agent365.ps1 -Environment <azd-environment>
+```
+
+The official CLI currently labels its generic FIC step "create managed
+identity" in dry-run output. The installer prints the resolved existing UAMI
+immediately before that plan; apply mode supplies its principal ID and does not
+ask the Agent 365 CLI to provision Azure hosting.
+
+Then perform onboarding, adoption, the guarded private image build, and rollout:
+
+```powershell
+./scripts/install-agent365.ps1 -Environment <azd-environment> -Apply -Deploy
+```
+
+If the tenant uses a tenant-owned Agent 365 CLI app, pass its application ID as
+`-ClientAppId <guid>`. In apply mode the installer runs `a365 setup requirements`
+first, allowing a Global Administrator to create or consent that client when the
+Microsoft-managed enterprise application is unavailable.
+
+The installer:
+
+- refuses to proceed unless the Azure CLI user is `christava@microsoft.com`;
+- writes local, ignored Agent 365 CLI configuration with `authMode=s2s` and the
+  existing AKS UAMI principal ID, so the official CLI creates the blueprint FIC;
+- runs `a365 setup all` without `--m365`, producing one standard Agent ID and one
+  Agent 365 catalog registration rather than a Teams bot or AI teammate;
+- verifies the owner on the blueprint, Agent ID and registration, verifies the
+  registration-to-Agent-ID binding, UAMI federation and the exact
+  `Agent365.Observability.OtelWrite` application assignment;
+- verifies an eligible license is actually assigned before setting
+  `AGENT_OBSERVABILITY_MODE=agent365`;
+- opens an interactive verification sign-in through the same consented Agent
+  365 CLI client and rejects a token for any other user or client. The ordinary
+  Azure CLI Graph token does not carry Agent ID/Registration scopes and is not
+  treated as proof of those resources;
+- imports only non-secret identity values into the named `azd` environment,
+  leaves `AGENT_IDENTITY_ENABLED=false` for Azure data-plane access, and leaves
+  `AGENT_REGISTRY_ENABLED=false` because the official CLI owns registration;
+- runs the existing deployment gate before the optional `azd provision` build
+  and AKS rollout.
+
+`a365.generated.config.json` can contain a locally protected blueprint secret.
+Both Agent 365 CLI files are ignored by Git; the importer never prints or copies
+that secret. Preserve the files as deployment state because the registration API
+does not provide a safe discovery/list fallback for a lost registration ID.
+After successful setup, remove the temporary Global Administrator assignment.
+Keep only the owner and operational access required by the tenant's lifecycle
+policy.
+
 If developer access/consent cannot be obtained in the Non-Production tenant,
 use an identity provisioned by an approved platform team or an approved development
 tenant. Do not retry permission writes from the blocked device. Agent identities
@@ -43,24 +129,26 @@ tenant**; moving registration to the Teams tenant is not a drop-in workaround.
 ## 1. Register and verify the owner
 
 On a permitted device/tenant, follow the official quickstart's **standard agent**
-path (registration only, externally hosted). Review a dry-run before applying.
-The corresponding current CLI preview is:
+path (registration only, externally hosted). The installer runs this preview:
 
 ```powershell
 a365 setup all --agent-name next-best-action --tenant-id <hosting-tenant-id> --authmode s2s --dry-run
 ```
 
-After review and prerequisite approval, the same command without `--dry-run`
-performs onboarding. **It is a directory/registration write**, not a local check.
+Do not simply remove `--dry-run` from that config-free command: the repository's
+installer first writes `managedIdentityPrincipalId` for the existing AKS UAMI,
+then runs the config-backed command so Agent 365 creates the required federation.
+The `-Apply` installer path is a directory/registration write, not a local check.
 Do not use `--m365`, `--aiteammate`, or supply the MCP URL as a Bot Framework
 messaging endpoint. Do not run `setup requirements` as a read-only check: it can
 repair prerequisites. Stop on missing permissions or uncertain creation; preserve
 the CLI's state instead of creating another registration.
 
 The CLI attempts to set the signed-in developer as blueprint owner and sponsor.
-Verify the resulting **agent identity sponsor, blueprint owner, and catalog
-owner** rather than assuming all three are identical. Use the intended human's
-object ID in that tenant; a sponsor does not need to be an administrator. The
+The installer verifies the resulting **agent identity owner, blueprint owner,
+and catalog owner** rather than assuming all three are identical. Use the intended
+human's object ID in that tenant; an owner does not need to remain an administrator.
+The
 [lifecycle actions page](https://learn.microsoft.com/microsoft-365/admin/manage/agent-actions)
 restricts its "Assign new owner" action to shared Agent Builder/Copilot Studio
 agents; it is not a universal owner-assignment API for arbitrary Python agents.
@@ -92,6 +180,15 @@ Use the following settings in the **named azd environment**:
 | `EXISTING_AGENT_IDENTITY_BLUEPRINT_APP_ID` / `EXISTING_AGENT_IDENTITY_ID` | Same blueprint client ID / child ID, for future Bicep adoption |
 | `AGENT_IDENTITY_DISPLAY_NAME` | Registered agent name |
 
+[`adopt_agent365_onboarding.py`](../scripts/adopt_agent365_onboarding.py) applies
+these values only after live readback succeeds. Run it separately when resuming
+an interrupted administrator setup:
+
+```powershell
+python scripts/adopt_agent365_onboarding.py --environment <azd-environment> `
+  --owner-upn christava@microsoft.com --apply
+```
+
 CLI `agentRegistrationId` is **not** the child ID and is not necessarily compatible
 with this repository's `AGENT_REGISTRY_ID` API/journal. Keep the CLI-managed
 registration in its own state; never send it to the alternate publisher blindly.
@@ -109,7 +206,8 @@ configure an existing federated credential trusting the hosting UAMI:
 
 Any FIC name is accepted in adopt mode if the trust matches. The UAMI itself
 needs **no** blueprint-management permissions. A CLI-created client secret alone
-does not configure this trust; this runtime deliberately does not import it.
+does not configure this trust; the installer therefore pre-seeds the UAMI
+principal before setup, and this runtime deliberately does not import the secret.
 The build reader still needs permission to **read** the typed blueprint, FIC,
 and child. Readback verifies relationships, not downstream token issuance or consent.
 

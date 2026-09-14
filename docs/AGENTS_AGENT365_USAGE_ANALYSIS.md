@@ -145,6 +145,16 @@ transport.**
    path, then verify telemetry in the agent's Activity view.
 6. Retest approvals with a new request and a real human decision after rollout.
 
+For an administrator-enabled target tenant, these steps are now packaged by
+[`install-agent365.ps1`](../scripts/install-agent365.ps1). Its default mode is a
+read-only Agent 365 CLI preview; `-Apply` performs official S2S onboarding and
+verified `azd` adoption, while `-Apply -Deploy` continues through the existing
+gated build and AKS rollout. It requires `christava@microsoft.com` to be the
+signed-in setup user and proves blueprint/Agent ID/registration ownership, UAMI
+federation, the observability application role and an assigned eligible license
+before enabling Agent 365 telemetry. This automation has offline test coverage
+but has not been run against the blocked Non-Production tenant.
+
 The seven UAMI directory-management permissions belong to the custom provisioning
 automation, not ordinary use of an onboarded identity. Tenant-authorized identity
 creation, applicable consent, and Conditional Access still apply. HTTP 200 from
@@ -154,6 +164,9 @@ Implementation guidance: [AGENTS_AGENT365_ONBOARDING.md](AGENTS_AGENT365_ONBOARD
 
 ## Validation limits
 
+- The administrator installer/importer has 27 offline tests. The focused Agent
+   365 identity, registry, observability, deployment and NBA wiring suite passes
+   **317 tests** after this packaging work.
 - The named offline regression suite passed **734 tests and 269 subtests**, with
   two platform-specific skips. Bicep compilation and shell syntax checks passed.
 - Real SDK console behavior and S2S export formatting/auth routing were tested

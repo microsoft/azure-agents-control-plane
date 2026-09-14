@@ -132,6 +132,19 @@ Use the [minimal Agent 365 onboarding guide](docs/AGENTS_AGENT365_ONBOARDING.md)
 3. Add metadata-only tracing: `AGENT_OBSERVABILITY_MODE=console` locally, then
 	`agent365` once S2S telemetry permission and tenant licensing are ready.
 
+For a target tenant with administrator support, preview and then run the complete
+standard-agent onboarding and gated rollout:
+
+```powershell
+./scripts/install-agent365.ps1 -Environment <azd-environment>
+./scripts/install-agent365.ps1 -Environment <azd-environment> -Apply -Deploy
+```
+
+The apply path requires `christava@microsoft.com` to be the signed-in owner and
+verifies the registration, UAMI federation, S2S observability role and assigned
+license before enabling export. See the onboarding guide for temporary tenant
+roles, CLI prerequisites, alternate license SKU names and recovery behavior.
+
 `AGENT_IDENTITY_PROVISIONING_MODE=adopt` is the default. `AGENT_IDENTITY_ENABLED`
 controls the separate Azure credential migration; it is not a registration switch.
 `AGENT_REGISTRY_ENABLED` opts into this repository's separate Graph publisher,
