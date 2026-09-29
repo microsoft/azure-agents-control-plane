@@ -14,9 +14,21 @@ The following two animations show the system architecture at runtime and buildti
 
 ### Runtime Architecture
 
-Runtime Architecture - Describes the request flow through API Management to AKS, workload identity, connections to AI Foundry, Cosmos DB, AI Search, Storage, the Azure Agents Learning SDK, and Fabric with observability through Monitor and App Insights.
+Runtime Architecture - Describes the request flow through API Management to AKS, workload identity, connections to AI Foundry, Cosmos DB, AI Search, Storage, the Azure Agents Learning SDK, and Fabric with observability through Monitor and App Insights. Agents 365 is spotlighted as the enterprise agent registry and AI kill switch.
 
 ![Runtime](runtime.svg)
+
+> **Agents 365: registry and AI kill switch.** Agents 365 provides the central
+> inventory for registered agent identities, ownership, access, and governance.
+> Its **Disable** control is the governance kill switch: administrators can
+> deactivate an agent identity centrally to prevent new authenticated access,
+> while APIM and AKS controls provide runtime containment for active workloads.
+
+The Agents 365 agent identity overview exposes the registered blueprint,
+owners and sponsors, permissions, governance policies, status, and the
+administrator-facing **Disable** action:
+
+![Agents 365 agent registry showing the Disable kill-switch control](docs/images/agents-365-registry-kill-switch.png)
 
 ### Buildtime Architecture
 
