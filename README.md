@@ -117,6 +117,14 @@ The `azd up` command deploys all infrastructure and automatically configures:
 - MCP server deployment with workload identity
 - LoadBalancer service connected to APIM backend
 
+### APIM Managed Identity Token Exchange
+
+The [token-exchange walkthrough](docs/APIM_MANAGED_IDENTITY_TOKEN_EXCHANGE.md)
+shows how APIM's user-assigned managed identity can authenticate as a federated
+Entra application without a client secret. Deployment adds an opt-in policy
+fragment; the guide covers federation trust, backend permissions, and inclusion
+on a protected API operation. Existing OAuth endpoints remain unchanged.
+
 ### Terraform (Optional)
 
 Bicep remains the primary infrastructure definition and `azd up` remains
@@ -194,6 +202,7 @@ python tests/test_apim_mcp_connection.py --use-az-token
 | [agent-approvals/README.md](agent-approvals/README.md)                                | Next Best Action Logic App/Teams human approvals |
 | [AGENTS_DEPLOYMENT_NOTES.md](docs/AGENTS_DEPLOYMENT_NOTES.md)                         | Detailed deployment notes                        |
 | [AGENTS_IDENTITY_DESIGN.md](docs/AGENTS_IDENTITY_DESIGN.md)                           | Identity architecture design                     |
+| [docs/APIM_MANAGED_IDENTITY_TOKEN_EXCHANGE.md](docs/APIM_MANAGED_IDENTITY_TOKEN_EXCHANGE.md) | APIM UAMI-to-application token exchange policy and setup |
 | [docs/AGENTS_AGENT365_ONBOARDING.md](docs/AGENTS_AGENT365_ONBOARDING.md)                | Minimal registration, ownership and observability |
 | [AGENTS_AGENT_LEARNING_DESIGN.md](docs/AGENTS_AGENT_LEARNING_DESIGN.md)               | Reinforcement learning (Azure Agents Learning SDK) documentation |
 | [AGENTS_AGENT_LEARNING_TEST_RESULTS.md](docs/AGENTS_AGENT_LEARNING_TEST_RESULTS.md)   | Learning SDK test results                        |

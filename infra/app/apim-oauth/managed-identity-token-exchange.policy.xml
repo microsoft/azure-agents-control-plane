@@ -1,0 +1,74 @@
+<fragment>
+    <choose>
+        <when condition="@{
+            var scope = context.Variables.GetValueOrDefault&lt;string&gt;(&quot;tokenExchangeScope&quot;, &quot;&quot;);
+            return string.IsNullOrWhiteSpace(scope) || !scope.EndsWith(&quot;/.default&quot;) || scope.Any(char.IsWhiteSpace);
+        }">
+            <return-response>
+                <set-status code="500" reason="Internal Server Error" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body>{"error":"token_exchange_not_configured"}</set-body>
+            </return-response>
+        </when>
+    </choose>
+    <authentication-managed-identity resource="api://AzureADTokenExchange"
+        client-id="{{EntraIdFicClientId}}"
+        output-token-variable-name="tokenExchangeAssertion" ignore-error="false" />
+    <send-request mode="new" response-variable-name="tokenExchangeResponse" timeout="20" ignore-error="true">
+        <set-url>https://login.microsoftonline.com/{{EntraIDTenantId}}/oauth2/v2.0/token</set-url>
+        <set-method>POST</set-method>
+        <set-header name="Content-Type" exists-action="override">
+            <value>application/x-www-form-urlencoded</value>
+        </set-header>
+        <set-body>@{
+            return "client_id=" + System.Net.WebUtility.UrlEncode("{{EntraIDClientId}}")
+                + "&amp;grant_type=client_credentials"
+                + "&amp;scope=" + System.Net.WebUtility.UrlEncode((string)context.Variables["tokenExchangeScope"])
+                + "&amp;client_assertion_type=" + System.Net.WebUtility.UrlEncode("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+                + "&amp;client_assertion=" + System.Net.WebUtility.UrlEncode((string)context.Variables["tokenExchangeAssertion"]);
+        }</set-body>
+    </send-request>
+    <choose>
+        <when condition="@(!context.Variables.ContainsKey(&quot;tokenExchangeResponse&quot;) || context.Variables[&quot;tokenExchangeResponse&quot;] == null || ((IResponse)context.Variables[&quot;tokenExchangeResponse&quot;]).StatusCode != 200)">
+            <return-response>
+                <set-status code="502" reason="Bad Gateway" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body>{"error":"token_exchange_failed"}</set-body>
+            </return-response>
+        </when>
+    </choose>
+    <set-variable name="tokenExchangeAccessToken" value="@{
+        try
+        {
+            var responseBody = ((IResponse)context.Variables[&quot;tokenExchangeResponse&quot;]).Body.As&lt;JObject&gt;();
+            if (responseBody[&quot;access_token&quot;]?.Type != JTokenType.String ||
+                !string.Equals((string)responseBody[&quot;token_type&quot;], &quot;Bearer&quot;, StringComparison.OrdinalIgnoreCase))
+            {
+                return &quot;&quot;;
+            }
+            return (string)responseBody[&quot;access_token&quot;];
+        }
+        catch
+        {
+            return &quot;&quot;;
+        }
+    }" />
+    <choose>
+        <when condition="@(string.IsNullOrWhiteSpace((string)context.Variables[&quot;tokenExchangeAccessToken&quot;]))">
+            <return-response>
+                <set-status code="502" reason="Bad Gateway" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body>{"error":"token_exchange_failed"}</set-body>
+            </return-response>
+        </when>
+    </choose>
+    <set-header name="Authorization" exists-action="override">
+        <value>@("Bearer " + (string)context.Variables["tokenExchangeAccessToken"])</value>
+    </set-header>
+</fragment>

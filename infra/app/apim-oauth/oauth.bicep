@@ -96,6 +96,21 @@ resource EntraIdFicClientIdNamedValue 'Microsoft.ApiManagement/service/namedValu
   }
 }
 
+resource managedIdentityTokenExchangeFragment 'Microsoft.ApiManagement/service/policyFragments@2024-05-01' = {
+  parent: apimService
+  name: 'managed-identity-token-exchange'
+  properties: {
+    description: 'Inbound app-only token exchange: APIM user-assigned managed identity to a federated Entra application. Set tokenExchangeScope before including this fragment.'
+    format: 'rawxml'
+    value: loadTextContent('managed-identity-token-exchange.policy.xml')
+  }
+  dependsOn: [
+    EntraIDTenantIdNamedValue
+    EntraIDClientIdNamedValue
+    EntraIdFicClientIdNamedValue
+  ]
+}
+
 resource OAuthCallbackUriNamedValue 'Microsoft.ApiManagement/service/namedValues@2021-08-01' = {
   parent: apimService
   name: 'OAuthCallbackUri'
