@@ -30,6 +30,39 @@ administrator-facing **Disable** action:
 
 ![Agents 365 agent registry showing the Disable kill-switch control](docs/images/agents-365-registry-kill-switch.png)
 
+#### Azure resources, managed identity, and Agents 365
+
+The MCP agent's Azure access is anchored to a **user-assigned managed identity
+(UAMI)**, exposed as `MCP_SERVER_IDENTITY_CLIENT_ID`. The relationship is:
+
+1. **Azure resources authorize the UAMI.** Bicep assigns roles to the UAMI's
+   principal ID at the resource scope, granting access to Azure AI Foundry,
+   Cosmos DB, AI Search, and Storage blob and queue data. These role assignments
+   tie the agent's identity to the Azure resources it can use.
+2. **AKS workloads authenticate as the UAMI.** The `mcp-agent-sa` Kubernetes
+   service account uses workload identity federation to obtain Microsoft Entra
+   tokens for that UAMI, without storing client secrets or resource keys.
+3. **Agents 365 registers the associated Entra Agent ID.** Standard onboarding
+   configures an Entra agent identity blueprint to trust the existing UAMI's
+   principal ID through federation, then creates an Entra Agent ID and registers
+   it in the Agents 365 catalog with verified human ownership and sponsorship.
+   The UAMI is therefore linked to the registered agent through federation; it
+   is not itself converted into an Entra Agent ID.
+
+By default, `AGENT_IDENTITY_ENABLED=false` keeps Azure data-plane access on the
+UAMI while the registered Agent ID supports Agent 365 governance and observability.
+Registration does not transfer Azure role assignments to the Agent ID. Moving
+Azure access to that identity is a separate, explicit credential migration.
+Likewise, disabling the registered Agent ID does not revoke the UAMI's Azure
+permissions; APIM and AKS controls remain necessary for runtime containment.
+
+See the [Agent 365 onboarding guide](docs/AGENTS_AGENT365_ONBOARDING.md) for
+registration, federation, ownership verification, and migration prerequisites.
+
+Here is a diagram that shows how all of this connects: 
+
+![Azure Security](azure-security.png)
+
 ### Buildtime Architecture
 
 Buildtime Architecture - Describes the developer workflow with VS Code, GitHub Copilot, SpecKit methodology, Python ecosystem, GitHub Actions CI/CD with parallel App Build and Infra Build tracks, deployment to Azure with human-in-the-loop approvals.
