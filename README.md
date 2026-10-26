@@ -210,6 +210,20 @@ Empty IDs or failed preflight stop identity-enabled rollout; there is no fallbac
 Private ACR builds require an existing VNet-attached task pool or a connected
 Docker runner; build scripts never temporarily enable public registry access.
 
+### Optional Fabric specialists and OneLake tools (Python)
+
+The Python MCP runtime includes four Fabric specialists (Lakehouse, Warehouse,
+Pipeline, and Semantic Model), an orchestrator, and OneLake file operations.
+Natural language selects a specialist or action; data queries require executable
+SQL, DAX, or MDX rather than automatic natural-language-to-SQL generation.
+
+Fabric remains **disabled in the default deployment**. The post-provision hooks
+do not automatically create workspaces or enable Fabric access. The
+[Fabric Data Agents setup guide](docs/FABRIC_DATA_AGENTS_SETUP_GUIDE.md) covers
+explicit workspace provisioning, managed-identity permissions, runtime opt-in,
+all eight new MCP tools, and offline tests. These additions are not implemented
+by the TypeScript runtime.
+
 ---
 
 ## Verification
@@ -224,6 +238,15 @@ kubectl get svc -n mcp-agents mcp-agents-loadbalancer
 # Run integration tests
 python tests/test_apim_mcp_connection.py --use-az-token
 ```
+
+Run the mocked Fabric/OneLake regression suite locally, without a Fabric tenant
+or Azure credentials (PowerShell provisioning checks use in-memory CLI/API stubs):
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest .\tests\test_fabric_data_agents.py -q
+```
+
+These tests do not establish live Fabric API compatibility or AKS readiness.
 
 ---
 
@@ -241,6 +264,7 @@ python tests/test_apim_mcp_connection.py --use-az-token
 | [AGENTS_AGENT_LEARNING_TEST_RESULTS.md](docs/AGENTS_AGENT_LEARNING_TEST_RESULTS.md)   | Learning SDK test results                        |
 | [AGENTS_EVALUATIONS.md](docs/AGENTS_EVALUATIONS.md)                                   | Agent evaluation framework                       |
 | [AGENTS_TEST_RESULTS.md](docs/AGENTS_TEST_RESULTS.md)                                 | Integration test results                         |
+| [FABRIC_DATA_AGENTS_SETUP_GUIDE.md](docs/FABRIC_DATA_AGENTS_SETUP_GUIDE.md)             | Optional Python Fabric specialists, OneLake setup, MCP tools, and offline tests |
 | [DEFENDER_FOR_CLOUD_TESTING.md](docs/DEFENDER_FOR_CLOUD_TESTING.md)                   | Defender for Cloud deployment and testing guide  |
 | [SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md)                                         | Security review: private networking and identity |
 | [PURVIEW_INTEGRATION.md](docs/PURVIEW_INTEGRATION.md)                                 | Purview data governance and compliance guide     |

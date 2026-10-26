@@ -41,6 +41,11 @@ from memory import (
     UserAccessDataGenerator, User, AuthEvent, AuthEventType,
 )
 
+from dotenv import load_dotenv
+
+# Fabric modules capture configuration at import time.
+load_dotenv(override=True)
+
 # Fabric Data Agents imports
 try:
     from fabric_tools import (
@@ -128,11 +133,6 @@ from agent_identity import get_agent_credential, get_async_agent_credential
 from agent_observability import telemetry
 
 AGENT365_APPROVAL_AVAILABLE = True
-
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv(override=True)
 
 _runtime_agent_credential = None
 _runtime_agent_async_credential = None
@@ -3234,7 +3234,7 @@ TOOLS = [
     # =========================================
     MCPTool(
         name="fabric_agent_query",
-        description="Intelligent Fabric agent that automatically routes your request to the right specialist (Lakehouse, Warehouse, Pipeline, or Semantic Model). Supports natural-language queries, schema exploration, pipeline management, and cross-domain analytics.",
+        description="Route a request to a Fabric Lakehouse, Warehouse, Pipeline, or Semantic Model specialist. Natural language selects the action; supply sql_query for data queries (no natural-language-to-SQL generation).",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3251,14 +3251,18 @@ TOOLS = [
                 "warehouse_id": {"type": "string", "description": "Target warehouse ID (optional)"},
                 "pipeline_id": {"type": "string", "description": "Target pipeline ID (optional)"},
                 "dataset_id": {"type": "string", "description": "Target semantic model/dataset ID (optional)"},
-                "sql_query": {"type": "string", "description": "Explicit SQL/DAX query to execute (optional)"}
+                "sql_query": {"type": "string", "description": "Executable SQL/DAX/MDX for data queries"},
+                "run_id": {"type": "string", "description": "Pipeline run ID for status monitoring"},
+                "pipeline_parameters": {"type": "object", "description": "Parameters for a pipeline run"},
+                "wait_for_completion": {"type": "boolean", "description": "Wait for the pipeline terminal status"},
+                "query_language": {"type": "string", "enum": ["DAX", "MDX"], "description": "Semantic model query language (default: DAX)"}
             },
             "required": ["query"]
         }
     ),
     MCPTool(
         name="fabric_agent_cross_domain",
-        description="Execute a cross-domain query spanning multiple Fabric resource types (e.g., query lakehouse data then trigger a pipeline refresh).",
+        description="Delegate sequentially to relevant Fabric specialists and aggregate results. Supply per-agent executable queries; this does not generate SQL or join results.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -3269,7 +3273,21 @@ TOOLS = [
                 "lakehouse_id": {"type": "string", "description": "Lakehouse ID (optional)"},
                 "warehouse_id": {"type": "string", "description": "Warehouse ID (optional)"},
                 "pipeline_id": {"type": "string", "description": "Pipeline ID (optional)"},
-                "dataset_id": {"type": "string", "description": "Dataset ID (optional)"}
+                "dataset_id": {"type": "string", "description": "Dataset ID (optional)"},
+                "queries": {
+                    "type": "object",
+                    "description": "Executable query for each data specialist",
+                    "properties": {
+                        "lakehouse": {"type": "string"},
+                        "warehouse": {"type": "string"},
+                        "semantic_model": {"type": "string"}
+                    },
+                    "additionalProperties": False
+                },
+                "run_id": {"type": "string", "description": "Pipeline run ID for monitoring"},
+                "pipeline_parameters": {"type": "object"},
+                "wait_for_completion": {"type": "boolean"},
+                "query_language": {"type": "string", "enum": ["DAX", "MDX"]}
             },
             "required": ["query"]
         }
@@ -3587,8 +3605,6 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 )
             
             try:
-                import asyncio
-                
                 task_id = str(uuid.uuid4())
                 timestamp = datetime.utcnow().isoformat()
                 
@@ -5181,14 +5197,17 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 )
             query = arguments.get("query", "")
             agent_kwargs = {}
-            for key in ("agent_type", "lakehouse_id", "warehouse_id", "pipeline_id", "dataset_id"):
-                if arguments.get(key):
+            for key in (
+                "agent_type", "lakehouse_id", "warehouse_id", "pipeline_id", "dataset_id",
+                "run_id", "pipeline_parameters", "wait_for_completion", "query_language",
+            ):
+                if key in arguments:
                     agent_kwargs[key] = arguments[key]
             if arguments.get("sql_query"):
                 agent_kwargs["query"] = arguments["sql_query"]
             orchestrator = get_fabric_orchestrator()
             resp = await orchestrator.handle(query, **agent_kwargs)
-            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}])
+            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}], isError=not resp.success)
 
         elif tool_name == "fabric_agent_cross_domain":
             if not FABRIC_AGENTS_AVAILABLE:
@@ -5197,10 +5216,13 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     isError=True,
                 )
             query = arguments.get("query", "")
-            kwargs = {k: arguments[k] for k in ("lakehouse_id", "warehouse_id", "pipeline_id", "dataset_id") if arguments.get(k)}
+            kwargs = {k: arguments[k] for k in (
+                "lakehouse_id", "warehouse_id", "pipeline_id", "dataset_id", "queries",
+                "run_id", "pipeline_parameters", "wait_for_completion", "query_language",
+            ) if k in arguments}
             orchestrator = get_fabric_orchestrator()
             resp = await orchestrator.cross_domain_query(query, **kwargs)
-            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}])
+            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}], isError=not resp.success)
 
         elif tool_name == "fabric_agent_list_all":
             if not FABRIC_AGENTS_AVAILABLE:
@@ -5210,7 +5232,7 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                 )
             orchestrator = get_fabric_orchestrator()
             resp = await orchestrator.list_all_resources()
-            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}])
+            return MCPToolResult(content=[{"type": "text", "text": resp.to_json()}], isError=not resp.success)
 
         # =========================================
         # OneLake file operations tools
@@ -5221,13 +5243,14 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     content=[{"type": "text", "text": "OneLake operations not available"}],
                     isError=True,
                 )
-            result = onelake_list_files_tool(
+            result = await asyncio.to_thread(
+                onelake_list_files_tool,
                 lakehouse_id=arguments.get("lakehouse_id", ""),
                 path=arguments.get("path", ""),
                 section=arguments.get("section", "Files"),
                 recursive=arguments.get("recursive", False),
             )
-            return MCPToolResult(content=[{"type": "text", "text": result}])
+            return MCPToolResult(content=[{"type": "text", "text": result}], isError=not json.loads(result).get("success", False))
 
         elif tool_name == "onelake_read_file":
             if not ONELAKE_AVAILABLE:
@@ -5235,12 +5258,13 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     content=[{"type": "text", "text": "OneLake operations not available"}],
                     isError=True,
                 )
-            result = onelake_read_file_tool(
+            result = await asyncio.to_thread(
+                onelake_read_file_tool,
                 lakehouse_id=arguments.get("lakehouse_id", ""),
                 path=arguments.get("path", ""),
                 section=arguments.get("section", "Files"),
             )
-            return MCPToolResult(content=[{"type": "text", "text": result}])
+            return MCPToolResult(content=[{"type": "text", "text": result}], isError=not json.loads(result).get("success", False))
 
         elif tool_name == "onelake_write_file":
             if not ONELAKE_AVAILABLE:
@@ -5248,14 +5272,15 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     content=[{"type": "text", "text": "OneLake operations not available"}],
                     isError=True,
                 )
-            result = onelake_write_file_tool(
+            result = await asyncio.to_thread(
+                onelake_write_file_tool,
                 lakehouse_id=arguments.get("lakehouse_id", ""),
                 path=arguments.get("path", ""),
                 content=arguments.get("content", ""),
                 section=arguments.get("section", "Files"),
                 overwrite=arguments.get("overwrite", True),
             )
-            return MCPToolResult(content=[{"type": "text", "text": result}])
+            return MCPToolResult(content=[{"type": "text", "text": result}], isError=not json.loads(result).get("success", False))
 
         elif tool_name == "onelake_delete_file":
             if not ONELAKE_AVAILABLE:
@@ -5263,13 +5288,14 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     content=[{"type": "text", "text": "OneLake operations not available"}],
                     isError=True,
                 )
-            result = onelake_delete_file_tool(
+            result = await asyncio.to_thread(
+                onelake_delete_file_tool,
                 lakehouse_id=arguments.get("lakehouse_id", ""),
                 path=arguments.get("path", ""),
                 section=arguments.get("section", "Files"),
                 recursive=arguments.get("recursive", False),
             )
-            return MCPToolResult(content=[{"type": "text", "text": result}])
+            return MCPToolResult(content=[{"type": "text", "text": result}], isError=not json.loads(result).get("success", False))
 
         elif tool_name == "onelake_get_file_properties":
             if not ONELAKE_AVAILABLE:
@@ -5277,12 +5303,13 @@ async def _execute_tool_impl(tool_name: str, arguments: Dict[str, Any]) -> MCPTo
                     content=[{"type": "text", "text": "OneLake operations not available"}],
                     isError=True,
                 )
-            result = onelake_get_file_properties_tool(
+            result = await asyncio.to_thread(
+                onelake_get_file_properties_tool,
                 lakehouse_id=arguments.get("lakehouse_id", ""),
                 path=arguments.get("path", ""),
                 section=arguments.get("section", "Files"),
             )
-            return MCPToolResult(content=[{"type": "text", "text": result}])
+            return MCPToolResult(content=[{"type": "text", "text": result}], isError=not json.loads(result).get("success", False))
 
         else:
             return MCPToolResult(

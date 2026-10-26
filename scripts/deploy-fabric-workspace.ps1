@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Provisions Fabric workspace, lakehouse, warehouse, pipeline, and semantic model
-    using the Microsoft Fabric REST API.
+    Provisions a Fabric workspace, lakehouse, and warehouse using the Fabric REST API.
+    Pipelines and semantic models must be created separately.
 
 .DESCRIPTION
     This script automates the manual post-deployment steps for Fabric Data Agents:
@@ -25,6 +25,9 @@
 .PARAMETER FabricEndpoint
     Fabric REST API base URL. Default: https://api.fabric.microsoft.com/v1
 
+.PARAMETER Environment
+    Named azd environment. Defaults to AZURE_ENV_NAME or the default azd environment.
+
 .EXAMPLE
     ./deploy-fabric-workspace.ps1
     ./deploy-fabric-workspace.ps1 -WorkspaceName "my-fabric-ws"
@@ -33,17 +36,23 @@
 param(
     [string]$WorkspaceName = "",
     [string]$CapacityId = "",
-    [string]$FabricEndpoint = "https://api.fabric.microsoft.com/v1"
+    [ValidatePattern('^https://')]
+    [string]$FabricEndpoint = "https://api.fabric.microsoft.com/v1",
+    [string]$Environment = $env:AZURE_ENV_NAME
 )
 
 $ErrorActionPreference = "Stop"
+$FabricEndpoint = $FabricEndpoint.TrimEnd('/')
+if (Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 # ================================================================
 # Helper: Get access token for Fabric API
 # ================================================================
 function Get-FabricToken {
     $token = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-    if (-not $token) {
+    if ($LASTEXITCODE -ne 0 -or -not $token) {
         throw "Failed to acquire Fabric API token. Run 'az login' first."
     }
     return $token
@@ -54,9 +63,13 @@ function Invoke-FabricApi {
         [string]$Method,
         [string]$Url,
         [object]$Body = $null,
-        [string]$Token
+        [string]$Token,
+        [switch]$ResultRequired
     )
 
+    if (-not $Url.StartsWith("$FabricEndpoint/", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Fabric API returned a URL outside the configured endpoint."
+    }
     $headers = @{
         "Authorization" = "Bearer $Token"
         "Content-Type"  = "application/json"
@@ -66,22 +79,61 @@ function Invoke-FabricApi {
         Method  = $Method
         Uri     = $Url
         Headers = $headers
+        TimeoutSec = 60
+        MaximumRedirection = 0
     }
 
     if ($Body) {
         $params["Body"] = ($Body | ConvertTo-Json -Depth 10)
     }
 
-    try {
-        $response = Invoke-RestMethod @params -ErrorAction Stop
+    $response = Invoke-RestMethod @params -ResponseHeadersVariable responseHeaders -StatusCodeVariable statusCode -ErrorAction Stop
+    if ($statusCode -ne 202) {
         return $response
     }
-    catch {
-        $statusCode = $_.Exception.Response.StatusCode.value__
-        $errorBody = $_.ErrorDetails.Message
-        Write-Warning "Fabric API error ($statusCode): $errorBody"
-        throw
+
+    $operationUrl = [string](@($responseHeaders['Location'])[0])
+    if (-not $operationUrl -and $responseHeaders['x-ms-operation-id']) {
+        $operationId = [string](@($responseHeaders['x-ms-operation-id'])[0])
+        $operationUrl = "$FabricEndpoint/operations/$operationId"
     }
+    if (-not $operationUrl.StartsWith("$FabricEndpoint/operations/", [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Fabric accepted the request without a valid operation URL."
+    }
+
+    $deadline = [DateTime]::UtcNow.AddMinutes(10)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $delay = 1
+        if ($responseHeaders['Retry-After']) {
+            $delay = [Math]::Clamp([int](@($responseHeaders['Retry-After'])[0]), 1, 60)
+        }
+        Start-Sleep -Seconds $delay
+        $operation = Invoke-RestMethod -Method GET -Uri $operationUrl -Headers $headers `
+            -TimeoutSec 60 -MaximumRedirection 0 -ResponseHeadersVariable responseHeaders -ErrorAction Stop
+        if ($operation.status -eq 'Succeeded') {
+            if ($ResultRequired) {
+                return Invoke-RestMethod -Method GET -Uri "$operationUrl/result" -Headers $headers `
+                    -TimeoutSec 60 -MaximumRedirection 0 -ErrorAction Stop
+            }
+            return $operation
+        }
+        if ($operation.status -in @('Failed', 'Cancelled')) {
+            throw "Fabric operation $($operation.status): $($operation.error.message)"
+        }
+    }
+    throw "Fabric operation timed out after 10 minutes."
+}
+
+function Get-FabricCollection {
+    param([string]$Url, [string]$Token)
+
+    $items = [System.Collections.Generic.List[object]]::new()
+    do {
+        $page = Invoke-FabricApi -Method GET -Url $Url -Token $Token
+        foreach ($item in $page.value) { $items.Add($item) }
+        $Url = $page.continuationUri
+    } while ($Url)
+    return $items.ToArray()
 }
 
 # ================================================================
@@ -92,31 +144,25 @@ Write-Host "  Fabric Data Agents - Workspace Provisioning" -ForegroundColor Cyan
 Write-Host "============================================`n" -ForegroundColor Cyan
 
 # Try to load azd env values
-$envName = $env:AZURE_ENV_NAME
+$envName = $Environment
 if (-not $envName) {
-    $envName = (azd env list --output json | ConvertFrom-Json | Where-Object { $_.IsDefault }).Name
+    $environments = azd env list --output json
+    if ($LASTEXITCODE -ne 0) { throw "Cannot list azd environments." }
+    $envName = ($environments | ConvertFrom-Json | Where-Object { $_.IsDefault }).Name
 }
-
-if ($envName) {
-    Write-Host "Loading azd environment: $envName" -ForegroundColor Gray
-    $envValues = azd env get-values -e $envName 2>$null
-    if ($envValues) {
-        $envValues | ForEach-Object {
-            if ($_ -match '^([A-Z_]+)="?(.*?)"?$') {
-                [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2])
-            }
-        }
+if (-not $envName) { throw "Select an azd environment with -Environment." }
+Write-Host "Loading azd environment: $envName" -ForegroundColor Gray
+$envValues = azd env get-values -e $envName
+if ($LASTEXITCODE -ne 0) { throw "Cannot load azd environment '$envName'." }
+$envValues | ForEach-Object {
+    if ($_ -match '^([A-Z][A-Z0-9_]*)="?(.*?)"?$') {
+        [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
     }
 }
 
 # Resolve parameters from azd env if not provided
 if (-not $WorkspaceName) {
     $WorkspaceName = "agents-$envName-ws"
-}
-
-if (-not $CapacityId -and $env:FABRIC_CAPACITY_NAME) {
-    Write-Host "Looking up capacity ID for '$($env:FABRIC_CAPACITY_NAME)'..." -ForegroundColor Gray
-    # We need to look up the capacity ID via the Fabric API
 }
 
 Write-Host "Workspace Name  : $WorkspaceName"
@@ -130,19 +176,34 @@ Write-Host "Acquiring Fabric API token..." -ForegroundColor Gray
 $token = Get-FabricToken
 Write-Host "[OK] Token acquired" -ForegroundColor Green
 
+if (-not $CapacityId -and $env:FABRIC_CAPACITY_NAME) {
+    $capacities = @(Get-FabricCollection -Url "$FabricEndpoint/capacities" -Token $token |
+        Where-Object { $_.displayName -eq $env:FABRIC_CAPACITY_NAME })
+    if ($capacities.Count -ne 1) {
+        throw "Expected one visible Fabric capacity named '$($env:FABRIC_CAPACITY_NAME)'. Supply -CapacityId."
+    }
+    $CapacityId = $capacities[0].id
+}
+
 # ================================================================
 # Step 1: Create or find workspace
 # ================================================================
 Write-Host "`n--- Step 1: Workspace ---" -ForegroundColor Yellow
 
-$workspaces = Invoke-FabricApi -Method GET -Url "$FabricEndpoint/workspaces" -Token $token
-$existing = $workspaces.value | Where-Object { $_.displayName -eq $WorkspaceName }
+$workspaces = Get-FabricCollection -Url "$FabricEndpoint/workspaces" -Token $token
+$matchingWorkspaces = @($workspaces | Where-Object { $_.displayName -eq $WorkspaceName })
+if ($matchingWorkspaces.Count -gt 1) { throw "Multiple workspaces are named '$WorkspaceName'. Use a unique name." }
+$existing = $matchingWorkspaces | Select-Object -First 1
 
 if ($existing) {
     $workspaceId = $existing.id
+    if (-not $CapacityId -and -not $existing.capacityId) {
+        throw "The existing workspace needs a Fabric capacity. Supply -CapacityId."
+    }
     Write-Host "[OK] Workspace already exists: $workspaceId" -ForegroundColor Green
 }
 else {
+    if (-not $CapacityId) { throw "Supply -CapacityId or configure FABRIC_CAPACITY_NAME before creating a workspace." }
     Write-Host "Creating workspace '$WorkspaceName'..."
     $wsBody = @{
         displayName = $WorkspaceName
@@ -154,21 +215,17 @@ else {
         $wsBody["capacityId"] = $CapacityId
     }
 
-    $wsResult = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces" -Body $wsBody -Token $token
+    $wsResult = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces" -Body $wsBody -Token $token -ResultRequired
     $workspaceId = $wsResult.id
+    if (-not $workspaceId) { throw "Workspace creation did not return an ID." }
     Write-Host "[OK] Workspace created: $workspaceId" -ForegroundColor Green
 }
 
 # Assign to capacity if provided and not already assigned
-if ($CapacityId -and -not $existing) {
+if ($CapacityId -and $existing -and $existing.capacityId -ne $CapacityId) {
     Write-Host "Assigning workspace to capacity $CapacityId..."
-    try {
-        Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces/$workspaceId/assignToCapacity" -Body @{ capacityId = $CapacityId } -Token $token
-        Write-Host "[OK] Capacity assigned" -ForegroundColor Green
-    }
-    catch {
-        Write-Warning "Capacity assignment may have already been done or failed: $_"
-    }
+    $null = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces/$workspaceId/assignToCapacity" -Body @{ capacityId = $CapacityId } -Token $token
+    Write-Host "[OK] Capacity assigned" -ForegroundColor Green
 }
 
 # ================================================================
@@ -177,8 +234,8 @@ if ($CapacityId -and -not $existing) {
 Write-Host "`n--- Step 2: Lakehouse ---" -ForegroundColor Yellow
 
 $lakehouseName = "AgentsLakehouse"
-$items = Invoke-FabricApi -Method GET -Url "$FabricEndpoint/workspaces/$workspaceId/lakehouses" -Token $token
-$existingLh = $items.value | Where-Object { $_.displayName -eq $lakehouseName }
+$items = Get-FabricCollection -Url "$FabricEndpoint/workspaces/$workspaceId/lakehouses" -Token $token
+$existingLh = $items | Where-Object { $_.displayName -eq $lakehouseName }
 
 if ($existingLh) {
     $lakehouseId = $existingLh.id
@@ -191,8 +248,9 @@ else {
         description = "Lakehouse for AI agent data queries - customer analytics, telemetry, and domain data"
         type        = "Lakehouse"
     }
-    $lhResult = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces/$workspaceId/items" -Body $lhBody -Token $token
+    $lhResult = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces/$workspaceId/items" -Body $lhBody -Token $token -ResultRequired
     $lakehouseId = $lhResult.id
+    if (-not $lakehouseId) { throw "Lakehouse creation did not return an ID." }
     Write-Host "[OK] Lakehouse created: $lakehouseId" -ForegroundColor Green
 }
 
@@ -202,8 +260,8 @@ else {
 Write-Host "`n--- Step 3: Warehouse ---" -ForegroundColor Yellow
 
 $warehouseName = "AgentsWarehouse"
-$whItems = Invoke-FabricApi -Method GET -Url "$FabricEndpoint/workspaces/$workspaceId/warehouses" -Token $token
-$existingWh = $whItems.value | Where-Object { $_.displayName -eq $warehouseName }
+$whItems = Get-FabricCollection -Url "$FabricEndpoint/workspaces/$workspaceId/warehouses" -Token $token
+$existingWh = $whItems | Where-Object { $_.displayName -eq $warehouseName }
 
 if ($existingWh) {
     $warehouseId = $existingWh.id
@@ -216,39 +274,36 @@ else {
         description = "Data warehouse for structured analytics - sales, reporting, aggregations"
         type        = "Warehouse"
     }
-    $whResult = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces/$workspaceId/items" -Body $whBody -Token $token
+    $whResult = Invoke-FabricApi -Method POST -Url "$FabricEndpoint/workspaces/$workspaceId/items" -Body $whBody -Token $token -ResultRequired
     $warehouseId = $whResult.id
+    if (-not $warehouseId) { throw "Warehouse creation did not return an ID." }
     Write-Host "[OK] Warehouse created: $warehouseId" -ForegroundColor Green
 }
 
 # ================================================================
 # Step 4: Output and save to azd env
 # ================================================================
-Write-Host "`n============================================" -ForegroundColor Cyan
-Write-Host "  Provisioning Complete!" -ForegroundColor Cyan
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "Resource IDs:" -ForegroundColor White
-Write-Host "  FABRIC_WORKSPACE_ID  = $workspaceId"
-Write-Host "  FABRIC_LAKEHOUSE_ID  = $lakehouseId"
-Write-Host "  FABRIC_WAREHOUSE_ID  = $warehouseId"
-Write-Host "  FABRIC_LAKEHOUSE_NAME= $lakehouseName"
-Write-Host ""
-
 # Save to azd env
-if ($envName) {
-    Write-Host "Saving to azd environment '$envName'..." -ForegroundColor Gray
-    azd env set FABRIC_WORKSPACE_ID $workspaceId -e $envName 2>$null
-    azd env set FABRIC_LAKEHOUSE_ID $lakehouseId -e $envName 2>$null
-    azd env set FABRIC_WAREHOUSE_ID $warehouseId -e $envName 2>$null
-    azd env set FABRIC_LAKEHOUSE_NAME $lakehouseName -e $envName 2>$null
-    azd env set FABRIC_DATA_AGENTS_ENABLED "true" -e $envName 2>$null
-    Write-Host "[OK] Environment variables saved" -ForegroundColor Green
+Write-Host "Saving to azd environment '$envName'..." -ForegroundColor Gray
+$resourceValues = [ordered]@{
+    FABRIC_WORKSPACE_ID = $workspaceId
+    FABRIC_LAKEHOUSE_ID = $lakehouseId
+    FABRIC_WAREHOUSE_ID = $warehouseId
+    FABRIC_LAKEHOUSE_NAME = $lakehouseName
 }
+foreach ($entry in $resourceValues.GetEnumerator()) {
+    if (-not $entry.Value) { throw "Missing resource ID or name for $($entry.Key)." }
+    azd env set $entry.Key $entry.Value -e $envName
+    if ($LASTEXITCODE -ne 0) { throw "Failed to save $($entry.Key) to azd environment '$envName'." }
+}
+Write-Host "[OK] Environment variables saved" -ForegroundColor Green
+
+Write-Host "`nProvisioning Complete!" -ForegroundColor Green
+foreach ($entry in $resourceValues.GetEnumerator()) { Write-Host "  $($entry.Key) = $($entry.Value)" }
 
 Write-Host "`nNext steps:" -ForegroundColor Yellow
-Write-Host "  1. Run 'azd deploy' to rebuild and deploy with new env vars"
+Write-Host "  1. Follow docs/FABRIC_DATA_AGENTS_SETUP_GUIDE.md for explicit runtime opt-in"
 Write-Host "  2. (Optional) Create a Data Pipeline in the Fabric portal"
 Write-Host "  3. (Optional) Create a Semantic Model / Power BI dataset"
-Write-Host "  4. Upload sample data to the Lakehouse Files section"
+Write-Host "  4. Grant the runtime managed identity the required Fabric workspace access"
 Write-Host ""

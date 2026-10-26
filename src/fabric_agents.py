@@ -2,10 +2,10 @@
 Microsoft Fabric Data Agents — Intelligent Agent Layer
 
 Four specialized agents that orchestrate Fabric tool calls with:
-- Natural-language intent detection and query generation
-- Schema-aware query validation
-- Memory integration (short-term, long-term, facts)
-- Multi-step workflow execution with retry logic
+- Keyword-based intent detection and routing
+- Explicit queries and schema discovery
+- Structured responses and cross-domain result aggregation
+- Pipeline monitoring and bounded retry logic
 
 Agent Types:
     LakehouseAgent   — Spark SQL against Fabric Lakehouses
@@ -17,6 +17,7 @@ Orchestrator:
     FabricAgentOrchestrator — Routes user requests to the right specialist
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -53,6 +54,13 @@ FOUNDRY_PROJECT_ENDPOINT = os.getenv("FOUNDRY_PROJECT_ENDPOINT", "")
 FABRIC_AGENT_MAX_RETRIES = int(os.getenv("FABRIC_AGENT_MAX_RETRIES", "3"))
 FABRIC_PIPELINE_POLL_INTERVAL = int(os.getenv("FABRIC_PIPELINE_POLL_INTERVAL", "30"))
 FABRIC_PIPELINE_TIMEOUT = int(os.getenv("FABRIC_PIPELINE_TIMEOUT", "3600"))
+for _name, _value in (
+    ("FABRIC_AGENT_MAX_RETRIES", FABRIC_AGENT_MAX_RETRIES),
+    ("FABRIC_PIPELINE_POLL_INTERVAL", FABRIC_PIPELINE_POLL_INTERVAL),
+    ("FABRIC_PIPELINE_TIMEOUT", FABRIC_PIPELINE_TIMEOUT),
+):
+    if _value <= 0:
+        raise ValueError(f"{_name} must be a positive integer")
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +150,11 @@ class BaseFabricAgent(ABC):
         )
 
         try:
-            ctx.intent = self._detect_intent(user_query)
+            intent_query = (
+                user_query if self.agent_type == FabricAgentType.PIPELINE
+                else kwargs.get("query") or user_query
+            )
+            ctx.intent = self._detect_intent(intent_query)
             logger.info(
                 f"[{self.agent_type.value}] intent={ctx.intent.value} query={user_query[:80]}"
             )
@@ -175,15 +187,29 @@ class BaseFabricAgent(ABC):
     def _parse_tool_result(raw_json: str) -> Dict[str, Any]:
         """Parse the JSON string returned by a fabric_*_tool function."""
         try:
-            return json.loads(raw_json)
+            result = json.loads(raw_json)
         except json.JSONDecodeError:
+            logger.error("Invalid JSON from Fabric tool")
             return {"success": False, "error": "Invalid JSON from tool", "raw": raw_json}
+        if not isinstance(result, dict):
+            logger.error("Fabric tool returned a non-object result")
+            return {"success": False, "error": "Expected a JSON object from tool"}
+        return result
+
+    @staticmethod
+    def _tool_errors(result: Dict[str, Any]) -> List[str]:
+        if result.get("success"):
+            return []
+        errors = result.get("errors")
+        if isinstance(errors, list) and errors:
+            return [str(error) for error in errors]
+        return [str(result.get("error", "Fabric operation failed"))]
 
     @staticmethod
     def _safe_limit(query: str, default_limit: int = 100) -> str:
-        """Append LIMIT if not present in a query for safety."""
+        """Append a default LIMIT to read queries without an explicit limit."""
         upper = query.upper().strip()
-        if "LIMIT" not in upper and "TOP " not in upper:
+        if re.match(r"^(SELECT|WITH)\b", upper) and not re.search(r"\bLIMIT\s+\d+", upper):
             query = query.rstrip().rstrip(";")
             return f"{query} LIMIT {default_limit}"
         return query
@@ -207,13 +233,17 @@ class LakehouseAgent(BaseFabricAgent):
     agent_type = FabricAgentType.LAKEHOUSE
 
     # Intent keywords
-    _SCHEMA_KEYWORDS = {"schema", "describe", "columns", "tables", "show", "metadata", "structure"}
+    _SCHEMA_KEYWORDS = {"schema", "describe", "columns", "tables", "metadata", "structure"}
     _WRITE_KEYWORDS = {"insert", "create", "write", "append", "merge", "upsert", "update", "delete", "drop"}
 
     def _detect_intent(self, query: str) -> AgentIntent:
         lower = query.lower()
         tokens = set(re.findall(r"\w+", lower))
 
+        if re.match(r"^\s*(SELECT|WITH)\b", query, re.IGNORECASE):
+            return AgentIntent.QUERY_DATA
+        if re.match(r"^\s*(INSERT|CREATE|MERGE|UPDATE|DELETE|DROP|ALTER|TRUNCATE)\b", query, re.IGNORECASE):
+            return AgentIntent.WRITE_DATA
         if tokens & self._SCHEMA_KEYWORDS:
             return AgentIntent.EXPLORE_SCHEMA
         if tokens & self._WRITE_KEYWORDS:
@@ -226,7 +256,9 @@ class LakehouseAgent(BaseFabricAgent):
 
         if not lakehouse_id:
             # Try to discover a lakehouse
-            discovery = self._parse_tool_result(fabric_list_resources_tool("lakehouse"))
+            discovery = self._parse_tool_result(
+                await asyncio.to_thread(fabric_list_resources_tool, "lakehouse")
+            )
             lakehouses = discovery.get("resources", {}).get("lakehouses", [])
             if lakehouses:
                 lakehouse_id = lakehouses[0].get("id", "")
@@ -252,7 +284,7 @@ class LakehouseAgent(BaseFabricAgent):
         sql = ctx.parameters.get("query", ctx.user_query)
         sql = self._safe_limit(sql)
 
-        raw = fabric_query_lakehouse_tool(lakehouse_id, sql, lakehouse_name)
+        raw = await asyncio.to_thread(fabric_query_lakehouse_tool, lakehouse_id, sql, lakehouse_name)
         result = self._parse_tool_result(raw)
         actions.append(f"Executed Spark SQL on lakehouse '{lakehouse_name or lakehouse_id}'")
 
@@ -266,7 +298,7 @@ class LakehouseAgent(BaseFabricAgent):
             data=result,
             actions_taken=actions,
             recommendations=self._generate_recommendations(result, row_count),
-            errors=result.get("errors", []),
+            errors=self._tool_errors(result),
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -276,8 +308,9 @@ class LakehouseAgent(BaseFabricAgent):
         """Run SHOW TABLES and optionally DESCRIBE on each table."""
         actions: List[str] = []
         tables_result = self._parse_tool_result(
-            fabric_query_lakehouse_tool(lakehouse_id, "SHOW TABLES", lakehouse_name)
+            await asyncio.to_thread(fabric_query_lakehouse_tool, lakehouse_id, "SHOW TABLES", lakehouse_name)
         )
+        errors = self._tool_errors(tables_result)
         actions.append("Listed tables in lakehouse")
 
         tables = [
@@ -291,20 +324,22 @@ class LakehouseAgent(BaseFabricAgent):
         for tbl in tables[:10]:
             if not tbl:
                 continue
-            desc_raw = fabric_query_lakehouse_tool(
-                lakehouse_id, f"DESCRIBE TABLE {tbl}", lakehouse_name
+            desc_raw = await asyncio.to_thread(
+                fabric_query_lakehouse_tool, lakehouse_id, f"DESCRIBE TABLE `{tbl.replace('`', '``')}`", lakehouse_name
             )
             desc = self._parse_tool_result(desc_raw)
+            errors.extend(self._tool_errors(desc))
             schema_details["columns"][tbl] = desc.get("results", {}).get("rows", [])
             actions.append(f"Described table '{tbl}'")
 
         return AgentResponse(
-            success=True,
+            success=not errors,
             agent_type=self.agent_type.value,
             intent=ctx.intent.value,
             summary=f"Found {len(tables)} tables in lakehouse '{lakehouse_name}'.",
             data=schema_details,
             actions_taken=actions,
+            errors=errors,
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -344,6 +379,10 @@ class WarehouseAgent(BaseFabricAgent):
     def _detect_intent(self, query: str) -> AgentIntent:
         lower = query.lower()
         tokens = set(re.findall(r"\w+", lower))
+        if re.match(r"^\s*(SELECT|WITH)\b", query, re.IGNORECASE):
+            return AgentIntent.QUERY_DATA
+        if re.match(r"^\s*(INSERT|CREATE|UPDATE|DELETE|ALTER|DROP|MERGE|TRUNCATE)\b", query, re.IGNORECASE):
+            return AgentIntent.WRITE_DATA
         if tokens & self._SCHEMA_KEYWORDS:
             return AgentIntent.EXPLORE_SCHEMA
         if tokens & self._WRITE_KEYWORDS:
@@ -355,7 +394,9 @@ class WarehouseAgent(BaseFabricAgent):
         warehouse_name = ctx.parameters.get("warehouse_name", "")
 
         if not warehouse_id:
-            discovery = self._parse_tool_result(fabric_list_resources_tool("warehouse"))
+            discovery = self._parse_tool_result(
+                await asyncio.to_thread(fabric_list_resources_tool, "warehouse")
+            )
             warehouses = discovery.get("resources", {}).get("warehouses", [])
             if warehouses:
                 warehouse_id = warehouses[0].get("id", "")
@@ -380,7 +421,7 @@ class WarehouseAgent(BaseFabricAgent):
         # T-SQL uses TOP instead of LIMIT
         sql = self._ensure_top(sql)
 
-        raw = fabric_query_warehouse_tool(warehouse_id, sql, warehouse_name)
+        raw = await asyncio.to_thread(fabric_query_warehouse_tool, warehouse_id, sql, warehouse_name)
         result = self._parse_tool_result(raw)
         actions.append(f"Executed T-SQL on warehouse '{warehouse_name or warehouse_id}'")
 
@@ -394,7 +435,7 @@ class WarehouseAgent(BaseFabricAgent):
             data=result,
             actions_taken=actions,
             recommendations=self._generate_recommendations(result, row_count),
-            errors=result.get("errors", []),
+            errors=self._tool_errors(result),
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -404,13 +445,15 @@ class WarehouseAgent(BaseFabricAgent):
         actions: List[str] = []
 
         # Use INFORMATION_SCHEMA for T-SQL
-        tables_raw = fabric_query_warehouse_tool(
+        tables_raw = await asyncio.to_thread(
+            fabric_query_warehouse_tool,
             warehouse_id,
             "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE "
             "FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME",
             warehouse_name,
         )
         tables_result = self._parse_tool_result(tables_raw)
+        errors = self._tool_errors(tables_result)
         actions.append("Queried INFORMATION_SCHEMA.TABLES")
 
         tables = tables_result.get("results", {}).get("rows", [])
@@ -422,25 +465,30 @@ class WarehouseAgent(BaseFabricAgent):
             table_schema = tbl.get("TABLE_SCHEMA", "dbo")
             if not table_name:
                 continue
-            col_raw = fabric_query_warehouse_tool(
+            escaped_name = table_name.replace("'", "''")
+            escaped_schema = table_schema.replace("'", "''")
+            col_raw = await asyncio.to_thread(
+                fabric_query_warehouse_tool,
                 warehouse_id,
                 f"SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH "
                 f"FROM INFORMATION_SCHEMA.COLUMNS "
-                f"WHERE TABLE_NAME = '{table_name}' AND TABLE_SCHEMA = '{table_schema}'",
+                f"WHERE TABLE_NAME = '{escaped_name}' AND TABLE_SCHEMA = '{escaped_schema}'",
                 warehouse_name,
             )
             col_result = self._parse_tool_result(col_raw)
+            errors.extend(self._tool_errors(col_result))
             fqn = f"{table_schema}.{table_name}"
             schema_details["columns"][fqn] = col_result.get("results", {}).get("rows", [])
             actions.append(f"Described columns for '{fqn}'")
 
         return AgentResponse(
-            success=True,
+            success=not errors,
             agent_type=self.agent_type.value,
             intent=ctx.intent.value,
             summary=f"Found {len(tables)} tables in warehouse '{warehouse_name}'.",
             data=schema_details,
             actions_taken=actions,
+            errors=errors,
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -448,9 +496,15 @@ class WarehouseAgent(BaseFabricAgent):
     def _ensure_top(sql: str, default_top: int = 100) -> str:
         """Add TOP clause if missing for safety."""
         upper = sql.upper().strip()
-        if upper.startswith("SELECT") and "TOP " not in upper and "LIMIT" not in upper:
+        if re.match(r"^SELECT\b", upper) and not re.search(r"\bTOP\s*(?:\(|\d)", upper):
             sql = sql.strip()
-            sql = re.sub(r"^(SELECT)\s", rf"\1 TOP {default_top} ", sql, count=1, flags=re.IGNORECASE)
+            sql = re.sub(
+                r"^(SELECT(?:\s+(?:DISTINCT|ALL))?)\b",
+                rf"\1 TOP {default_top}",
+                sql,
+                count=1,
+                flags=re.IGNORECASE,
+            )
         return sql
 
     @staticmethod
@@ -495,10 +549,10 @@ class PipelineAgent(BaseFabricAgent):
 
         if tokens & self._RETRY_KEYWORDS:
             return AgentIntent.RETRY_PIPELINE
-        if tokens & self._TRIGGER_KEYWORDS:
-            return AgentIntent.TRIGGER_PIPELINE
         if tokens & self._MONITOR_KEYWORDS:
             return AgentIntent.MONITOR_PIPELINE
+        if tokens & self._TRIGGER_KEYWORDS:
+            return AgentIntent.TRIGGER_PIPELINE
         if tokens & self._LIST_KEYWORDS:
             return AgentIntent.LIST_RESOURCES
         return AgentIntent.TRIGGER_PIPELINE
@@ -522,7 +576,7 @@ class PipelineAgent(BaseFabricAgent):
         )
 
     async def _list_pipelines(self, ctx: AgentContext) -> AgentResponse:
-        raw = fabric_list_resources_tool("pipeline")
+        raw = await asyncio.to_thread(fabric_list_resources_tool, "pipeline")
         result = self._parse_tool_result(raw)
         pipelines = result.get("resources", {}).get("pipelines", [])
 
@@ -533,6 +587,7 @@ class PipelineAgent(BaseFabricAgent):
             summary=f"Found {len(pipelines)} data pipelines in workspace.",
             data={"pipelines": pipelines},
             actions_taken=["Listed workspace pipelines"],
+            errors=self._tool_errors(result),
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -551,28 +606,39 @@ class PipelineAgent(BaseFabricAgent):
                 elapsed_seconds=ctx.elapsed_seconds,
             )
 
-        raw = fabric_trigger_pipeline_tool(pipeline_id, pipeline_name, params_json)
+        raw = await asyncio.to_thread(fabric_trigger_pipeline_tool, pipeline_id, pipeline_name, params_json)
         result = self._parse_tool_result(raw)
+        success = bool(result.get("success"))
+        errors = self._tool_errors(result)
         actions = [f"Triggered pipeline '{pipeline_name or pipeline_id}'"]
 
         run_id = result.get("run_id", "")
 
         # Optionally wait for completion
         wait = ctx.parameters.get("wait_for_completion", False)
-        if wait and run_id:
+        if wait and success and run_id:
             status_result = await self._poll_until_complete(
                 pipeline_id, run_id, pipeline_name
             )
             result["final_status"] = status_result
+            success = bool(status_result.get("success")) and status_result.get("status") == PipelineRunStatus.SUCCEEDED.value
+            if not success:
+                errors = self._tool_errors(status_result) or [
+                    f"Pipeline finished with status {status_result.get('status', 'Unknown')}"
+                ]
             actions.append(f"Waited for completion — final status: {status_result.get('status', 'unknown')}")
+        elif wait and success:
+            success = False
+            errors = ["Pipeline trigger did not return a run_id to monitor"]
 
         return AgentResponse(
-            success=result.get("success", False),
+            success=success,
             agent_type=self.agent_type.value,
             intent=ctx.intent.value,
             summary=f"Pipeline '{pipeline_name or pipeline_id}' triggered. Run ID: {run_id}",
             data=result,
             actions_taken=actions,
+            errors=errors,
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -591,7 +657,7 @@ class PipelineAgent(BaseFabricAgent):
                 elapsed_seconds=ctx.elapsed_seconds,
             )
 
-        raw = fabric_get_pipeline_status_tool(pipeline_id, run_id, pipeline_name)
+        raw = await asyncio.to_thread(fabric_get_pipeline_status_tool, pipeline_id, run_id, pipeline_name)
         result = self._parse_tool_result(raw)
         status = result.get("status", "Unknown")
 
@@ -602,6 +668,7 @@ class PipelineAgent(BaseFabricAgent):
             summary=f"Pipeline '{pipeline_name or pipeline_id}' run {run_id} — status: {status}",
             data=result,
             actions_taken=[f"Checked status of run {run_id}"],
+            errors=self._tool_errors(result),
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -626,19 +693,19 @@ class PipelineAgent(BaseFabricAgent):
         last_result: Dict[str, Any] = {}
 
         for attempt in range(1, FABRIC_AGENT_MAX_RETRIES + 1):
-            raw = fabric_trigger_pipeline_tool(pipeline_id, pipeline_name, params_json)
+            raw = await asyncio.to_thread(fabric_trigger_pipeline_tool, pipeline_id, pipeline_name, params_json)
             result = self._parse_tool_result(raw)
             run_id = result.get("run_id", "")
             actions.append(f"Attempt {attempt}: triggered run {run_id}")
 
-            if run_id:
+            if result.get("success") and run_id:
                 status_result = await self._poll_until_complete(
                     pipeline_id, run_id, pipeline_name
                 )
                 final_status = status_result.get("status", "Unknown")
                 actions.append(f"Attempt {attempt}: final status = {final_status}")
 
-                if final_status == PipelineRunStatus.SUCCEEDED.value:
+                if status_result.get("success") and final_status == PipelineRunStatus.SUCCEEDED.value:
                     result["final_status"] = status_result
                     return AgentResponse(
                         success=True,
@@ -669,27 +736,30 @@ class PipelineAgent(BaseFabricAgent):
         self, pipeline_id: str, run_id: str, pipeline_name: str
     ) -> Dict[str, Any]:
         """Poll pipeline status until terminal state or timeout."""
-        import asyncio
-
         terminal_states = {
             PipelineRunStatus.SUCCEEDED.value,
             PipelineRunStatus.FAILED.value,
             PipelineRunStatus.CANCELLED.value,
         }
-        elapsed = 0
+        deadline = time.monotonic() + FABRIC_PIPELINE_TIMEOUT
 
-        while elapsed < FABRIC_PIPELINE_TIMEOUT:
-            raw = fabric_get_pipeline_status_tool(pipeline_id, run_id, pipeline_name)
+        while time.monotonic() < deadline:
+            raw = await asyncio.to_thread(fabric_get_pipeline_status_tool, pipeline_id, run_id, pipeline_name)
             result = self._parse_tool_result(raw)
             status = result.get("status", "Unknown")
 
-            if status in terminal_states:
+            if not result.get("success") or status in terminal_states:
                 return result
 
-            await asyncio.sleep(FABRIC_PIPELINE_POLL_INTERVAL)
-            elapsed += FABRIC_PIPELINE_POLL_INTERVAL
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(FABRIC_PIPELINE_POLL_INTERVAL, remaining))
 
-        return {"status": "Timeout", "message": f"Timed out after {FABRIC_PIPELINE_TIMEOUT}s"}
+        return {
+            "success": False,
+            "status": "Timeout",
+            "error": f"Timed out after {FABRIC_PIPELINE_TIMEOUT}s",
+        }
 
 
 # ===========================================================================
@@ -715,10 +785,12 @@ class SemanticModelAgent(BaseFabricAgent):
         lower = query.lower()
         tokens = set(re.findall(r"\w+", lower))
 
-        if {"list", "show", "discover", "available"} & tokens:
-            return AgentIntent.LIST_RESOURCES
+        if re.match(r"^\s*(EVALUATE|SELECT|WITH)\b", query, re.IGNORECASE):
+            return AgentIntent.QUERY_DATA
         if tokens & self._KPI_KEYWORDS:
             return AgentIntent.QUERY_KPI
+        if {"list", "show", "discover", "available"} & tokens:
+            return AgentIntent.LIST_RESOURCES
         return AgentIntent.QUERY_DATA
 
     async def _execute(self, ctx: AgentContext) -> AgentResponse:
@@ -731,7 +803,9 @@ class SemanticModelAgent(BaseFabricAgent):
 
         if not dataset_id:
             # Discover
-            discovery = self._parse_tool_result(fabric_list_resources_tool("semantic_model"))
+            discovery = self._parse_tool_result(
+                await asyncio.to_thread(fabric_list_resources_tool, "semantic_model")
+            )
             models = discovery.get("resources", {}).get("semantic_models", [])
             if models:
                 dataset_id = models[0].get("id", "")
@@ -748,7 +822,9 @@ class SemanticModelAgent(BaseFabricAgent):
             )
 
         dax_query = ctx.parameters.get("query", ctx.user_query)
-        raw = fabric_query_semantic_model_tool(dataset_id, dax_query, dataset_name, query_language)
+        raw = await asyncio.to_thread(
+            fabric_query_semantic_model_tool, dataset_id, dax_query, dataset_name, query_language
+        )
         result = self._parse_tool_result(raw)
 
         return AgentResponse(
@@ -758,11 +834,12 @@ class SemanticModelAgent(BaseFabricAgent):
             summary=f"Queried semantic model '{dataset_name or dataset_id}' with {query_language}.",
             data=result,
             actions_taken=[f"Executed {query_language} query on '{dataset_name or dataset_id}'"],
+            errors=self._tool_errors(result),
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
     async def _list_models(self, ctx: AgentContext) -> AgentResponse:
-        raw = fabric_list_resources_tool("semantic_model")
+        raw = await asyncio.to_thread(fabric_list_resources_tool, "semantic_model")
         result = self._parse_tool_result(raw)
         models = result.get("resources", {}).get("semantic_models", [])
 
@@ -773,6 +850,7 @@ class SemanticModelAgent(BaseFabricAgent):
             summary=f"Found {len(models)} semantic models in workspace.",
             data={"semantic_models": models},
             actions_taken=["Listed semantic models"],
+            errors=self._tool_errors(result),
             elapsed_seconds=ctx.elapsed_seconds,
         )
 
@@ -815,6 +893,16 @@ class FabricAgentOrchestrator:
             agent_key = kwargs.pop("agent_type")
             if agent_key in self._agents:
                 return self._agents[agent_key], kwargs
+            raise ValueError(f"Unknown Fabric agent_type: {agent_key}")
+
+        for parameter, agent_key in (
+            ("lakehouse_id", "lakehouse"),
+            ("warehouse_id", "warehouse"),
+            ("pipeline_id", "pipeline"),
+            ("dataset_id", "semantic_model"),
+        ):
+            if kwargs.get(parameter):
+                return self._agents[agent_key], kwargs
 
         # Keyword-based routing
         if any(kw in lower for kw in ["lakehouse", "spark sql", "delta", "parquet", "onelake"]):
@@ -830,16 +918,6 @@ class FabricAgentOrchestrator:
             "semantic model", "dataset", "dax", "mdx", "power bi", "kpi", "measure",
             "report", "dashboard",
         ]):
-            return self.semantic_model_agent, kwargs
-
-        # Fallback: if explicit IDs are provided, use them
-        if kwargs.get("lakehouse_id"):
-            return self.lakehouse_agent, kwargs
-        if kwargs.get("warehouse_id"):
-            return self.warehouse_agent, kwargs
-        if kwargs.get("pipeline_id"):
-            return self.pipeline_agent, kwargs
-        if kwargs.get("dataset_id"):
             return self.semantic_model_agent, kwargs
 
         # Default — lakehouse (most general-purpose)
@@ -872,8 +950,14 @@ class FabricAgentOrchestrator:
 
     async def list_all_resources(self) -> AgentResponse:
         """Convenience: list every Fabric resource type."""
-        raw = fabric_list_resources_tool("all")
-        result = json.loads(raw) if isinstance(raw, str) else raw
+        if not FABRIC_DATA_AGENTS_ENABLED:
+            return AgentResponse(
+                success=False, agent_type="orchestrator", intent="list_resources",
+                summary="Fabric Data Agents are not enabled. Set FABRIC_DATA_AGENTS_ENABLED=true.",
+                errors=["Fabric Data Agents disabled"],
+            )
+        raw = await asyncio.to_thread(fabric_list_resources_tool, "all")
+        result = BaseFabricAgent._parse_tool_result(raw)
 
         return AgentResponse(
             success=result.get("success", False),
@@ -882,6 +966,7 @@ class FabricAgentOrchestrator:
             summary="Listed all Fabric resources in workspace.",
             data=result.get("resources", {}),
             actions_taken=["Listed lakehouses, warehouses, pipelines, semantic models"],
+            errors=BaseFabricAgent._tool_errors(result),
         )
 
     async def cross_domain_query(
@@ -893,9 +978,18 @@ class FabricAgentOrchestrator:
         Example: "Get customer churn data from lakehouse, then refresh the dashboard
                   by triggering the ETL pipeline."
 
-        The orchestrator splits the request into sub-tasks, delegates each to the
-        appropriate agent, and aggregates results.
+        The orchestrator selects specialists using IDs, query keys, and keywords.
+        Per-specialist executable queries may be supplied in ``queries``.
+        Results are aggregated without generating queries or planning dependencies.
         """
+        if not FABRIC_DATA_AGENTS_ENABLED:
+            return AgentResponse(
+                success=False, agent_type="orchestrator", intent="cross_domain",
+                summary="Fabric Data Agents are not enabled. Set FABRIC_DATA_AGENTS_ENABLED=true.",
+                errors=["Fabric Data Agents disabled"],
+            )
+
+        queries = kwargs.pop("queries", {})
         sub_results: List[Dict[str, Any]] = []
         actions: List[str] = []
 
@@ -903,20 +997,23 @@ class FabricAgentOrchestrator:
         lower = user_query.lower()
         relevant_agents: List[BaseFabricAgent] = []
 
-        if any(kw in lower for kw in ["lakehouse", "spark", "delta", "customer", "churn"]):
+        if kwargs.get("lakehouse_id") or "lakehouse" in queries or any(kw in lower for kw in ["lakehouse", "spark", "delta", "customer", "churn"]):
             relevant_agents.append(self.lakehouse_agent)
-        if any(kw in lower for kw in ["warehouse", "t-sql", "sales", "report"]):
+        if kwargs.get("warehouse_id") or "warehouse" in queries or any(kw in lower for kw in ["warehouse", "t-sql", "sales", "report"]):
             relevant_agents.append(self.warehouse_agent)
-        if any(kw in lower for kw in ["pipeline", "etl", "trigger", "refresh"]):
+        if kwargs.get("pipeline_id") or any(kw in lower for kw in ["pipeline", "etl", "trigger", "refresh"]):
             relevant_agents.append(self.pipeline_agent)
-        if any(kw in lower for kw in ["semantic", "dax", "kpi", "dashboard", "measure"]):
+        if kwargs.get("dataset_id") or "semantic_model" in queries or any(kw in lower for kw in ["semantic", "dax", "kpi", "dashboard", "measure"]):
             relevant_agents.append(self.semantic_model_agent)
 
         if not relevant_agents:
             relevant_agents = [self.lakehouse_agent]
 
         for agent in relevant_agents:
-            resp = await agent.handle(user_query, session_id=session_id, **kwargs)
+            parameters = dict(kwargs)
+            if agent.agent_type.value in queries:
+                parameters["query"] = queries[agent.agent_type.value]
+            resp = await agent.handle(user_query, session_id=session_id, **parameters)
             sub_results.append(asdict(resp))
             actions.extend(resp.actions_taken)
 

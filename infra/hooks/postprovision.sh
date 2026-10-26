@@ -176,6 +176,10 @@ sed -e "s|\${CONTAINER_REGISTRY}|$CONTAINER_REG|g" \
     -e "s|\${AZURE_SEARCH_INDEX_NAME}|$SEARCH_INDEX|g" \
     -e "s|\${AZURE_SEARCH_KNOWLEDGE_BASE_NAME}|task-instructions-kb|g" \
     -e "s|\${FABRIC_API_ENDPOINT}||g" \
+    -e "s|\${FABRIC_AGENT_MAX_RETRIES:-3}|3|g" \
+    -e "s|\${FABRIC_PIPELINE_POLL_INTERVAL:-30}|30|g" \
+    -e "s|\${FABRIC_PIPELINE_TIMEOUT:-3600}|3600|g" \
+    -e "s|\${ONELAKE_MAX_DOWNLOAD_BYTES:-52428800}|52428800|g" \
     -e "s|\${ONTOLOGY_CONTAINER_NAME}|${ONTOLOGY_CONTAINER_NAME:-ontologies}|g" \
     ./k8s/mcp-agents-deployment.yaml > ./k8s/mcp-agents-deployment-configured.yaml
 echo "  ✅ Configured mcp-agents-deployment-configured.yaml"

@@ -12,15 +12,19 @@ Authentication uses workload identity via DefaultAzureCredential.
 All operations go through the OneLake DFS (Data Lake Storage Gen2) endpoint.
 """
 
-import io
+import base64
 import json
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
+from azure.core.exceptions import AzureError
 from azure.identity import DefaultAzureCredential
 import requests
+
+from fabric_tools import FABRIC_DATA_AGENTS_ENABLED
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +40,8 @@ ONELAKE_SCOPE = "https://storage.azure.com/.default"
 
 # Max download size to prevent out-of-memory (50 MB)
 MAX_DOWNLOAD_BYTES = int(os.getenv("ONELAKE_MAX_DOWNLOAD_BYTES", str(50 * 1024 * 1024)))
+if MAX_DOWNLOAD_BYTES <= 0:
+    raise ValueError("ONELAKE_MAX_DOWNLOAD_BYTES must be a positive integer")
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +91,18 @@ class OneLakeClient:
             "x-ms-version": "2021-08-06",
         }
 
+    def _build_path(self, lakehouse_id: str, path: str, section: str) -> str:
+        if not self.workspace_id or any(char in self.workspace_id for char in "/\\?#"):
+            raise ValueError("A valid FABRIC_WORKSPACE_ID is required")
+        if not lakehouse_id or any(char in lakehouse_id for char in "/\\?#"):
+            raise ValueError("A valid lakehouse_id is required")
+        if section not in ("Files", "Tables"):
+            raise ValueError("section must be Files or Tables")
+        clean_path = path.strip("/")
+        if "\\" in clean_path or any(part in (".", "..") for part in clean_path.split("/")):
+            raise ValueError("path must stay within the selected lakehouse section")
+        return f"{lakehouse_id}/{section}" + (f"/{clean_path}" if clean_path else "")
+
     def _build_url(self, lakehouse_id: str, path: str, section: str = "Files") -> str:
         """
         Build a DFS URL for the given lakehouse item and path.
@@ -94,11 +112,10 @@ class OneLakeClient:
             path: Relative path within the section (e.g., "raw/sales.csv")
             section: "Files" or "Tables"
         """
-        clean_path = path.strip("/")
-        return (
-            f"{self.dfs_endpoint}/{self.workspace_id}/{lakehouse_id}"
-            f"/{section}/{clean_path}"
-        )
+        if not path.strip("/"):
+            raise ValueError("A non-empty file or directory path is required")
+        item_path = self._build_path(lakehouse_id, path, section)
+        return f"{self.dfs_endpoint}/{quote(self.workspace_id, safe='')}/{quote(item_path, safe='/')}"
 
     # ------------------------------------------------------------------
     # List
@@ -123,27 +140,30 @@ class OneLakeClient:
         Returns:
             List of dicts with name, path, isDirectory, contentLength, lastModified
         """
-        url = self._build_url(lakehouse_id, path, section)
+        directory = self._build_path(lakehouse_id, path, section)
+        url = f"{self.dfs_endpoint}/{quote(self.workspace_id, safe='')}"
         params: Dict[str, str] = {
             "resource": "filesystem",
             "recursive": str(recursive).lower(),
+            "directory": directory,
         }
-        if path:
-            params["directory"] = f"{section}/{path.strip('/')}"
-
-        resp = requests.get(url, headers=self._headers(), params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
 
         entries: List[Dict[str, Any]] = []
-        for item in data.get("paths", []):
-            entries.append({
-                "name": item.get("name", "").split("/")[-1],
-                "path": item.get("name", ""),
-                "isDirectory": item.get("isDirectory", "false") == "true",
-                "contentLength": int(item.get("contentLength", 0)),
-                "lastModified": item.get("lastModified", ""),
-            })
+        while True:
+            resp = requests.get(url, headers=self._headers(), params=dict(params), timeout=30)
+            resp.raise_for_status()
+            for item in resp.json().get("paths", []):
+                entries.append({
+                    "name": item.get("name", "").split("/")[-1],
+                    "path": item.get("name", ""),
+                    "isDirectory": str(item.get("isDirectory", False)).lower() == "true",
+                    "contentLength": int(item.get("contentLength", 0)),
+                    "lastModified": item.get("lastModified", ""),
+                })
+            continuation = resp.headers.get("x-ms-continuation")
+            if not continuation:
+                break
+            params["continuation"] = continuation
 
         return entries
 
@@ -178,17 +198,18 @@ class OneLakeClient:
         size = int(head_resp.headers.get("Content-Length", 0))
 
         if size > MAX_DOWNLOAD_BYTES:
-            return {
-                "success": False,
-                "error": f"File too large ({size} bytes). Max: {MAX_DOWNLOAD_BYTES}.",
-                "path": path,
-                "size": size,
-            }
+            raise ValueError(f"File too large ({size} bytes). Max: {MAX_DOWNLOAD_BYTES}.")
 
-        resp = requests.get(url, headers=self._headers(), timeout=60)
-        resp.raise_for_status()
+        with requests.get(url, headers=self._headers(), timeout=60, stream=True) as resp:
+            resp.raise_for_status()
+            content_type = resp.headers.get("Content-Type", "application/octet-stream")
+            downloaded = bytearray()
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if len(downloaded) + len(chunk) > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"File exceeds the {MAX_DOWNLOAD_BYTES}-byte download limit.")
+                downloaded.extend(chunk)
 
-        content_type = resp.headers.get("Content-Type", "application/octet-stream")
+        content_bytes = bytes(downloaded)
         is_text = any(
             t in content_type
             for t in ["text/", "json", "csv", "xml"]
@@ -196,16 +217,14 @@ class OneLakeClient:
 
         content: Any
         if is_text:
-            content = resp.content.decode(encoding, errors="replace")
+            content = content_bytes.decode(encoding)
         else:
-            # Return base64 for binary files (or just metadata)
-            import base64
-            content = base64.b64encode(resp.content).decode("ascii")
+            content = base64.b64encode(content_bytes).decode("ascii")
 
         return {
             "success": True,
             "path": path,
-            "size": size,
+            "size": len(content_bytes),
             "contentType": content_type,
             "isText": is_text,
             "content": content,
@@ -246,10 +265,11 @@ class OneLakeClient:
 
         # Step 1: Create
         create_params = {"resource": "file"}
-        if overwrite:
-            create_params["mode"] = "overwrite"
+        create_headers = dict(headers)
+        if not overwrite:
+            create_headers["If-None-Match"] = "*"
         create_resp = requests.put(
-            url, headers=headers, params=create_params, timeout=30
+            url, headers=create_headers, params=create_params, timeout=30
         )
         create_resp.raise_for_status()
 
@@ -354,6 +374,8 @@ _onelake_client: Optional[OneLakeClient] = None
 def get_onelake_client() -> OneLakeClient:
     """Get or create the global OneLake client."""
     global _onelake_client
+    if not FABRIC_DATA_AGENTS_ENABLED:
+        raise ValueError("Fabric Data Agents are not enabled. Set FABRIC_DATA_AGENTS_ENABLED=true.")
     if _onelake_client is None:
         _onelake_client = OneLakeClient()
         logger.info("OneLake client initialized")
@@ -394,7 +416,7 @@ def onelake_list_files_tool(
             "count": len(entries),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-    except Exception as e:
+    except (requests.RequestException, AzureError, ValueError) as e:
         logger.error(f"Error listing OneLake files: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
@@ -419,7 +441,7 @@ def onelake_read_file_tool(
         client = get_onelake_client()
         result = client.read_file(lakehouse_id, path, section)
         return json.dumps(result)
-    except Exception as e:
+    except (requests.RequestException, AzureError, ValueError) as e:
         logger.error(f"Error reading OneLake file: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
@@ -448,7 +470,7 @@ def onelake_write_file_tool(
         client = get_onelake_client()
         result = client.write_file(lakehouse_id, path, content, section, overwrite)
         return json.dumps(result)
-    except Exception as e:
+    except (requests.RequestException, AzureError, ValueError) as e:
         logger.error(f"Error writing OneLake file: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
@@ -475,7 +497,7 @@ def onelake_delete_file_tool(
         client = get_onelake_client()
         result = client.delete_file(lakehouse_id, path, section, recursive)
         return json.dumps(result)
-    except Exception as e:
+    except (requests.RequestException, AzureError, ValueError) as e:
         logger.error(f"Error deleting OneLake file: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
@@ -500,6 +522,6 @@ def onelake_get_file_properties_tool(
         client = get_onelake_client()
         result = client.get_file_properties(lakehouse_id, path, section)
         return json.dumps(result)
-    except Exception as e:
+    except (requests.RequestException, AzureError, ValueError) as e:
         logger.error(f"Error getting OneLake file properties: {e}")
         return json.dumps({"success": False, "error": str(e)})

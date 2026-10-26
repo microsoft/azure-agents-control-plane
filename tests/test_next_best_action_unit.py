@@ -938,6 +938,84 @@ class TestFabricWrappers(unittest.TestCase):
 #  Tests – create_mcp_agent
 # ===========================================================================
 
+class TestFabricMcpIntegration(unittest.TestCase):
+    def test_new_tools_are_registered_once_with_matching_parameters(self):
+        tools = {tool.name: tool for tool in agent.TOOLS}
+        for name in (
+            "fabric_agent_query", "fabric_agent_cross_domain", "fabric_agent_list_all",
+            "onelake_list_files", "onelake_read_file", "onelake_write_file",
+            "onelake_delete_file", "onelake_get_file_properties",
+        ):
+            self.assertIn(name, tools)
+        self.assertIn("run_id", tools["fabric_agent_query"].inputSchema["properties"])
+        self.assertIn("queries", tools["fabric_agent_cross_domain"].inputSchema["properties"])
+        self.assertIn("lakehouse_id", tools["onelake_read_file"].inputSchema["required"])
+
+    @patch.object(agent, "FABRIC_AGENTS_AVAILABLE", True)
+    def test_pipeline_and_query_parameters_reach_orchestrator(self):
+        response = MagicMock(success=True)
+        response.to_json.return_value = json.dumps({"success": True})
+        orchestrator = MagicMock()
+        orchestrator.handle = AsyncMock(return_value=response)
+        arguments = {
+            "query": "check pipeline status", "agent_type": "pipeline",
+            "pipeline_id": "pl-001", "run_id": "run-001",
+            "pipeline_parameters": {"batch": 1}, "wait_for_completion": False,
+            "sql_query": "SELECT id FROM customers", "query_language": "DAX",
+        }
+        with patch.object(agent, "get_fabric_orchestrator", return_value=orchestrator):
+            result = _run(agent._execute_tool_impl("fabric_agent_query", arguments))
+        self.assertFalse(result.isError)
+        orchestrator.handle.assert_awaited_once_with(
+            "check pipeline status", agent_type="pipeline", pipeline_id="pl-001",
+            run_id="run-001", pipeline_parameters={"batch": 1}, wait_for_completion=False,
+            query="SELECT id FROM customers", query_language="DAX",
+        )
+
+    @patch.object(agent, "FABRIC_AGENTS_AVAILABLE", True)
+    def test_orchestrator_failures_set_mcp_error(self):
+        response = MagicMock(success=False)
+        response.to_json.return_value = json.dumps({"success": False, "errors": ["Disabled"]})
+        orchestrator = MagicMock()
+        for method in ("handle", "cross_domain_query", "list_all_resources"):
+            setattr(orchestrator, method, AsyncMock(return_value=response))
+        with patch.object(agent, "get_fabric_orchestrator", return_value=orchestrator):
+            for name in ("fabric_agent_query", "fabric_agent_cross_domain", "fabric_agent_list_all"):
+                with self.subTest(name=name):
+                    result = _run(agent._execute_tool_impl(name, {"query": "query data"}))
+                    self.assertTrue(result.isError)
+                    self.assertFalse(json.loads(result.content[0]["text"])["success"])
+
+    @patch.object(agent, "FABRIC_AGENTS_AVAILABLE", True)
+    def test_cross_domain_forwards_separate_queries(self):
+        response = MagicMock(success=True)
+        response.to_json.return_value = json.dumps({"success": True})
+        orchestrator = MagicMock()
+        orchestrator.cross_domain_query = AsyncMock(return_value=response)
+        queries = {"lakehouse": "SELECT id FROM customers", "warehouse": "SELECT id FROM orders"}
+        with patch.object(agent, "get_fabric_orchestrator", return_value=orchestrator):
+            result = _run(agent._execute_tool_impl(
+                "fabric_agent_cross_domain", {"query": "compare data", "queries": queries},
+            ))
+        self.assertFalse(result.isError)
+        orchestrator.cross_domain_query.assert_awaited_once_with("compare data", queries=queries)
+
+    @patch.object(agent, "ONELAKE_AVAILABLE", True)
+    def test_onelake_success_and_failure_set_matching_mcp_error(self):
+        for name in (
+            "onelake_list_files", "onelake_read_file", "onelake_write_file",
+            "onelake_delete_file", "onelake_get_file_properties",
+        ):
+            for success in (True, False):
+                with self.subTest(name=name, success=success), patch.object(
+                    agent, name + "_tool", return_value=json.dumps({"success": success}),
+                ) as operation:
+                    result = _run(agent._execute_tool_impl(name, {
+                        "lakehouse_id": "lh-001", "path": "data.txt", "content": "text",
+                    }))
+                    self.assertEqual(result.isError, not success)
+                    self.assertEqual(operation.call_args.kwargs["lakehouse_id"], "lh-001")
+
 
 class TestCreateMcpAgent(unittest.TestCase):
     @patch.object(agent, "FOUNDRY_PROJECT_ENDPOINT", "")

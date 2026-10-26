@@ -1,712 +1,295 @@
-# Fabric Data Agents — Complete Setup Guide
+# Fabric Data Agents Setup Guide
 
-A step-by-step guide to connect and create Fabric Data Agents that interact with a Microsoft Fabric Lakehouse workspace.
+The Python MCP runtime provides four specialists, an orchestrator, and OneLake
+file operations. The TypeScript runtime does not implement these additions.
 
----
+**Fabric stays disabled in the default deployment.** Neither `azd up` nor the
+post-provision hooks automatically create a workspace or enable these tools.
+Setting azd environment values alone does not override the disabled Kubernetes
+template. Provision resources and opt into runtime access separately.
 
-## Table of Contents
+## Capabilities and boundaries
 
-1. [Prerequisites](#1-prerequisites)
-2. [Authenticate to Azure](#2-authenticate-to-azure)
-3. [Provision Fabric Capacity](#3-provision-fabric-capacity)
-4. [Resume / Manage Capacity](#4-resume--manage-capacity)
-5. [Create Fabric Workspace & Lakehouse](#5-create-fabric-workspace--lakehouse)
-6. [Upload Sample Data to Lakehouse](#6-upload-sample-data-to-lakehouse)
-7. [Configure Environment Variables](#7-configure-environment-variables)
-8. [Build & Deploy the MCP Container](#8-build--deploy-the-mcp-container)
-9. [Test the Fabric Data Agents](#9-test-the-fabric-data-agents)
-10. [MCP Tool Reference](#10-mcp-tool-reference)
-11. [Architecture Overview](#11-architecture-overview)
-12. [Troubleshooting](#12-troubleshooting)
+| Component | Behavior |
+|-----------|----------|
+| Lakehouse specialist | Execute Spark SQL, discover resources, and explore table schemas |
+| Warehouse specialist | Execute T-SQL and explore `INFORMATION_SCHEMA` |
+| Pipeline specialist | Trigger, monitor, wait for completion, and retry bounded runs |
+| Semantic Model specialist | Delegate DAX/MDX requests to the existing Fabric tools |
+| Orchestrator | Route by explicit agent type, resource ID, then keywords; aggregate cross-domain responses |
+| OneLake client | List, read, write, delete, and inspect files through the DFS endpoint |
 
----
+Routing and intent detection are heuristics, not an LLM query generator. Supply
+executable SQL/DAX/MDX for data queries. Cross-domain calls delegate sequentially
+and aggregate responses; they do not generate queries, join results, or plan
+dependencies between operations. Default row limits are best-effort query
+conveniences, not authorization or resource-quota enforcement.
 
-## 1. Prerequisites
+The specialists reuse [fabric_tools.py](../src/fabric_tools.py). Mocked tests
+verify local behavior, not the availability of its query endpoints in a tenant.
+Confirm supported APIs, query engines, permissions, and query languages for your
+Fabric environment before production use.
 
-| Requirement | Details |
-|-------------|---------|
-| **Azure Subscription** | Active subscription with `Contributor` role |
-| **Azure CLI** | v2.50+ (`az --version`) |
-| **PowerShell** | 7.x+ (`pwsh --version`) |
-| **Python** | 3.11+ |
-| **Docker** | For building container images |
-| **kubectl** | For AKS deployment |
-| **Azure Developer CLI (azd)** | For IaC provisioning (`azd version`) |
-| **Fabric License** | F-SKU capacity (F2, F4, F8…) — Premium Per User (PP3) does **not** support Lakehouse |
+## Prerequisites
 
-### Verify Prerequisites
+- Python 3.11+ and dependencies from [requirements.txt](../src/requirements.txt).
+- PowerShell 7, Azure CLI, and Azure Developer CLI for the optional provisioner.
+- An active Fabric capacity that supports the intended items, and permission to
+  create workspaces/items and assign the capacity.
+- Fabric tenant settings permitting the runtime's service principal, appropriate
+  workspace/item access for that identity, and the required network connectivity.
+- For AKS, the existing approved workload-identity, private networking, build,
+  approval, and registry configuration. Do not substitute resource keys or
+  bypass the deployment gates.
 
-```powershell
-az --version
-python --version
-docker --version
-kubectl version --client
-azd version
-```
+Azure capacity roles alone do not grant Fabric workspace/item access. Grant
+only the workspace, item, and semantic-model permissions the requested operations
+need. The Fabric and OneLake clients use `DefaultAzureCredential`; AKS normally
+uses the existing UAMI through workload identity. Agent 365 registration does not
+transfer those permissions or change these clients to an Entra Agent ID.
 
----
+Capacity provisioning is separate from workspace creation. See the
+[capacity template](../infra/core/fabric/fabric-capacity.bicep) and
+[Fabric capacity documentation](https://learn.microsoft.com/fabric/enterprise/buy-subscription).
+Check current regional pricing rather than relying on an embedded cost estimate.
 
-## 2. Authenticate to Azure
+## Explicit workspace provisioning
 
-### 2.1 Login to the correct tenant
-
-```powershell
-# Replace with your tenant ID
-az login --tenant <YOUR_TENANT_ID>
-
-# Example:
-az login --tenant 6fc3d6e0-df56-4271-ab53-9782cdea9bf6
-```
-
-### 2.2 Verify you're on the right subscription
+Authenticate to the intended tenant/subscription and select an azd environment:
 
 ```powershell
-az account show --query "{name:name, id:id, tenantId:tenantId, user:user.name}" -o table
-```
-
-### 2.3 Switch subscription if needed
-
-```powershell
+az login --tenant "<TENANT_ID>"
 az account set --subscription "<SUBSCRIPTION_ID>"
+azd env select "<ENVIRONMENT>"
+
+.\scripts\deploy-fabric-workspace.ps1 `
+    -Environment "<ENVIRONMENT>" `
+    -WorkspaceName "<WORKSPACE_NAME>" `
+    -CapacityId "<FABRIC_CAPACITY_GUID>"
 ```
 
----
+Run this only after approving the resource creation and associated costs.
+`-CapacityId` is the Fabric API capacity GUID, not an Azure resource ID. If it is
+omitted, the script resolves `FABRIC_CAPACITY_NAME` from the selected environment,
+or reuses an existing workspace's capacity. A new workspace requires a capacity.
 
-## 3. Provision Fabric Capacity
+The script creates or reuses:
 
-Fabric items (Lakehouse, Warehouse, Pipeline, Semantic Model) require an **F-SKU** capacity.
+- The named workspace.
+- A Lakehouse named `AgentsLakehouse`.
+- A Warehouse named `AgentsWarehouse`.
 
-> **Important**: Premium Per User (PP3/P-SKU) does **not** support Lakehouse or Warehouse creation. You need an F-SKU (F2 minimum).
+It handles paginated resource discovery and polls HTTP 202 long-running
+operations before using resource IDs. Capacity-assignment, API, missing-ID, and
+azd-save failures stop the script; a failed operation is not reported as complete.
+It saves `FABRIC_WORKSPACE_ID`, `FABRIC_LAKEHOUSE_ID`, `FABRIC_WAREHOUSE_ID`, and
+`FABRIC_LAKEHOUSE_NAME` to the selected azd environment. It does **not** enable the
+runtime, grant workspace permissions, upload ontologies, create a pipeline or
+semantic model, build an image, or deploy to AKS.
 
-### Option A: Deploy via Bicep (recommended)
+Create pipelines and semantic models separately. Uploading a CSV to `Files`
+does not create a queryable Lakehouse table; load/register it as a table in Fabric
+before querying it.
 
-The repository includes a Bicep template at `infra/core/fabric/fabric-capacity.bicep`:
+## Runtime configuration
+
+Set configuration before the Python process imports the Fabric modules. The MCP
+server loads its local `.env` before those imports; restart after changing values.
+See [.env.example](../src/.env.example) for disabled-by-default settings.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `FABRIC_ENABLED` | `false` | Existing Fabric integration flag |
+| `FABRIC_DATA_AGENTS_ENABLED` | `false` | Enable the orchestrator and OneLake tool client |
+| `FABRIC_WORKSPACE_ID` | empty | Workspace GUID |
+| `FABRIC_API_ENDPOINT` | `https://api.fabric.microsoft.com/v1` | Existing Fabric REST client endpoint |
+| `FABRIC_ONELAKE_DFS_ENDPOINT` | `https://onelake.dfs.fabric.microsoft.com` | OneLake DFS endpoint |
+| `FABRIC_AGENT_MAX_RETRIES` | `3` | Maximum attempts for an explicit pipeline retry |
+| `FABRIC_PIPELINE_POLL_INTERVAL` | `30` | Seconds between status polls |
+| `FABRIC_PIPELINE_TIMEOUT` | `3600` | Pipeline polling deadline in seconds |
+| `ONELAKE_MAX_DOWNLOAD_BYTES` | `52428800` | Maximum downloaded file bytes (50 MiB) |
+
+Numeric settings must be positive integers. OneLake checks both the declared
+file size and the actual streamed byte count. Binary reads return base64 with
+`isText=false`; writes accept UTF-8 text. `overwrite=false` uses a conditional
+create and stops if the file already exists. File operations require a non-empty
+path inside `Files` or `Tables`; listing may use an empty path for that section's
+root. Create parent directories beforehand.
+
+### Local process opt-in
+
+From the repository root, after configuring the existing MCP dependencies:
 
 ```powershell
-# Create a resource group (or use an existing one)
-az group create --name rg-fabric-agents --location westus3
+$env:FABRIC_ENABLED = "true"
+$env:FABRIC_DATA_AGENTS_ENABLED = "true"
+$env:FABRIC_WORKSPACE_ID = "<WORKSPACE_GUID>"
+$env:FABRIC_API_ENDPOINT = "https://api.fabric.microsoft.com/v1"
+$env:FABRIC_ONELAKE_DFS_ENDPOINT = "https://onelake.dfs.fabric.microsoft.com"
 
-# Deploy an F2 capacity (smallest, ~$0.36/hr)
-az deployment group create `
-    --resource-group "rg-fabric-agents" `
-    --template-file "./infra/core/fabric/fabric-capacity.bicep" `
-    --parameters name="fabricagentsf2" `
-                 location="westus3" `
-                 skuName="F2" `
-                 adminMembers="['yourname@yourdomain.com']"
+Push-Location .\src
+try {
+    ..\.venv\Scripts\python.exe -m uvicorn next_best_action_agent:app --host 127.0.0.1 --port 8000
+} finally {
+    Pop-Location
+}
 ```
 
-> **Note**: The capacity name must contain only lowercase letters and numbers (no hyphens/underscores).
+The clients acquire tokens when operations need them. Do not expose the local
+server publicly or put tokens, signed URLs, or resource credentials into `.env`.
 
-### Option B: Create via Azure Portal
+### AKS opt-in for an approved Python deployment
 
-1. Go to [Azure Portal](https://portal.azure.com)
-2. Search for **Microsoft Fabric** → **Create**
-3. Select SKU: **F2** (or higher)
-4. Select region and admin members
-5. Click **Create**
+Build and deploy through the existing gated workflow described in the
+[README](../README.md#deployment). The Python Dockerfile already copies all
+application modules; no separate image or additional dependency is needed.
 
-### 3.1 Verify the capacity
+After the existing identity/approval preflight succeeds and an operator approves
+Fabric access for that deployment, apply a namespace-scoped environment override:
 
 ```powershell
-az resource list --resource-type "Microsoft.Fabric/capacities" -o table
-```
-
----
-
-## 4. Resume / Manage Capacity
-
-Fabric F-SKU capacities can be **paused** to stop billing and **resumed** when needed.
-
-### List capacity states via Fabric API
-
-```powershell
-$token = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-$headers = @{ Authorization = "Bearer $token" }
-$caps = Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/capacities" -Headers $headers
-$caps.value | Select-Object displayName, sku, state, id | Format-Table -AutoSize
-```
-
-### Resume a paused capacity
-
-```powershell
-az resource invoke-action `
-    --resource-group "<RESOURCE_GROUP>" `
-    --name "<CAPACITY_NAME>" `
-    --resource-type "Microsoft.Fabric/capacities" `
-    --action resume
-
-# Example:
-az resource invoke-action --resource-group "rg-sdemo" --name "saifabric01" --resource-type "Microsoft.Fabric/capacities" --action resume
-```
-
-Wait ~15 seconds for activation, then verify:
-
-```powershell
-Start-Sleep -Seconds 15
-# Re-run the capacity list above to confirm state = "Active"
-```
-
-### Pause capacity (stop billing)
-
-```powershell
-az resource invoke-action `
-    --resource-group "<RESOURCE_GROUP>" `
-    --name "<CAPACITY_NAME>" `
-    --resource-type "Microsoft.Fabric/capacities" `
-    --action suspend
-```
-
----
-
-## 5. Create Fabric Workspace & Lakehouse
-
-### Option A: Use the automated deploy script (recommended)
-
-The repository includes `scripts/deploy-fabric-workspace.ps1` which creates:
-- A Fabric **Workspace**
-- A **Lakehouse** (AgentsLakehouse)
-- A **Warehouse** (AgentsWarehouse)
-
-```powershell
-cd azure-agents-control-plane
-
-# Get your capacity ID from Step 4 above
-./scripts/deploy-fabric-workspace.ps1 `
-    -CapacityId "<YOUR_F_SKU_CAPACITY_ID>" `
-    -WorkspaceName "agents-fabric-data-ws"
-
-# Example:
-./scripts/deploy-fabric-workspace.ps1 `
-    -CapacityId "6d791cc5-92b9-4b3f-ba6d-fecddea68e11" `
-    -WorkspaceName "agents-fabric-data-ws"
-```
-
-**Expected output:**
-
-```
-============================================
-  Fabric Data Agents - Workspace Provisioning
-============================================
-
---- Step 1: Workspace ---
-[OK] Workspace created: 4625b2e9-2493-4855-a357-592f36755ebd
-
---- Step 2: Lakehouse ---
-[OK] Lakehouse created: 684658fa-5036-4075-a78e-bd8dfb8df02e
-
---- Step 3: Warehouse ---
-[OK] Warehouse created: <warehouse-id>
-
-============================================
-  Provisioning Complete!
-============================================
-Resource IDs:
-  FABRIC_WORKSPACE_ID  = 4625b2e9-2493-4855-a357-592f36755ebd
-  FABRIC_LAKEHOUSE_ID  = 684658fa-5036-4075-a78e-bd8dfb8df02e
-```
-
-Save these IDs — you'll need them for environment variables.
-
-### Option B: Create manually via Fabric Portal
-
-1. Open [Power BI / Fabric portal](https://app.powerbi.com)
-2. Click **Workspaces** → **New Workspace**
-3. Name: `agents-fabric-data-ws`
-4. Under **Advanced** → **Capacity**, select your F-SKU capacity
-5. Click **Apply**
-6. Inside the workspace, click **+ New item** → **Lakehouse**
-7. Name: `AgentsLakehouse`
-8. Note the Workspace ID from the URL: `https://app.powerbi.com/groups/<WORKSPACE_ID>/...`
-
-### 5.1 Reassign workspace to a different capacity
-
-```powershell
-$token = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-$headers = @{ Authorization = "Bearer $token"; "Content-Type" = "application/json" }
-
-Invoke-RestMethod -Method POST `
-    -Uri "https://api.fabric.microsoft.com/v1/workspaces/<WORKSPACE_ID>/assignToCapacity" `
-    -Headers $headers `
-    -Body (@{ capacityId = "<NEW_CAPACITY_ID>" } | ConvertTo-Json)
-```
-
-### 5.2 Verify workspace items
-
-```powershell
-$token = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-$headers = @{ Authorization = "Bearer $token" }
-
-# List workspaces
-$ws = Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/workspaces" -Headers $headers
-$ws.value | Format-Table id, displayName, capacityId -AutoSize
-
-# List items in workspace
-$wsId = "<YOUR_WORKSPACE_ID>"
-$items = Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/workspaces/$wsId/items" -Headers $headers
-$items.value | Format-Table id, displayName, type -AutoSize
-```
-
----
-
-## 6. Upload Sample Data to Lakehouse
-
-Upload data files to the Lakehouse's **Files** section via OneLake.
-
-### Using the Fabric Portal
-
-1. Open your workspace in [Fabric Portal](https://app.powerbi.com)
-2. Open **AgentsLakehouse**
-3. Click **Files** → **Upload** → **Upload files**
-4. Upload CSV/Parquet/JSON files
-
-### Using the OneLake REST API (programmatic)
-
-```powershell
-$token = az account get-access-token --resource "https://storage.azure.com" --query accessToken -o tsv
-$headers = @{ Authorization = "Bearer $token"; "Content-Type" = "application/octet-stream" }
-$wsId = "<WORKSPACE_ID>"
-$lhId = "<LAKEHOUSE_ID>"
-$fileName = "customers.csv"
-$dfsBase = "https://onelake.dfs.fabric.microsoft.com"
-
-# Step 1: Create the file
-Invoke-RestMethod -Method PUT `
-    -Uri "$dfsBase/$wsId/$lhId/Files/$fileName`?resource=file" `
-    -Headers $headers
-
-# Step 2: Append data
-$bytes = [System.IO.File]::ReadAllBytes(".\data\customers.csv")
-Invoke-RestMethod -Method PATCH `
-    -Uri "$dfsBase/$wsId/$lhId/Files/$fileName`?action=append&position=0" `
-    -Headers $headers `
-    -Body $bytes
-
-# Step 3: Flush (commit)
-Invoke-RestMethod -Method PATCH `
-    -Uri "$dfsBase/$wsId/$lhId/Files/$fileName`?action=flush&position=$($bytes.Length)" `
-    -Headers $headers
-```
-
-### Using Python (via fabric_onelake.py)
-
-```python
-from fabric_onelake import get_onelake_client
-
-client = get_onelake_client()
-result = client.write_file(
-    item_id="<LAKEHOUSE_ID>",
-    path="customers.csv",
-    data=open("data/customers.csv", "rb").read(),
-    content_type="text/csv"
-)
-print(result)
-```
-
----
-
-## 7. Configure Environment Variables
-
-### 7.1 Required environment variables
-
-Set these in your deployment configuration:
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `FABRIC_ENABLED` | Enable Fabric integration | `true` |
-| `FABRIC_DATA_AGENTS_ENABLED` | Enable Fabric Data Agents | `true` |
-| `FABRIC_WORKSPACE_ID` | Workspace GUID from Step 5 | `4625b2e9-2493-4855-a357-592f36755ebd` |
-| `FABRIC_API_ENDPOINT` | Fabric REST API base URL | `https://api.fabric.microsoft.com/v1` |
-| `FABRIC_ONELAKE_DFS_ENDPOINT` | OneLake DFS endpoint | `https://onelake.dfs.fabric.microsoft.com` |
-| `FABRIC_AGENT_MAX_RETRIES` | Max retries for pipeline operations | `3` |
-| `FABRIC_PIPELINE_POLL_INTERVAL` | Pipeline status poll interval (seconds) | `30` |
-| `FABRIC_PIPELINE_TIMEOUT` | Pipeline run timeout (seconds) | `3600` |
-| `ONELAKE_MAX_DOWNLOAD_BYTES` | Max file download size (bytes) | `52428800` (50 MB) |
-
-### 7.2 Set via azd environment
-
-```powershell
-azd env set FABRIC_ENABLED "true"
-azd env set FABRIC_DATA_AGENTS_ENABLED "true"
-azd env set FABRIC_WORKSPACE_ID "4625b2e9-2493-4855-a357-592f36755ebd"
-azd env set FABRIC_LAKEHOUSE_ID "684658fa-5036-4075-a78e-bd8dfb8df02e"
-azd env set FABRIC_API_ENDPOINT "https://api.fabric.microsoft.com/v1"
-azd env set FABRIC_ONELAKE_DFS_ENDPOINT "https://onelake.dfs.fabric.microsoft.com"
-```
-
-### 7.3 Set for local development
-
-Create a `.env` file or set system environment variables:
-
-```bash
-export FABRIC_ENABLED=true
-export FABRIC_DATA_AGENTS_ENABLED=true
-export FABRIC_WORKSPACE_ID=4625b2e9-2493-4855-a357-592f36755ebd
-export FABRIC_API_ENDPOINT=https://api.fabric.microsoft.com/v1
-export FABRIC_ONELAKE_DFS_ENDPOINT=https://onelake.dfs.fabric.microsoft.com
-```
-
----
-
-## 8. Build & Deploy the MCP Container
-
-### 8.1 Build the Docker image
-
-```powershell
-cd src
-
-# Build the image
-docker build -t mcp-agents:latest .
-
-# Tag for Azure Container Registry
-$acr = "<YOUR_ACR_NAME>.azurecr.io"
-docker tag mcp-agents:latest "$acr/mcp-agents:latest"
-```
-
-### 8.2 Push to ACR
-
-```powershell
-az acr login --name <YOUR_ACR_NAME>
-docker push "$acr/mcp-agents:latest"
-```
-
-### 8.3 Deploy to AKS via azd
-
-```powershell
-# Full provision + deploy (infrastructure + application)
-azd up
-
-# Or deploy only the application (if infrastructure already exists)
-azd deploy
-```
-
-### 8.4 Deploy manually to AKS
-
-```powershell
-# Get AKS credentials
-az aks get-credentials --resource-group <RG_NAME> --name <AKS_NAME> --overwrite-existing
-
-# Apply configured K8s manifests
-kubectl apply -f ./k8s/mcp-agents-deployment-configured.yaml
-kubectl apply -f ./k8s/mcp-agents-loadbalancer-configured.yaml
-
-# Wait for rollout
+kubectl set env deployment/mcp-agents -n mcp-agents `
+    FABRIC_ENABLED=true `
+    FABRIC_DATA_AGENTS_ENABLED=true `
+    FABRIC_WORKSPACE_ID="<WORKSPACE_GUID>" `
+    FABRIC_API_ENDPOINT=https://api.fabric.microsoft.com/v1 `
+    FABRIC_ONELAKE_DFS_ENDPOINT=https://onelake.dfs.fabric.microsoft.com
 kubectl rollout status deployment/mcp-agents -n mcp-agents --timeout=300s
 ```
 
-### 8.5 Verify deployment
+This does not grant Fabric permissions or bypass the existing deployment gates.
+The standard post-provision hooks keep Fabric disabled and will reset this
+override on a later deployment. Manage intentional overrides through your
+approved deployment process. To disable these tools, set
+`FABRIC_DATA_AGENTS_ENABLED=false` and wait for the rollout.
 
-```powershell
-kubectl get pods -n mcp-agents
-kubectl logs -l app=mcp-agents -n mcp-agents --tail=50
-```
+## MCP tool reference
 
----
+These eight tools supplement the existing six low-level `fabric_*` tools.
+Failures are returned as MCP tool errors as well as unsuccessful JSON results.
 
-## 9. Test the Fabric Data Agents
+| Tool | Required arguments | Optional arguments |
+|------|--------------------|--------------------|
+| `fabric_agent_query` | `query` | `agent_type`, resource IDs, `sql_query`, `run_id`, `pipeline_parameters`, `wait_for_completion`, `query_language` |
+| `fabric_agent_cross_domain` | `query` | Resource IDs, per-specialist `queries`, pipeline parameters/status options, `query_language` |
+| `fabric_agent_list_all` | none | none |
+| `onelake_list_files` | `lakehouse_id` | `path`, `section`, `recursive` |
+| `onelake_read_file` | `lakehouse_id`, `path` | `section` |
+| `onelake_write_file` | `lakehouse_id`, `path`, `content` | `section`, `overwrite` (default `true`) |
+| `onelake_delete_file` | `lakehouse_id`, `path` | `section`, `recursive` (default `false`) |
+| `onelake_get_file_properties` | `lakehouse_id`, `path` | `section` |
 
-### 9.1 Run unit tests
+Resource IDs are `lakehouse_id`, `warehouse_id`, `pipeline_id`, and `dataset_id`.
+Agent types are `lakehouse`, `warehouse`, `pipeline`, and `semantic_model`.
+`section` is `Files` (default) or `Tables`. Use `query`, not `user_query`, in
+MCP arguments; use `lakehouse_id`, not `item_id`, for OneLake tools.
 
-```powershell
-cd azure-agents-control-plane
-python -m pytest tests/test_fabric_data_agents.py -v
-```
+### Lakehouse query
 
-### 9.2 Run integration tests
-
-```powershell
-python -m pytest tests/test_fabric_agents.py -v --use-az-token
-```
-
-### 9.3 Test via MCP tool calls
-
-Once deployed, interact with the agents via MCP SSE endpoint:
-
-**Query Lakehouse:**
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 1,
   "method": "tools/call",
   "params": {
     "name": "fabric_agent_query",
     "arguments": {
-      "user_query": "Show me the top 10 customers by monthly spend from the lakehouse",
-      "agent_type": "lakehouse"
+      "query": "query the lakehouse for customers",
+      "agent_type": "lakehouse",
+      "lakehouse_id": "<LAKEHOUSE_GUID>",
+      "sql_query": "SELECT customer_id, name FROM customers LIMIT 10"
     }
-  },
-  "id": 1
+  }
 }
 ```
 
-**List all Fabric resources:**
+### Monitor an existing pipeline run
+
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 2,
   "method": "tools/call",
   "params": {
-    "name": "fabric_agent_list_all",
-    "arguments": {}
-  },
-  "id": 2
+    "name": "fabric_agent_query",
+    "arguments": {
+      "query": "check pipeline run status",
+      "agent_type": "pipeline",
+      "pipeline_id": "<PIPELINE_GUID>",
+      "run_id": "<RUN_GUID>"
+    }
+  }
 }
 ```
 
-**Upload a file to OneLake:**
+To trigger a run, use `query: "trigger pipeline"` and `pipeline_parameters`.
+With `wait_for_completion=true`, failed, cancelled, timed-out, or unreadable
+terminal status is an error rather than a successful trigger response.
+
+### Upload UTF-8 text without overwriting
+
 ```json
 {
   "jsonrpc": "2.0",
+  "id": 3,
   "method": "tools/call",
   "params": {
     "name": "onelake_write_file",
     "arguments": {
-      "item_id": "<LAKEHOUSE_ID>",
-      "path": "data/report.csv",
-      "content": "id,name,value\n1,Alpha,100\n2,Beta,200"
+      "lakehouse_id": "<LAKEHOUSE_GUID>",
+      "path": "report.csv",
+      "content": "id,value\n1,100\n",
+      "overwrite": false
     }
-  },
-  "id": 3
+  }
 }
 ```
 
-**Read a file from OneLake:**
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "tools/call",
-  "params": {
-    "name": "onelake_read_file",
-    "arguments": {
-      "item_id": "<LAKEHOUSE_ID>",
-      "path": "data/report.csv"
-    }
-  },
-  "id": 4
-}
-```
+For Python callers, add `src` to `PYTHONPATH` and use
+`get_onelake_client().write_file(lakehouse_id="...", path="report.csv", content="...")`
+from [fabric_onelake.py](../src/fabric_onelake.py).
 
-**Cross-domain query:**
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "tools/call",
-  "params": {
-    "name": "fabric_agent_cross_domain",
-    "arguments": {
-      "user_query": "Get customer churn data from lakehouse and trigger the refresh pipeline"
-    }
-  },
-  "id": 5
-}
-```
+For cross-domain data calls, `queries` maps `lakehouse`, `warehouse`, and/or
+`semantic_model` to separate executable queries in each specialist's language.
 
----
+## Offline validation
 
-## 10. MCP Tool Reference
-
-### Fabric Data Agent Tools
-
-| Tool Name | Description | Key Parameters |
-|-----------|-------------|----------------|
-| `fabric_agent_query` | Orchestrated query — auto-routes to the right agent | `user_query`, `agent_type` (optional), `lakehouse_id`, `warehouse_id`, `dataset_id`, `pipeline_id` |
-| `fabric_agent_cross_domain` | Multi-agent cross-domain query | `user_query` |
-| `fabric_agent_list_all` | List all Fabric resources in workspace | _(none)_ |
-
-### OneLake File Tools
-
-| Tool Name | Description | Key Parameters |
-|-----------|-------------|----------------|
-| `onelake_list_files` | List files/folders in a Lakehouse | `item_id`, `path` (optional) |
-| `onelake_read_file` | Read a file from OneLake | `item_id`, `path` |
-| `onelake_write_file` | Write/upload a file to OneLake | `item_id`, `path`, `content` |
-| `onelake_delete_file` | Delete a file from OneLake | `item_id`, `path` |
-| `onelake_get_file_properties` | Get file metadata (size, date) | `item_id`, `path` |
-
-### Agent Types (for `fabric_agent_query`)
-
-| Agent Type | Use Case | Query Language |
-|------------|----------|----------------|
-| `lakehouse` | Delta tables, Spark SQL queries | Spark SQL |
-| `warehouse` | Structured analytics, T-SQL queries | T-SQL |
-| `pipeline` | Trigger/monitor ETL pipelines | N/A |
-| `semantic_model` | Power BI datasets, KPIs | DAX / MDX |
-
----
-
-## 11. Architecture Overview
-
-```
-                    ┌─────────────────────────────────────┐
-                    │         MCP Server (FastAPI)         │
-                    │    next_best_action_agent.py         │
-                    │         Port 8000 (AKS)             │
-                    └──────────────┬──────────────────────┘
-                                   │
-                    ┌──────────────▼──────────────────────┐
-                    │     FabricAgentOrchestrator          │
-                    │         fabric_agents.py             │
-                    │   Routes requests by keyword/type    │
-                    └──┬──────┬──────┬──────┬─────────────┘
-                       │      │      │      │
-          ┌────────────▼┐  ┌──▼────┐ ┌▼─────┐ ┌▼────────────┐
-          │  Lakehouse  │  │Ware-  │ │Pipe- │ │  Semantic   │
-          │   Agent     │  │house  │ │line  │ │   Model     │
-          │ (Spark SQL) │  │Agent  │ │Agent │ │   Agent     │
-          │             │  │(T-SQL)│ │      │ │  (DAX/MDX)  │
-          └──────┬──────┘  └──┬────┘ └──┬───┘ └──────┬──────┘
-                 │            │         │            │
-          ┌──────▼────────────▼─────────▼────────────▼──────┐
-          │              fabric_tools.py                     │
-          │         Low-level Fabric REST API calls          │
-          │    https://api.fabric.microsoft.com/v1           │
-          └─────────────────────┬────────────────────────────┘
-                                │
-          ┌─────────────────────▼────────────────────────────┐
-          │              fabric_onelake.py                    │
-          │       OneLake DFS File Operations                │
-          │   https://onelake.dfs.fabric.microsoft.com       │
-          └──────────────────────────────────────────────────┘
-                                │
-          ┌─────────────────────▼────────────────────────────┐
-          │            Microsoft Fabric                       │
-          │  ┌──────────┐ ┌──────────┐ ┌──────────────────┐ │
-          │  │Lakehouse │ │Warehouse │ │ Semantic Models  │ │
-          │  │(Delta)   │ │ (T-SQL)  │ │ (Power BI)       │ │
-          │  └──────────┘ └──────────┘ └──────────────────┘ │
-          │  ┌──────────┐ ┌──────────────────────────────┐  │
-          │  │Pipelines │ │      OneLake (DFS)           │  │
-          │  │ (ETL)    │ │   Unified Data Lake          │  │
-          │  └──────────┘ └──────────────────────────────┘  │
-          └─────────────────────────────────────────────────┘
-```
-
-### Authentication Flow
-
-```
-AKS Pod → Workload Identity → Managed Identity → Azure AD Token
-  → Fabric API scope: https://analysis.windows.net/powerbi/api/.default
-  → OneLake scope:    https://storage.azure.com/.default
-```
-
-### Key Files
-
-| File | Purpose |
-|------|---------|
-| `src/fabric_agents.py` | 4 specialist agents + orchestrator |
-| `src/fabric_onelake.py` | OneLake DFS file operations |
-| `src/fabric_tools.py` | Low-level Fabric REST API client |
-| `src/next_best_action_agent.py` | Main MCP server (registers tools) |
-| `scripts/deploy-fabric-workspace.ps1` | Automated Fabric provisioning |
-| `infra/core/fabric/fabric-capacity.bicep` | Fabric capacity IaC |
-| `infra/app/fabric-data-agents.bicep` | RBAC assignments |
-| `k8s/mcp-agents-deployment.yaml` | K8s deployment manifest |
-| `tests/test_fabric_data_agents.py` | Unit tests (30+ tests) |
-
----
-
-## 12. Troubleshooting
-
-### Error: "FeatureNotAvailable" (403) when creating Lakehouse
-
-**Cause**: Workspace is on a PP-SKU (Premium Per User) capacity, not an F-SKU.
-
-**Fix**: Assign the workspace to an F-SKU capacity:
+Run from the repository root with the development dependencies installed:
 
 ```powershell
-# Find your F-SKU capacity ID
-$token = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-$headers = @{ Authorization = "Bearer $token" }
-$caps = Invoke-RestMethod -Uri "https://api.fabric.microsoft.com/v1/capacities" -Headers $headers
-$caps.value | Where-Object { $_.sku -like "F*" } | Format-Table displayName, sku, state, id
-
-# Reassign workspace
-$headers["Content-Type"] = "application/json"
-Invoke-RestMethod -Method POST `
-    -Uri "https://api.fabric.microsoft.com/v1/workspaces/<WS_ID>/assignToCapacity" `
-    -Headers $headers `
-    -Body (@{ capacityId = "<F_SKU_CAPACITY_ID>" } | ConvertTo-Json)
+.\.venv\Scripts\python.exe -m pytest .\tests\test_fabric_data_agents.py -q
+.\.venv\Scripts\python.exe -m pytest .\tests\test_next_best_action_unit.py::TestFabricMcpIntegration -q
 ```
 
-### Error: "CapacityNotInActiveState" (400)
+The first suite mocks HTTP and credentials. Where PowerShell 7 is installed, it
+also executes the real provisioner with in-memory Azure CLI, azd, and REST
+functions; it never provisions resources. Coverage includes intent precedence,
+query forwarding, schema failures, bounded pipeline retries/polling, feature
+disable paths, OneLake pagination/paths, exact download limits, conditional
+writes, provisioning failures, long-running operations, and deployment defaults.
+The second suite checks registration, MCP parameter forwarding, and error flags.
 
-**Cause**: The Fabric capacity is paused/inactive.
+These checks do **not** validate live Fabric/Power BI query API compatibility,
+tenant licensing/consent, workload-identity permissions, container execution,
+private endpoint reachability, or a deployed AKS rollout. Validate those in an
+approved test environment separately; a mocked success is not a deployment result.
 
-**Fix**: Resume the capacity (see [Step 4](#4-resume--manage-capacity)).
+## Troubleshooting
 
-### Error: "Invalid chars in resource name"
+- **Tools disabled:** check the running pod/process configuration, not just azd
+  values. The default template deliberately keeps Fabric off.
+- **401/403:** verify tenant settings, the credential actually selected by
+  `DefaultAzureCredential`, and Fabric workspace/item permissions. Registering an
+  Agent ID does not grant UAMI access.
+- **Unsupported query API/language:** confirm the existing
+  [Fabric client](../src/fabric_tools.py) endpoints against supported APIs for
+  your workload. Do not treat mocked responses as service validation.
+- **No queryable table:** a file in OneLake `Files` is not automatically a table.
+- **Capacity/item creation fails:** confirm capacity availability and assignment;
+  rerun only after resolving the reported error.
+- **File already exists:** choose a new path or explicitly allow overwriting.
+- **File too large:** use a smaller file or deliberately raise the byte limit
+  within the pod's memory budget; base64 and JSON encoding also consume memory.
 
-**Cause**: Fabric capacity names can only contain lowercase letters and numbers.
-
-**Fix**: Use a name like `fabricagentsf2` (no hyphens/underscores).
-
-### Error: "UnicodeDecodeError: 'charmap' codec can't decode byte"
-
-**Cause**: Windows cp1252 encoding issue with special characters in Python files.
-
-**Fix**: Always open files with explicit `encoding='utf-8'`:
-
-```python
-ast.parse(open('src/file.py', encoding='utf-8').read())
-```
-
-### Lakehouse query returns empty results
-
-**Possible causes**:
-1. No data uploaded to the Lakehouse yet → Upload via [Step 6](#6-upload-sample-data-to-lakehouse)
-2. Table not created from files → In Fabric Portal, right-click the file → **Load to Tables**
-3. Wrong `lakehouse_id` → Verify with `fabric_agent_list_all`
-
-### Pods fail to authenticate to Fabric API
-
-**Cause**: Workload identity not configured.
-
-**Fix**: Ensure federated identity credential exists:
-
-```powershell
-az identity federated-credential create `
-    --name mcp-agents-federated `
-    --identity-name <IDENTITY_NAME> `
-    --resource-group <RG_NAME> `
-    --issuer <AKS_OIDC_ISSUER> `
-    --subject "system:serviceaccount:mcp-agents:mcp-agents-sa" `
-    --audience "api://AzureADTokenExchange"
-```
-
-### Cannot see Fabric portal
-
-**Fix**: Use the correct URL with your tenant:
-
-```
-https://app.powerbi.com/home?ctid=<YOUR_TENANT_ID>
-```
-
----
-
-## Quick Reference: End-to-End Commands
-
-```powershell
-# 1. Login
-az login --tenant 6fc3d6e0-df56-4271-ab53-9782cdea9bf6
-
-# 2. Resume capacity
-az resource invoke-action --resource-group "rg-sdemo" --name "saifabric01" `
-    --resource-type "Microsoft.Fabric/capacities" --action resume
-
-# 3. Create workspace + Lakehouse + Warehouse
-./scripts/deploy-fabric-workspace.ps1 `
-    -CapacityId "6d791cc5-92b9-4b3f-ba6d-fecddea68e11" `
-    -WorkspaceName "agents-fabric-data-ws"
-
-# 4. Set env vars
-azd env set FABRIC_WORKSPACE_ID "<WORKSPACE_ID>"
-azd env set FABRIC_DATA_AGENTS_ENABLED "true"
-
-# 5. Deploy
-azd deploy
-
-# 6. Run tests
-python -m pytest tests/test_fabric_data_agents.py -v
-
-# 7. Pause capacity when done
-az resource invoke-action --resource-group "rg-sdemo" --name "saifabric01" `
-    --resource-type "Microsoft.Fabric/capacities" --action suspend
-```
+See the [OneLake API guidance](https://learn.microsoft.com/fabric/onelake/onelake-access-api)
+and [Fabric long-running operation contract](https://learn.microsoft.com/rest/api/fabric/articles/long-running-operation).

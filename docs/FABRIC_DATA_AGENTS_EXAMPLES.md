@@ -2,6 +2,12 @@
 
 This document provides practical examples of using Fabric Data Agents in the Azure Agents Control Plane.
 
+For current provisioning, explicit runtime opt-in, and the eight additional
+Python orchestrator/OneLake tools, start with the
+[setup guide](FABRIC_DATA_AGENTS_SETUP_GUIDE.md). The examples below describe the
+existing low-level tools. Default deployments keep Fabric disabled; mock
+responses here do not establish live API compatibility.
+
 ## Overview
 
 Fabric Data Agents enable enterprise AI agents to interact with Microsoft Fabric's data platform capabilities:
@@ -22,33 +28,12 @@ Fabric Data Agents enable enterprise AI agents to interact with Microsoft Fabric
 
 ### Infrastructure Deployment
 
-```bash
-# Enable Fabric Data Agents in main.parameters.json
-{
-  "fabricEnabled": {
-    "value": true
-  },
-  "fabricDataAgentsEnabled": {
-    "value": true
-  },
-  "fabricWorkspaceId": {
-    "value": "abcd1234-5678-90ab-cdef-ghijklmnopqr"
-  },
-  "fabricCapacityName": {
-    "value": "fabriccapacitydev01"
-  },
-  "fabricSkuName": {
-    "value": "F2"
-  },
-  "fabricAdminEmail": {
-    "value": "admin@contoso.com"
-  }
-}
-
-# Deploy with Azure Developer CLI
-azd provision
-azd deploy
-```
+Fabric capacity provisioning and runtime enablement are separate, opt-in
+operations. Changing Bicep parameters or azd environment values alone does not
+enable the disabled Kubernetes template. Follow the
+[setup guide](FABRIC_DATA_AGENTS_SETUP_GUIDE.md#explicit-workspace-provisioning)
+for capacity/workspace prerequisites and the approved runtime override; keep the
+existing identity, approval, and private-registry deployment gates in place.
 
 ### Environment Variables
 
