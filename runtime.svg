@@ -288,7 +288,7 @@
     <!-- Divider - moved lower -->
     <line x1="15" y1="190" x2="525" y2="190" stroke="#444" stroke-width="1"/>
     
-    <!-- Agents 365 governance registry and AI kill switch -->
+    <!-- Agents 365 governance registry and AI disable switch -->
     <g transform="translate(50, 205)">
       <rect x="0" y="0" width="220" height="70" fill="#2a1111" stroke="#ff4d4f" stroke-width="3" class="box"/>
       <g class="logo-glow">
@@ -297,7 +297,7 @@
       </g>
       <text x="70" y="25" class="title">Agents 365</text>
       <text x="70" y="45" class="sublabel">Agent Registry</text>
-      <text x="70" y="63" font-family="Segoe UI" font-size="15" font-weight="600" fill="#ff8a8b">AI Kill Switch</text>
+      <text x="70" y="63" font-family="Segoe UI" font-size="15" font-weight="600" fill="#ff8a8b">AI Disable Switch</text>
     </g>
     
     <!-- Azure Agents Learning SDK Section - Centered vertically in bottom third -->
